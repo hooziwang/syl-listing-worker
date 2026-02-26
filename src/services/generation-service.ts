@@ -5,7 +5,7 @@ import type { AppEnv } from "../config/env.js";
 import type { ListingResult } from "../domain/types.js";
 import { LLMClient } from "./llm-client.js";
 import { parseRequirements, type ListingRequirements } from "./requirements-parser.js";
-import { loadTenantRules, type SectionRule } from "./rules-loader.js";
+import { loadTenantRules, type SectionRule, type TenantRules } from "./rules-loader.js";
 import type { RedisTraceStore } from "../store/trace-store.js";
 
 interface GenerationInput {
@@ -62,7 +62,7 @@ function extractJSONObjectText(input: string): string {
   return text;
 }
 
-function adaptBulletsJSONContent(raw: string): { content: string; error?: string } {
+function adaptJSONArrayContent(raw: string, field: string): { content: string; error?: string } {
   const jsonText = extractJSONObjectText(raw);
   if (!jsonText) {
     return { content: "", error: "JSON 解析失败: 返回为空" };
@@ -77,15 +77,15 @@ function adaptBulletsJSONContent(raw: string): { content: string; error?: string
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     return { content: "", error: "JSON 解析失败: 顶层必须是对象" };
   }
-  const bullets = (parsed as { bullets?: unknown }).bullets;
-  if (!Array.isArray(bullets)) {
-    return { content: "", error: "JSON 解析失败: 缺少 bullets 数组字段" };
+  const arr = (parsed as Record<string, unknown>)[field];
+  if (!Array.isArray(arr)) {
+    return { content: "", error: `JSON 解析失败: 缺少 ${field} 数组字段` };
   }
-  const lines = bullets
+  const lines = arr
     .map((item) => (typeof item === "string" ? normalizeLine(stripBulletPrefix(item)) : ""))
     .filter(Boolean);
   if (lines.length === 0) {
-    return { content: "", error: "JSON 解析失败: bullets 数组为空" };
+    return { content: "", error: `JSON 解析失败: ${field} 数组为空` };
   }
   return { content: lines.join("\n") };
 }
@@ -127,85 +127,68 @@ function rangeCheck(value: number, min: number, max: number): boolean {
   return true;
 }
 
-function validateTitle(title: string, requirements: ListingRequirements, rule: SectionRule): string[] {
+function validateSectionContent(content: string, requirements: ListingRequirements, rule: SectionRule): string[] {
   const constraints = rule.constraints;
   const tolerance = getTolerance(constraints);
-  const minChars = getNumber(constraints, "min_chars", 0) - tolerance;
-  const maxChars = getNumber(constraints, "max_chars", 0) + tolerance;
-
+  const normalized = normalizeText(content);
   const errors: string[] = [];
-  const normalized = normalizeLine(title);
+  const rawMinChars = getNumber(constraints, "min_chars", 0);
+  const rawMaxChars = getNumber(constraints, "max_chars", 0);
+  const minChars = rawMinChars > 0 ? rawMinChars - tolerance : 0;
+  const maxChars = rawMaxChars > 0 ? rawMaxChars + tolerance : 0;
+  const hasTextLengthConstraint = rawMinChars > 0 || rawMaxChars > 0;
+  if (hasTextLengthConstraint && !rangeCheck(normalized.length, Math.max(0, minChars), maxChars)) {
+    errors.push(`长度不满足约束: ${normalized.length}`);
+  }
 
-  if (!rangeCheck(normalized.length, Math.max(0, minChars), maxChars)) {
-    errors.push(`标题长度不满足约束: ${normalized.length}`);
+  const lines = splitLines(content);
+  const expectedCount = getNumber(constraints, "line_count", 0);
+  const rawMinCharsPerLine = getNumber(constraints, "min_chars_per_line", 0);
+  const rawMaxCharsPerLine = getNumber(constraints, "max_chars_per_line", 0);
+  const minCharsPerLine = rawMinCharsPerLine > 0 ? rawMinCharsPerLine - tolerance : 0;
+  const maxCharsPerLine = rawMaxCharsPerLine > 0 ? rawMaxCharsPerLine + tolerance : 0;
+  const hasLineConstraint = expectedCount > 0 || rawMinCharsPerLine > 0 || rawMaxCharsPerLine > 0;
+  if (hasLineConstraint) {
+    if (expectedCount > 0 && lines.length != expectedCount) {
+      errors.push(`行数不满足约束: ${lines.length} != ${expectedCount}`);
+      return errors;
+    }
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = normalizeLine(lines[i]);
+      const ok = rangeCheck(line.length, Math.max(0, minCharsPerLine), maxCharsPerLine);
+      if (!ok) {
+        errors.push(`第${i + 1}条长度不满足约束: ${line.length}`);
+      }
+    }
+  }
+
+  const minParagraphs = getNumber(constraints, "min_paragraphs", 0);
+  const maxParagraphs = getNumber(constraints, "max_paragraphs", 0);
+  if (minParagraphs > 0 || maxParagraphs > 0) {
+    const paragraphs = normalized
+      .split(/\n\s*\n/g)
+      .map((p) => p.trim())
+      .filter(Boolean);
+    if (!rangeCheck(paragraphs.length, minParagraphs, maxParagraphs)) {
+      errors.push(`段落数量不满足约束: ${paragraphs.length}`);
+    }
   }
 
   const mustContain = constraints.must_contain;
   if (Array.isArray(mustContain)) {
-    const content = normalized.toLowerCase();
-    if (mustContain.includes("brand") && requirements.brand && !content.includes(requirements.brand.toLowerCase())) {
-      errors.push(`标题缺少品牌词: ${requirements.brand}`);
+    const lc = normalizeLine(content).toLowerCase();
+    if (mustContain.includes("brand") && requirements.brand && !lc.includes(requirements.brand.toLowerCase())) {
+      errors.push(`缺少品牌词: ${requirements.brand}`);
     }
     if (mustContain.includes("top_keywords")) {
       const topN = Math.min(3, requirements.keywords.length);
       for (let i = 0; i < topN; i += 1) {
         const kw = requirements.keywords[i];
-        if (kw && !content.includes(kw.toLowerCase())) {
-          errors.push(`标题缺少关键词 #${i + 1}: ${kw}`);
+        if (kw && !lc.includes(kw.toLowerCase())) {
+          errors.push(`缺少关键词 #${i + 1}: ${kw}`);
         }
       }
     }
-  }
-
-  return errors;
-}
-
-function validateBullets(lines: string[], rule: SectionRule): string[] {
-  const constraints = rule.constraints;
-  const tolerance = getTolerance(constraints);
-  const expectedCount = getNumber(constraints, "line_count", 5);
-  const minChars = getNumber(constraints, "min_chars_per_line", 0) - tolerance;
-  const maxChars = getNumber(constraints, "max_chars_per_line", 0) + tolerance;
-
-  const errors: string[] = [];
-  if (expectedCount > 0 && lines.length !== expectedCount) {
-    errors.push(`五点数量错误: ${lines.length} != ${expectedCount}`);
-    return errors;
-  }
-
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = normalizeLine(lines[i]);
-    const ok = rangeCheck(line.length, Math.max(0, minChars), maxChars);
-    if (!ok) {
-      errors.push(`第${i + 1}条长度不满足约束: ${line.length}`);
-    }
-  }
-
-  return errors;
-}
-
-function validateDescription(text: string, rule: SectionRule): string[] {
-  const constraints = rule.constraints;
-  const tolerance = getTolerance(constraints);
-  const minChars = getNumber(constraints, "min_chars", 0) - tolerance;
-  const maxChars = getNumber(constraints, "max_chars", 0) + tolerance;
-
-  const normalized = normalizeText(text);
-  const errors: string[] = [];
-
-  if (!rangeCheck(normalized.length, Math.max(0, minChars), maxChars)) {
-    errors.push(`描述长度不满足约束: ${normalized.length}`);
-  }
-
-  const paragraphs = normalized
-    .split(/\n\s*\n/g)
-    .map((p) => p.trim())
-    .filter(Boolean);
-  const minParagraphs = getNumber(constraints, "min_paragraphs", 0);
-  const maxParagraphs = getNumber(constraints, "max_paragraphs", 0);
-
-  if (!rangeCheck(paragraphs.length, minParagraphs, maxParagraphs)) {
-    errors.push(`段落数量不满足约束: ${paragraphs.length}`);
   }
 
   return errors;
@@ -227,6 +210,33 @@ function uniqueSorted(values: number[]): number[] {
   return [...new Set(values)].sort((a, b) => a - b);
 }
 
+function buildSearchTermsFromRule(requirements: ListingRequirements, rule: SectionRule): string {
+  const source = typeof rule.constraints.source === "string" ? rule.constraints.source : "keywords_copy";
+  if (source !== "keywords_copy") {
+    throw new Error(`search_terms 暂不支持 source=${source}`);
+  }
+  const dedupe = rule.constraints.dedupe !== false;
+  const separator = typeof rule.constraints.separator === "string" && rule.constraints.separator !== ""
+    ? rule.constraints.separator
+    : " ";
+  const values = dedupe ? dedupeKeepOrder(requirements.keywords) : requirements.keywords.map((v) => normalizeLine(v)).filter(Boolean);
+  return values.join(separator);
+}
+
+function renderByVars(template: string, vars: Record<string, string>): string {
+  return template.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_, key: string) => vars[key] ?? "");
+}
+
+function renderList(items: string[], itemTemplate: string): string {
+  const rendered = items.map((item, index) =>
+    renderByVars(itemTemplate, {
+      index: String(index + 1),
+      item
+    })
+  );
+  return rendered.join("\n");
+}
+
 async function promiseValue<T>(promise: Promise<T>, label: string): Promise<T> {
   try {
     return await promise;
@@ -239,6 +249,7 @@ async function promiseValue<T>(promise: Promise<T>, label: string): Promise<T> {
 export class GenerationService {
   private readonly llmClient: LLMClient;
   private executionBrief = "";
+  private currentRules: TenantRules | null = null;
 
   constructor(
     private readonly env: AppEnv,
@@ -274,6 +285,13 @@ export class GenerationService {
         "trace append failed"
       );
     }
+  }
+
+  private mustRulesLoaded(): TenantRules {
+    if (!this.currentRules) {
+      throw new Error("规则未加载");
+    }
+    return this.currentRules;
   }
 
   private buildSectionSystemPrompt(rule: SectionRule, jsonOutput = false): string {
@@ -746,11 +764,12 @@ export class GenerationService {
   }
 
   private async translateText(text: string, step: string, retries: number): Promise<string> {
+    const rules = this.mustRulesLoaded();
     const started = Date.now();
     await this.appendTrace("translate_start", "info", { step, input_chars: text.length, retries });
     this.logger.info({ event: "translate_start", step, input_chars: text.length, retries }, "translate start");
     const translated = await this.llmClient.translateWithTranslatorAgent(
-      "你是专业翻译。将输入英文翻译成简体中文，保持语义准确，不要解释。",
+      rules.workflow.translation.system_prompt,
       text,
       step,
       Math.max(1, retries)
@@ -767,31 +786,27 @@ export class GenerationService {
     return translated;
   }
 
-  private buildPlanningSystemPrompt(): string {
-    return [
-      "你是电商文案执行编排师（Orchestrator）。",
-      "请根据输入需求输出一份简洁的英文执行简报，用于后续多阶段文案生成与修复。",
-      "只输出纯文本，不要 JSON，不要代码块，不要解释过程。"
-    ].join("\n");
-  }
-
-  private buildPlanningUserPrompt(requirements: ListingRequirements): string {
-    return [
-      "任务：输出 listing 生成执行简报（英文）",
-      `品牌: ${requirements.brand}`,
-      `分类: ${requirements.category}`,
-      `关键词库:\n${requirements.keywords.join("\n")}`,
-      "需求原文:",
-      requirements.raw,
-      "输出要求：",
-      "1) 给出标题策略、五点策略、描述策略、搜索词策略；",
-      "2) 给出执行顺序建议（先并发生成哪些 section，再做哪些复核）；",
-      "3) 每条策略一句话，强调关键词覆盖与可读性平衡；",
-      "4) 总长度控制在 700 字符以内。"
-    ].join("\n");
+  private buildPromptVars(
+    requirements: ListingRequirements,
+    sections?: Partial<Record<ENSectionKey, string>>
+  ): Record<string, string> {
+    return {
+      brand: requirements.brand,
+      category: requirements.category,
+      keywords: requirements.keywords.join("\n"),
+      requirements_raw: requirements.raw,
+      title: sections?.title ?? "",
+      bullets: sections?.bullets ?? "",
+      description: sections?.description ?? "",
+      search_terms: sections?.search_terms ?? ""
+    };
   }
 
   private async planExecution(requirements: ListingRequirements): Promise<string> {
+    const rules = this.mustRulesLoaded();
+    if (!rules.workflow.planning.enabled) {
+      return "";
+    }
     const started = Date.now();
     await this.appendTrace("planning_start", "info", {
       brand: requirements.brand,
@@ -800,10 +815,10 @@ export class GenerationService {
     });
     try {
       const brief = await this.llmClient.orchestrateWithOrchestratorAgent(
-        this.buildPlanningSystemPrompt(),
-        this.buildPlanningUserPrompt(requirements),
+        rules.workflow.planning.system_prompt,
+        renderByVars(rules.workflow.planning.user_prompt, this.buildPromptVars(requirements)),
         "orchestration",
-        2
+        rules.workflow.planning.retries
       );
       const normalized = normalizeText(brief);
       await this.appendTrace("planning_ok", "info", {
@@ -822,41 +837,12 @@ export class GenerationService {
     }
   }
 
-  private buildJudgeSystemPrompt(): string {
-    return [
-      "你是亚马逊 Listing 质量审查专家。",
-      "你将审查英文 listing 各 section 的一致性与规则匹配度。",
-      "若无问题，只输出：OK",
-      "若有问题，按以下格式逐行输出：",
-      "- [title] <问题>",
-      "- [bullets] <问题>",
-      "- [description] <问题>",
-      "- [search_terms] <问题>",
-      "禁止输出其他格式。"
-    ].join("\n");
-  }
-
-  private buildJudgeUserPrompt(requirements: ListingRequirements, sections: Record<ENSectionKey, string>): string {
-    return [
-      `品牌: ${requirements.brand}`,
-      `分类: ${requirements.category}`,
-      `关键词库:\n${requirements.keywords.join("\n")}`,
-      "",
-      "【TITLE】",
-      sections.title,
-      "",
-      "【BULLETS】",
-      sections.bullets,
-      "",
-      "【DESCRIPTION】",
-      sections.description,
-      "",
-      "【SEARCH_TERMS】",
-      sections.search_terms
-    ].join("\n");
-  }
-
   private parseJudgeIssues(text: string): JudgeIssue[] {
+    const rules = this.mustRulesLoaded();
+    const ignored = new Set(rules.workflow.judge.ignore_messages.map((v) => normalizeText(v).toLowerCase()));
+    const allowed = new Set(
+      rules.requiredSections.filter((v) => v !== "translation") as ENSectionKey[]
+    );
     const normalized = normalizeText(text);
     if (normalized.toUpperCase() === "OK") {
       return [];
@@ -864,13 +850,21 @@ export class GenerationService {
     const lines = normalized.split("\n").map((v) => v.trim()).filter(Boolean);
     const out: JudgeIssue[] = [];
     for (const line of lines) {
-      const m = /^-?\s*\[(title|bullets|description|search_terms)\]\s*(.+)$/i.exec(line);
+      const m = /^-?\s*\[([a-zA-Z0-9_]+)\]\s*(.+)$/i.exec(line);
       if (!m) {
         continue;
       }
+      const section = m[1].toLowerCase() as ENSectionKey;
+      if (!allowed.has(section)) {
+        continue;
+      }
+      const message = m[2].trim();
+      if (ignored.has(normalizeText(message).toLowerCase())) {
+        continue;
+      }
       out.push({
-        section: m[1].toLowerCase() as ENSectionKey,
-        message: m[2].trim()
+        section,
+        message
       });
     }
     return out;
@@ -880,14 +874,18 @@ export class GenerationService {
     requirements: ListingRequirements,
     sections: Record<ENSectionKey, string>
   ): Promise<JudgeIssue[]> {
+    const rules = this.mustRulesLoaded();
+    if (!rules.workflow.judge.enabled) {
+      return [];
+    }
     const started = Date.now();
     await this.appendTrace("quality_judge_start", "info", {});
     try {
       const judgeOutput = await this.llmClient.reviewWithJudgeAgent(
-        this.buildJudgeSystemPrompt(),
-        this.buildJudgeUserPrompt(requirements, sections),
+        rules.workflow.judge.system_prompt,
+        renderByVars(rules.workflow.judge.user_prompt, this.buildPromptVars(requirements, sections)),
         "quality_judge",
-        2
+        rules.workflow.judge.retries
       );
       const issues = this.parseJudgeIssues(judgeOutput);
       if (issues.length > 0) {
@@ -930,7 +928,15 @@ export class GenerationService {
       },
       "generation start"
     );
-    const requirements = parseRequirements(input.inputMarkdown);
+    const archivePath = join(this.env.rulesFsDir, input.tenantId, input.rulesVersion, "rules.tar.gz");
+    const tenantRules = await loadTenantRules(archivePath, input.tenantId, input.rulesVersion);
+    this.currentRules = tenantRules;
+    await this.appendTrace("rules_loaded", "info", {
+      archive_path: archivePath,
+      rules_version: tenantRules.version
+    });
+
+    const requirements = parseRequirements(input.inputMarkdown, tenantRules.input);
 
     if (!requirements.category) {
       await this.appendTrace("generation_invalid_input", "error", { error: "缺少分类" });
@@ -941,13 +947,6 @@ export class GenerationService {
       throw new Error("关键词过少，至少 3 条");
     }
 
-    const archivePath = join(this.env.rulesFsDir, input.tenantId, input.rulesVersion, "rules.tar.gz");
-    const tenantRules = await loadTenantRules(archivePath, input.tenantId, input.rulesVersion);
-    await this.appendTrace("rules_loaded", "info", {
-      archive_path: archivePath,
-      rules_version: tenantRules.version
-    });
-
     const titleRule = tenantRules.sections.get("title");
     const bulletsRule = tenantRules.sections.get("bullets");
     const descriptionRule = tenantRules.sections.get("description");
@@ -955,14 +954,12 @@ export class GenerationService {
     const translationRule = tenantRules.sections.get("translation");
 
     if (!titleRule || !bulletsRule || !descriptionRule || !searchTermsRule || !translationRule) {
-      await this.appendTrace("rules_missing_sections", "error", {
-        title: Boolean(titleRule),
-        bullets: Boolean(bulletsRule),
-        description: Boolean(descriptionRule),
-        search_terms: Boolean(searchTermsRule),
-        translation: Boolean(translationRule)
-      });
-      throw new Error("规则文件缺失：title/bullets/description/search_terms/translation 必须齐全");
+      const existsPayload: Record<string, unknown> = {};
+      for (const key of tenantRules.requiredSections) {
+        existsPayload[key] = tenantRules.sections.has(key);
+      }
+      await this.appendTrace("rules_missing_sections", "error", existsPayload);
+      throw new Error(`规则文件缺失：${tenantRules.requiredSections.join("/")} 必须齐全`);
     }
 
     const translationRetries = Math.max(1, translationRule.execution.retries || 2);
@@ -973,20 +970,20 @@ export class GenerationService {
     const keywordsTranslationPromise = this.translateText(keywordsText, "translate_keywords", translationRetries);
 
     const titleEnPromise = this.generateSectionWithValidation(requirements, titleRule, "title", (content) =>
-      validateTitle(content, requirements, titleRule)
+      validateSectionContent(content, requirements, titleRule)
     );
     const bulletsJSONModeSettings = this.deepseekJSONModeSettings();
+    const bulletsJSONArrayField = bulletsRule.output.json_array_field || "bullets";
     const bulletsRawPromise = this.generateSectionWithValidation(requirements, bulletsRule, "bullets", (content) => {
-      const lines = splitLines(content);
-      return validateBullets(lines, bulletsRule);
+      return validateSectionContent(content, requirements, bulletsRule);
     }, {
       jsonOutput: true,
       writerModelSettings: bulletsJSONModeSettings,
       repairModelSettings: bulletsJSONModeSettings,
-      adaptContent: adaptBulletsJSONContent
+      adaptContent: (raw) => adaptJSONArrayContent(raw, bulletsJSONArrayField)
     });
     const descriptionEnPromise = this.generateSectionWithValidation(requirements, descriptionRule, "description", (content) =>
-      validateDescription(content, descriptionRule)
+      validateSectionContent(content, requirements, descriptionRule)
     );
 
     let titleEn = await titleEnPromise;
@@ -994,9 +991,10 @@ export class GenerationService {
     let bulletsLinesEn = splitLines(bulletsRaw);
     let descriptionEn = await descriptionEnPromise;
 
-    const searchTermsEn = dedupeKeepOrder(requirements.keywords).join(" ");
+    const searchTermsEn = buildSearchTermsFromRule(requirements, searchTermsRule);
 
-    const maxJudgeRounds = 2;
+    const judgeSkip = new Set(tenantRules.workflow.judge.skip_sections);
+    const maxJudgeRounds = tenantRules.workflow.judge.max_rounds;
     let judgeIssues = await this.runQualityJudge(requirements, {
       title: titleEn,
       bullets: bulletsLinesEn.join("\n"),
@@ -1017,7 +1015,7 @@ export class GenerationService {
           requirements,
           titleRule,
           `title_judge_repair_round_${judgeRound}`,
-          (content) => validateTitle(content, requirements, titleRule),
+          (content) => validateSectionContent(content, requirements, titleRule),
           {
             initialFeedback: this.buildJudgeFeedbackText(grouped.title),
             maxRetries: 2
@@ -1030,14 +1028,14 @@ export class GenerationService {
           requirements,
           bulletsRule,
           `bullets_judge_repair_round_${judgeRound}`,
-          (content) => validateBullets(splitLines(content), bulletsRule),
+          (content) => validateSectionContent(content, requirements, bulletsRule),
           {
             initialFeedback: this.buildJudgeFeedbackText(grouped.bullets),
             maxRetries: 2,
             jsonOutput: true,
             writerModelSettings: bulletsJSONModeSettings,
             repairModelSettings: bulletsJSONModeSettings,
-            adaptContent: adaptBulletsJSONContent
+            adaptContent: (raw) => adaptJSONArrayContent(raw, bulletsJSONArrayField)
           }
         );
         bulletsLinesEn = splitLines(bulletsRaw);
@@ -1048,7 +1046,7 @@ export class GenerationService {
           requirements,
           descriptionRule,
           `description_judge_repair_round_${judgeRound}`,
-          (content) => validateDescription(content, descriptionRule),
+          (content) => validateSectionContent(content, requirements, descriptionRule),
           {
             initialFeedback: this.buildJudgeFeedbackText(grouped.description),
             maxRetries: 2
@@ -1057,10 +1055,15 @@ export class GenerationService {
       }
 
       if (grouped.search_terms.length > 0) {
+        const searchTermsSource = typeof searchTermsRule.constraints.source === "string"
+          ? searchTermsRule.constraints.source
+          : "keywords_copy";
         await this.appendTrace("quality_judge_repair_skip", "warn", {
           round: judgeRound,
           section: "search_terms",
-          reason: "search_terms 固定由关键词库复制，不进行模型改写",
+          reason: judgeSkip.has("search_terms")
+            ? `search_terms 使用 ${searchTermsSource}，当前不进行模型改写`
+            : "当前执行器未启用 search_terms 模型改写",
           issues: grouped.search_terms
         });
       }
@@ -1088,51 +1091,27 @@ export class GenerationService {
     const keywordsCn = splitLines(keywordsCnRaw);
     const bulletsCn = splitLines(bulletsCnRaw);
 
-    const enMarkdown = [
-      "# Amazon Listing (EN)",
-      "",
-      "## 分类",
-      requirements.category,
-      "",
-      "## 关键词",
-      ...requirements.keywords,
-      "",
-      "## 标题",
-      titleEn,
-      "",
-      "## 五点描述",
-      ...bulletsLinesEn.map((line, idx) => `**第${idx + 1}点**\n${line}\n`),
-      "",
-      "## 产品描述",
-      descriptionEn,
-      "",
-      "## 搜索词",
-      searchTermsEn
-    ].join("\n");
+    const keywordsCnFinal = keywordsCn.length > 0 ? keywordsCn : requirements.keywords;
+    const bulletsCnFinal = bulletsCn.length > 0 ? bulletsCn : bulletsLinesEn;
 
-    const cnMarkdown = [
-      "# 亚马逊 Listing (CN)",
-      "",
-      "## 分类",
-      normalizeText(categoryCn),
-      "",
-      "## 关键词",
-      ...(keywordsCn.length > 0 ? keywordsCn : requirements.keywords),
-      "",
-      "## 标题",
-      normalizeText(titleCn),
-      "",
-      "## 五点描述",
-      ...(bulletsCn.length > 0
-        ? bulletsCn.map((line, idx) => `**第${idx + 1}点**\n${line}\n`)
-        : bulletsLinesEn.map((line, idx) => `**第${idx + 1}点**\n${line}\n`)),
-      "",
-      "## 产品描述",
-      normalizeText(descriptionCn),
-      "",
-      "## 搜索词",
-      normalizeText(searchTermsCn)
-    ].join("\n");
+    const vars = {
+      brand: requirements.brand,
+      category_en: requirements.category,
+      category_cn: normalizeText(categoryCn),
+      keywords_en: renderList(requirements.keywords, tenantRules.workflow.render.keywords_item_template),
+      keywords_cn: renderList(keywordsCnFinal, tenantRules.workflow.render.keywords_item_template),
+      title_en: normalizeText(titleEn),
+      title_cn: normalizeText(titleCn),
+      bullets_en: renderList(bulletsLinesEn, tenantRules.workflow.render.bullets_item_template),
+      bullets_cn: renderList(bulletsCnFinal, tenantRules.workflow.render.bullets_item_template),
+      description_en: normalizeText(descriptionEn),
+      description_cn: normalizeText(descriptionCn),
+      search_terms_en: normalizeText(searchTermsEn),
+      search_terms_cn: normalizeText(searchTermsCn)
+    };
+
+    const enMarkdown = normalizeText(renderByVars(tenantRules.templates.en, vars));
+    const cnMarkdown = normalizeText(renderByVars(tenantRules.templates.cn, vars));
 
     this.logger.info(
       {
