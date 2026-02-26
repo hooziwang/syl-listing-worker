@@ -60,6 +60,19 @@ docker compose up -d --build
 bash scripts/deploy.sh
 ```
 
+从本地直接远程部署（推荐，内置主机指纹自动修复）：
+
+```bash
+bash scripts/deploy.sh \
+  --remote-host 43.135.112.167 \
+  --remote-user ubuntu \
+  --install-docker
+```
+
+首次重装服务器后，若主机指纹变化，脚本会自动清理旧 `known_hosts` 指纹并拉取新指纹，再继续部署。
+
+远程目录默认 `/opt/syl-listing-worker`，可通过 `--remote-dir` 覆盖。
+
 ## 部署后验证
 
 查看容器状态：
@@ -80,9 +93,11 @@ make diagnose
 make diagnose-external BASE_URL=https://worker.aelus.tech SYL_KEY=<SYL_LISTING_KEY>
 # 可选: TIMEOUT=300 INTERVAL=2
 # 本机调试可加: RESOLVE=worker.aelus.tech:443:127.0.0.1
+# 需要额外检查生成链路时加: DIAGNOSE_EXTERNAL_OPTS="--with-generate"
 ```
 
-说明：外部诊断会发起一次真实 `generate` 任务；若任务因内容校验失败返回 `failed`，会以警告提示，但仍视为接口链路可用。
+说明：外部诊断默认不发起 `generate` 任务；仅检查健康、鉴权、规则接口。  
+如需附加检查生成链路，可加 `--with-generate`，这会发起一次真实 `generate` 任务。
 
 验证 HTTP 跳转 HTTPS：
 
@@ -178,6 +193,8 @@ docker compose up -d --build
   - 检查 `443` 端口放通。
 - `docker compose` 不存在：
   - 安装 `docker-compose-v2`，使用 `docker compose` 命令。
+- 服务器重装后 SSH 指纹变化：
+  - 使用 `scripts/deploy.sh --remote-host ...`，会自动清理旧 `known_hosts` 指纹并拉取新指纹后重试连接。
 
 ## 关键接口
 

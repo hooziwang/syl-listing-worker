@@ -31,4 +31,4 @@ diagnose:
 	bash scripts/diagnose.sh
 
 diagnose-external:
-	bash scripts/diagnose_external.sh --base-url "$(BASE_URL)" --key "$(SYL_KEY)" --timeout "$(TIMEOUT)" --interval "$(INTERVAL)" --resolve "$(RESOLVE)"
+	bash scripts/diagnose_external.sh --base-url "$(BASE_URL)" --key "$(SYL_KEY)" --timeout "$(TIMEOUT)" --interval "$(INTERVAL)" --resolve "$(RESOLVE)" $(DIAGNOSE_EXTERNAL_OPTS)

@@ -6,6 +6,7 @@ SYL_KEY="${SYL_KEY:-${SYL_LISTING_KEY:-}}"
 POLL_TIMEOUT_SECONDS="${POLL_TIMEOUT_SECONDS:-300}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-2}"
 CURL_RESOLVE="${CURL_RESOLVE:-}"
+WITH_GENERATE=0
 
 log() {
   printf '%s\n' "$*"
@@ -31,6 +32,7 @@ usage() {
   --timeout <sec>        生成任务轮询超时时间，默认 300
   --interval <sec>       轮询间隔，默认 2
   --resolve <rule>       透传给 curl --resolve（可选），例: worker.aelus.tech:443:127.0.0.1
+  --with-generate        额外执行一次真实 generate 链路检查（默认关闭）
   -h, --help             显示帮助
 EOF
 }
@@ -63,6 +65,9 @@ parse_args() {
         val="${2:-}"
         [[ -n "${val}" ]] && CURL_RESOLVE="${val}"
         shift
+        ;;
+      --with-generate)
+        WITH_GENERATE=1
         ;;
       -h|--help)
         usage
@@ -258,7 +263,11 @@ main() {
   local token
   token="$(check_auth)"
   check_rules_endpoints "$token"
-  check_generate_pipeline "$token"
+  if [[ "${WITH_GENERATE}" -eq 1 ]]; then
+    check_generate_pipeline "$token"
+  else
+    log "跳过生成链路检查（默认关闭，可加 --with-generate）"
+  fi
   log "外部诊断完成: worker 对外接口运行正常"
 }
 
