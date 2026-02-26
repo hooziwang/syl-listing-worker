@@ -130,6 +130,20 @@ curl -i -X POST 'https://worker.aelus.tech/v1/auth/exchange' \
   -H 'Authorization: Bearer <SYL_LISTING_KEY>'
 ```
 
+查询任务全链路日志（管理员接口）：
+
+```bash
+curl -sS 'https://worker.aelus.tech/v1/admin/logs/trace/<job_id>?limit=500&offset=0' \
+  -H 'Authorization: Bearer <ADMIN_TOKEN>'
+```
+
+也支持：
+
+```bash
+curl -sS 'https://worker.aelus.tech/v1/admin/logs/trace/<job_id>' \
+  -H 'x-admin-token: <ADMIN_TOKEN>'
+```
+
 ## 迁移到新服务器
 
 1. 将仓库和 `data/` 一并迁移（尤其规则和证书数据）：
@@ -213,3 +227,4 @@ make deploy-remote SERVER=syl-server
 - `POST /v1/generate`
 - `GET /v1/jobs/:jobId`
 - `GET /v1/jobs/:jobId/result`
+- `GET /v1/admin/logs/trace/:jobId`（管理员接口，`Authorization: Bearer <ADMIN_TOKEN>` 或 `x-admin-token: <ADMIN_TOKEN>`）
