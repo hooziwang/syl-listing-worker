@@ -18,12 +18,19 @@ const publishSchema = z.object({
   signature_algo: z.string().default("ed25519")
 });
 
+function withTenant<T extends object>(tenantId: string, payload: T): T & { tenant_id: string } {
+  return {
+    ...(payload as object),
+    tenant_id: tenantId
+  } as T & { tenant_id: string };
+}
+
 function requireAdmin(ctx: ApiContext) {
   return async (request: FastifyRequest, reply: FastifyReply) => {
     const tokenHeader = request.headers["x-admin-token"];
     const token = Array.isArray(tokenHeader) ? tokenHeader[0] : tokenHeader;
     if (!token || token !== ctx.env.adminToken) {
-      return reply.unauthorized("invalid_admin_token");
+      return reply.code(401).send(withTenant("admin", { error: "invalid_admin_token" }));
     }
   };
 }
@@ -32,14 +39,15 @@ function requireAuth(ctx: ApiContext) {
   return async (request: FastifyRequest, reply: FastifyReply) => {
     const parsed = bearerSchema.safeParse(request.headers.authorization || "");
     if (!parsed.success) {
-      return reply.unauthorized("missing_bearer_token");
+      return reply.code(401).send(withTenant("unknown", { error: "missing_bearer_token" }));
     }
 
     const token = parsed.data.replace(/^Bearer\s+/i, "").trim();
     try {
       request.auth = ctx.authService.verifyBearerToken(token);
+      reply.header("x-tenant-id", request.auth.tenant_id);
     } catch {
-      return reply.unauthorized("invalid_bearer_token");
+      return reply.code(401).send(withTenant("unknown", { error: "invalid_bearer_token" }));
     }
   };
 }
@@ -68,26 +76,28 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
     if (!report.ok) {
       reply.code(503);
     }
-    return report;
+    reply.header("x-tenant-id", "system");
+    return withTenant("system", report);
   });
 
   app.post("/v1/auth/exchange", async (request, reply) => {
     const authHeader = request.headers.authorization;
     const parsedBearer = bearerSchema.safeParse(Array.isArray(authHeader) ? authHeader[0] : authHeader || "");
     if (!parsedBearer.success) {
-      return reply.badRequest("missing_bearer_authorization");
+      return reply.code(400).send(withTenant("unknown", { error: "missing_bearer_authorization" }));
     }
 
     const sylKey = parsedBearer.data.replace(/^Bearer\s+/i, "").trim();
     if (!sylKey) {
-      return reply.badRequest("missing_bearer_authorization");
+      return reply.code(400).send(withTenant("unknown", { error: "missing_bearer_authorization" }));
     }
 
     try {
       const exchanged = ctx.authService.exchangeBySylKey(sylKey);
+      reply.header("x-tenant-id", exchanged.tenant_id);
       return exchanged;
     } catch {
-      return reply.unauthorized("invalid_syl_key");
+      return reply.code(401).send(withTenant("unknown", { error: "invalid_syl_key" }));
     }
   });
 
@@ -107,8 +117,9 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
         });
       } catch (error) {
         const msg = error instanceof Error ? error.message : "publish_failed";
-        return reply.badRequest(msg);
+        return reply.code(400).send(withTenant(body.tenant_id, { error: msg }));
       }
+      reply.header("x-tenant-id", body.tenant_id);
       return {
         ok: true,
         tenant_id: body.tenant_id,
@@ -122,8 +133,9 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
         await ctx.rulesService.rollback(body.tenant_id, body.rules_version);
       } catch (error) {
         const msg = error instanceof Error ? error.message : "rollback_failed";
-        return reply.badRequest(msg);
+        return reply.code(400).send(withTenant(body.tenant_id, { error: msg }));
       }
+      reply.header("x-tenant-id", body.tenant_id);
       return { ok: true, tenant_id: body.tenant_id, rules_version: body.rules_version };
     });
   });
@@ -136,29 +148,30 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
       const tenantId = request.auth!.tenant_id;
       const resolved = await ctx.rulesService.resolve(tenantId, query.current);
       resolved.download_url = `${requestBaseURL(request)}/v1/rules/download/${encodeURIComponent(tenantId)}/${encodeURIComponent(resolved.rules_version)}`;
-      return resolved;
+      return withTenant(tenantId, resolved);
     });
 
     securedApp.post("/v1/rules/refresh", async (request) => {
       const tenantId = request.auth!.tenant_id;
       const resolved = await ctx.rulesService.resolve(tenantId, undefined);
       resolved.download_url = `${requestBaseURL(request)}/v1/rules/download/${encodeURIComponent(tenantId)}/${encodeURIComponent(resolved.rules_version)}`;
-      return resolved;
+      return withTenant(tenantId, resolved);
     });
 
     securedApp.get("/v1/rules/download/:tenantId/:rulesVersion", async (request, reply) => {
       const params = z.object({ tenantId: z.string().min(1), rulesVersion: z.string().min(1) }).parse(request.params);
       const tenantId = request.auth!.tenant_id;
       if (tenantId !== params.tenantId) {
-        return reply.forbidden("tenant_mismatch");
+        return reply.code(403).send(withTenant(tenantId, { error: "tenant_mismatch" }));
       }
       try {
         const archive = await ctx.rulesService.readArchive(params.tenantId, params.rulesVersion);
+        reply.header("x-tenant-id", tenantId);
         reply.header("Content-Type", "application/gzip");
         reply.header("Cache-Control", "no-store");
         return reply.send(archive);
       } catch {
-        return reply.notFound("rules_archive_not_found");
+        return reply.code(404).send(withTenant(tenantId, { error: "rules_archive_not_found" }));
       }
     });
 
@@ -178,7 +191,8 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
 
       return {
         job_id: jobId,
-        status: "queued"
+        status: "queued",
+        tenant_id: tenantId
       };
     });
 
@@ -188,14 +202,15 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
 
       const record = await ctx.jobStore.get(params.jobId);
       if (!record || record.tenant_id !== tenantId) {
-        return reply.notFound("job_not_found");
+        return reply.code(404).send(withTenant(tenantId, { error: "job_not_found" }));
       }
 
       return {
         job_id: record.id,
         status: record.status,
         error: record.error_message || undefined,
-        updated_at: record.updated_at
+        updated_at: record.updated_at,
+        tenant_id: tenantId
       };
     });
 
@@ -205,23 +220,24 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
 
       const record = await ctx.jobStore.get(params.jobId);
       if (!record || record.tenant_id !== tenantId) {
-        return reply.notFound("job_not_found");
+        return reply.code(404).send(withTenant(tenantId, { error: "job_not_found" }));
       }
 
       if (record.status !== "succeeded") {
         return reply.code(409).send({
           error: "job_not_ready",
           status: record.status,
-          message: "任务未完成，暂不可读取 result"
+          message: "任务未完成，暂不可读取 result",
+          tenant_id: tenantId
         });
       }
 
       const result = await ctx.jobStore.consumeResult(params.jobId);
       if (!result) {
-        return reply.notFound("result_consumed_or_missing");
+        return reply.code(404).send(withTenant(tenantId, { error: "result_consumed_or_missing" }));
       }
 
-      return result;
+      return withTenant(tenantId, result);
     });
   });
 }

@@ -29,14 +29,30 @@ else
 fi
 
 reload_loop() {
+  cert_mtime_prev=0
+  key_mtime_prev=0
+
+  if [ -s "${CERT_FILE}" ] && [ -s "${KEY_FILE}" ]; then
+    cert_mtime_prev="$(stat -c %Y "${CERT_FILE}" 2>/dev/null || echo 0)"
+    key_mtime_prev="$(stat -c %Y "${KEY_FILE}" 2>/dev/null || echo 0)"
+  fi
+
   while true; do
     sleep 120
     mode="$(cat "${STATE_FILE}" 2>/dev/null || echo "http")"
     if [ "${mode}" = "http" ] && [ -s "${CERT_FILE}" ] && [ -s "${KEY_FILE}" ]; then
+      cert_mtime_prev="$(stat -c %Y "${CERT_FILE}" 2>/dev/null || echo 0)"
+      key_mtime_prev="$(stat -c %Y "${KEY_FILE}" 2>/dev/null || echo 0)"
       render_https
       nginx -s reload || true
-    elif [ "${mode}" = "https" ]; then
-      nginx -s reload || true
+    elif [ "${mode}" = "https" ] && [ -s "${CERT_FILE}" ] && [ -s "${KEY_FILE}" ]; then
+      cert_mtime_now="$(stat -c %Y "${CERT_FILE}" 2>/dev/null || echo 0)"
+      key_mtime_now="$(stat -c %Y "${KEY_FILE}" 2>/dev/null || echo 0)"
+      if [ "${cert_mtime_now}" != "${cert_mtime_prev}" ] || [ "${key_mtime_now}" != "${key_mtime_prev}" ]; then
+        cert_mtime_prev="${cert_mtime_now}"
+        key_mtime_prev="${key_mtime_now}"
+        nginx -s reload || true
+      fi
     fi
   done
 }
