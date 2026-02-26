@@ -1,0 +1,87 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: syl-listing-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ./data/redis:/data
+
+  worker-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: syl-listing-worker:latest
+    container_name: syl-listing-worker-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: ["node", "dist/api-main.js"]
+    depends_on:
+      - redis
+    volumes:
+      - ./data/rules:/data/syl-listing/rules
+
+  worker-runner:
+    image: syl-listing-worker:latest
+    container_name: syl-listing-worker-runner
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: ["node", "dist/runner-main.js"]
+    depends_on:
+      - redis
+      - worker-api
+    volumes:
+      - ./data/rules:/data/syl-listing/rules
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: syl-listing-nginx
+    restart: unless-stopped
+    depends_on:
+      - worker-api
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMAIN=${DOMAIN}
+    volumes:
+      - ./docker/nginx/entrypoint.sh:/entrypoint.sh:ro
+      - ./docker/nginx/templates:/etc/nginx/templates:ro
+      - ./data/letsencrypt:/etc/letsencrypt
+      - ./data/certbot-webroot:/var/www/certbot
+    command: ["/bin/sh", "/entrypoint.sh"]
+
+  certbot:
+    image: certbot/certbot:latest
+    container_name: syl-listing-certbot
+    restart: unless-stopped
+    depends_on:
+      - nginx
+    entrypoint:
+      - /bin/sh
+      - -ec
+    environment:
+      - DOMAIN=${DOMAIN}
+      - LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL}
+    volumes:
+      - ./data/letsencrypt:/etc/letsencrypt
+      - ./data/certbot-webroot:/var/www/certbot
+    command:
+      - |
+        set -u
+        if [ -z "$${DOMAIN:-}" ]; then
+          echo "DOMAIN is required"
+          exit 1
+        fi
+        sleep 10
+        EMAIL_ARGS="--register-unsafely-without-email"
+        if [ -n "$${LETSENCRYPT_EMAIL:-}" ]; then
+          EMAIL_ARGS="--email $${LETSENCRYPT_EMAIL}"
+        fi
+        while true; do
+          certbot certonly --webroot --webroot-path /var/www/certbot --non-interactive --agree-tos $${EMAIL_ARGS} --keep-until-expiring -d "$${DOMAIN}" || true
+          certbot renew --webroot --webroot-path /var/www/certbot --non-interactive --quiet || true
+          sleep 12h
+        done

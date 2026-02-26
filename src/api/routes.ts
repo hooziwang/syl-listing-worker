@@ -66,11 +66,15 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
   app.get("/healthz", async () => ({ ok: true }));
 
   app.post("/v1/auth/exchange", async (request, reply) => {
-    const sylKeyHeader = request.headers["x-syl-key"];
-    const sylKey = Array.isArray(sylKeyHeader) ? sylKeyHeader[0] : sylKeyHeader;
+    const authHeader = request.headers.authorization;
+    const parsedBearer = bearerSchema.safeParse(Array.isArray(authHeader) ? authHeader[0] : authHeader || "");
+    if (!parsedBearer.success) {
+      return reply.badRequest("missing_bearer_authorization");
+    }
 
+    const sylKey = parsedBearer.data.replace(/^Bearer\s+/i, "").trim();
     if (!sylKey) {
-      return reply.badRequest("missing_x_syl_key");
+      return reply.badRequest("missing_bearer_authorization");
     }
 
     try {
