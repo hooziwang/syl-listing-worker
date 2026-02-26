@@ -70,8 +70,10 @@ bash scripts/deploy.sh \
 ```
 
 首次重装服务器后，若主机指纹变化，脚本会自动清理旧 `known_hosts` 指纹并拉取新指纹，再继续部署。
+部署脚本默认会等待 HTTPS 就绪（证书签发后会自动触发 nginx 切换），避免刚部署完出现 443 握手失败窗口期。
 
 远程目录默认 `/opt/syl-listing-worker`，可通过 `--remote-dir` 覆盖。
+可选：`--skip-wait-https`（跳过等待）、`--https-timeout`、`--https-interval`（调整等待策略）。
 
 ## 部署后验证
 

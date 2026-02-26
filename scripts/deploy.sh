@@ -7,6 +7,9 @@ ENV_EXAMPLE_FILE="${ROOT_DIR}/.env.example"
 SKIP_BUILD=0
 STOP_LEGACY=0
 INSTALL_DOCKER=0
+SKIP_WAIT_HTTPS=0
+HTTPS_TIMEOUT_SECONDS="${HTTPS_TIMEOUT_SECONDS:-240}"
+HTTPS_INTERVAL_SECONDS="${HTTPS_INTERVAL_SECONDS:-2}"
 REMOTE_HOST=""
 REMOTE_USER="${REMOTE_USER:-ubuntu}"
 REMOTE_PORT="${REMOTE_PORT:-22}"
@@ -33,6 +36,9 @@ usage() {
   --skip-build       跳过镜像构建（等同 docker compose up -d）
   --stop-legacy      停止并禁用旧 systemd 服务（api/runner/nginx）
   --install-docker   缺少 docker 时尝试自动安装（Ubuntu）
+  --skip-wait-https  部署后不等待 HTTPS 就绪（默认等待）
+  --https-timeout    等待 HTTPS 就绪超时秒数，默认 240
+  --https-interval   等待 HTTPS 轮询间隔秒数，默认 2
   --remote-host      远端主机（启用远程部署模式）
   --remote-user      远端 SSH 用户，默认 ubuntu
   --remote-port      远端 SSH 端口，默认 22
@@ -53,6 +59,17 @@ parse_args() {
         ;;
       --install-docker)
         INSTALL_DOCKER=1
+        ;;
+      --skip-wait-https)
+        SKIP_WAIT_HTTPS=1
+        ;;
+      --https-timeout)
+        HTTPS_TIMEOUT_SECONDS="${2:-}"
+        shift
+        ;;
+      --https-interval)
+        HTTPS_INTERVAL_SECONDS="${2:-}"
+        shift
         ;;
       --remote-host)
         REMOTE_HOST="${2:-}"
@@ -83,6 +100,14 @@ parse_args() {
     esac
     shift
   done
+}
+
+validate_positive_integer() {
+  local key="$1"
+  local value="$2"
+  if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+    die "${key} 必须是正整数"
+  fi
 }
 
 need_cmd() {
@@ -168,6 +193,11 @@ required_env() {
   fi
 }
 
+read_env_value() {
+  local key="$1"
+  grep -E "^${key}=" "${ENV_FILE}" | tail -n 1 | cut -d'=' -f2- || true
+}
+
 validate_env() {
   required_env "DOMAIN"
   required_env "SYL_LISTING_KEYS"
@@ -209,7 +239,50 @@ deploy() {
   fi
 }
 
+wait_https_ready() {
+  if [[ "${SKIP_WAIT_HTTPS}" -eq 1 ]]; then
+    return
+  fi
+
+  local domain
+  domain="$(read_env_value "DOMAIN")"
+  [[ -n "${domain}" ]] || return
+
+  local deadline now restarted
+  deadline=$(( $(date +%s) + HTTPS_TIMEOUT_SECONDS ))
+  restarted=0
+
+  log "等待 HTTPS 就绪（domain=${domain}，timeout=${HTTPS_TIMEOUT_SECONDS}s）..."
+  while true; do
+    if "${COMPOSE_CMD[@]}" --env-file "${ENV_FILE}" exec -T nginx sh -lc \
+      "test -s /etc/letsencrypt/live/${domain}/fullchain.pem && \
+       test -s /etc/letsencrypt/live/${domain}/privkey.pem && \
+       [ \"\$(cat /var/run/nginx_tls_mode 2>/dev/null || true)\" = \"https\" ] && \
+       grep -q 'listen 443' /etc/nginx/conf.d/default.conf" >/dev/null 2>&1; then
+      log "HTTPS 已就绪"
+      return
+    fi
+
+    if [[ "${restarted}" -eq 0 ]] && "${COMPOSE_CMD[@]}" --env-file "${ENV_FILE}" exec -T nginx sh -lc \
+      "test -s /etc/letsencrypt/live/${domain}/fullchain.pem && \
+       test -s /etc/letsencrypt/live/${domain}/privkey.pem && \
+       [ \"\$(cat /var/run/nginx_tls_mode 2>/dev/null || true)\" != \"https\" ]" >/dev/null 2>&1; then
+      log "证书已签发，重启 nginx 以立即切换 HTTPS..."
+      "${COMPOSE_CMD[@]}" --env-file "${ENV_FILE}" restart nginx >/dev/null
+      restarted=1
+    fi
+
+    now="$(date +%s)"
+    if (( now >= deadline )); then
+      die "等待 HTTPS 就绪超时（${HTTPS_TIMEOUT_SECONDS}s）"
+    fi
+    sleep "${HTTPS_INTERVAL_SECONDS}"
+  done
+}
+
 run_local_deploy() {
+  validate_positive_integer "https-timeout" "${HTTPS_TIMEOUT_SECONDS}"
+  validate_positive_integer "https-interval" "${HTTPS_INTERVAL_SECONDS}"
   ensure_docker
   resolve_docker_cmd
   resolve_compose_cmd
@@ -220,6 +293,7 @@ run_local_deploy() {
 
   log "开始部署..."
   deploy
+  wait_https_ready
   "${COMPOSE_CMD[@]}" --env-file "${ENV_FILE}" ps
   log "部署完成"
 }
@@ -314,6 +388,11 @@ build_remote_deploy_opts() {
   if [[ "${INSTALL_DOCKER}" -eq 1 ]]; then
     opts+=(--install-docker)
   fi
+  if [[ "${SKIP_WAIT_HTTPS}" -eq 1 ]]; then
+    opts+=(--skip-wait-https)
+  fi
+  opts+=(--https-timeout "${HTTPS_TIMEOUT_SECONDS}")
+  opts+=(--https-interval "${HTTPS_INTERVAL_SECONDS}")
   if [[ "${#opts[@]}" -eq 0 ]]; then
     printf ''
     return
