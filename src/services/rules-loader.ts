@@ -54,6 +54,7 @@ export interface WorkflowRules {
   render: {
     keywords_item_template: string;
     bullets_item_template: string;
+    bullets_separator: string;
   };
   display_labels: Record<string, string>;
 }
@@ -64,7 +65,6 @@ export interface TemplateRules {
 }
 
 export interface TenantRules {
-  version: string;
   requiredSections: string[];
   input: InputRules;
   workflow: WorkflowRules;
@@ -140,7 +140,6 @@ export async function loadTenantRules(
   const inputDoc = await readYAML(join(rulesDir, "input.yaml"));
   const workflowDoc = await readYAML(join(rulesDir, "workflow.yaml"));
 
-  const packageVersion = asString(packageDoc.version, rulesVersion);
   const requiredSections = asStringArray(packageDoc.required_sections, [
     "title",
     "bullets",
@@ -202,7 +201,8 @@ export async function loadTenantRules(
     },
     render: {
       keywords_item_template: mustString(renderNode.keywords_item_template, "workflow.render.keywords_item_template"),
-      bullets_item_template: mustString(renderNode.bullets_item_template, "workflow.render.bullets_item_template")
+      bullets_item_template: mustString(renderNode.bullets_item_template, "workflow.render.bullets_item_template"),
+      bullets_separator: asString(renderNode.bullets_separator, "\n")
     },
     display_labels: (() => {
       const node = (workflowDoc.display_labels as Record<string, unknown> | undefined) ?? {};
@@ -254,7 +254,6 @@ export async function loadTenantRules(
   }
 
   const parsed: TenantRules = {
-    version: packageVersion,
     requiredSections,
     input,
     workflow,

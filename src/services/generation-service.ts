@@ -227,14 +227,14 @@ function renderByVars(template: string, vars: Record<string, string>): string {
   return template.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_, key: string) => vars[key] ?? "");
 }
 
-function renderList(items: string[], itemTemplate: string): string {
+function renderList(items: string[], itemTemplate: string, separator = "\n"): string {
   const rendered = items.map((item, index) =>
     renderByVars(itemTemplate, {
       index: String(index + 1),
       item
     })
   );
-  return rendered.join("\n");
+  return rendered.join(separator);
 }
 
 async function promiseValue<T>(promise: Promise<T>, label: string): Promise<T> {
@@ -1004,7 +1004,7 @@ export class GenerationService {
     this.currentRules = tenantRules;
     await this.appendTrace("rules_loaded", "info", {
       archive_path: archivePath,
-      rules_version: tenantRules.version
+      rules_version: input.rulesVersion
     });
 
     const requirements = parseRequirements(input.inputMarkdown, tenantRules.input);
@@ -1173,8 +1173,16 @@ export class GenerationService {
       keywords_cn: renderList(keywordsCnFinal, tenantRules.workflow.render.keywords_item_template),
       title_en: normalizeText(titleEn),
       title_cn: normalizeText(titleCn),
-      bullets_en: renderList(bulletsLinesEn, tenantRules.workflow.render.bullets_item_template),
-      bullets_cn: renderList(bulletsCnFinal, tenantRules.workflow.render.bullets_item_template),
+      bullets_en: renderList(
+        bulletsLinesEn,
+        tenantRules.workflow.render.bullets_item_template,
+        tenantRules.workflow.render.bullets_separator
+      ),
+      bullets_cn: renderList(
+        bulletsCnFinal,
+        tenantRules.workflow.render.bullets_item_template,
+        tenantRules.workflow.render.bullets_separator
+      ),
       description_en: normalizeText(descriptionEn),
       description_cn: normalizeText(descriptionCn),
       search_terms_en: normalizeText(searchTermsEn),
@@ -1207,7 +1215,7 @@ export class GenerationService {
       en_markdown: enMarkdown,
       cn_markdown: cnMarkdown,
       validation_report: [
-        `rules_version=${tenantRules.version}`,
+        `rules_version=${input.rulesVersion}`,
         `keywords_count=${requirements.keywords.length}`,
         `bullets_count=${bulletsLinesEn.length}`,
         `judge_issues_count=${judgeIssues.length}`
