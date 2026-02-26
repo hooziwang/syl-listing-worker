@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import type { ModelSettings } from "@openai/agents";
 import type { Logger } from "pino";
 import type { AppEnv } from "../config/env.js";
 import type { ListingResult } from "../domain/types.js";
@@ -24,6 +25,10 @@ interface JudgeIssue {
 interface SectionGenerateOptions {
   initialFeedback?: string;
   maxRetries?: number;
+  jsonOutput?: boolean;
+  writerModelSettings?: Partial<ModelSettings>;
+  repairModelSettings?: Partial<ModelSettings>;
+  adaptContent?: (raw: string) => { content: string; error?: string };
 }
 
 interface TranslationSlot {
@@ -49,6 +54,46 @@ function splitLines(input: string): string[] {
     .split("\n")
     .map((line) => stripBulletPrefix(line))
     .filter(Boolean);
+}
+
+function extractJSONObjectText(input: string): string {
+  const text = normalizeText(input);
+  if (!text) {
+    return "";
+  }
+  const fenced = /```(?:json)?\s*([\s\S]*?)\s*```/i.exec(text);
+  if (fenced && fenced[1]) {
+    return fenced[1].trim();
+  }
+  return text;
+}
+
+function adaptBulletsJSONContent(raw: string): { content: string; error?: string } {
+  const jsonText = extractJSONObjectText(raw);
+  if (!jsonText) {
+    return { content: "", error: "JSON 解析失败: 返回为空" };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    return { content: "", error: `JSON 解析失败: ${msg}` };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { content: "", error: "JSON 解析失败: 顶层必须是对象" };
+  }
+  const bullets = (parsed as { bullets?: unknown }).bullets;
+  if (!Array.isArray(bullets)) {
+    return { content: "", error: "JSON 解析失败: 缺少 bullets 数组字段" };
+  }
+  const lines = bullets
+    .map((item) => (typeof item === "string" ? normalizeLine(stripBulletPrefix(item)) : ""))
+    .filter(Boolean);
+  if (lines.length === 0) {
+    return { content: "", error: "JSON 解析失败: bullets 数组为空" };
+  }
+  return { content: lines.join("\n") };
 }
 
 function dedupeKeepOrder(values: string[]): string[] {
@@ -237,10 +282,12 @@ export class GenerationService {
     }
   }
 
-  private buildSectionSystemPrompt(rule: SectionRule): string {
+  private buildSectionSystemPrompt(rule: SectionRule, jsonOutput = false): string {
     return [
       "你是专业亚马逊 Listing 文案专家。",
-      "只输出目标 section 的文本，不要输出解释、JSON、代码块、前后缀。",
+      jsonOutput
+        ? "只输出符合要求的 JSON 对象，不要解释，不要代码块，不要额外文本。"
+        : "只输出目标 section 的文本，不要输出解释、JSON、代码块、前后缀。",
       `section=${rule.section}`,
       `规则:\n${rule.instruction}`
     ].join("\n");
@@ -278,6 +325,19 @@ export class GenerationService {
       return `<= ${maxChars}`;
     }
     return "遵循规则";
+  }
+
+  private deepseekJSONModeSettings(): Partial<ModelSettings> | undefined {
+    if (this.env.generationProvider !== "deepseek") {
+      return undefined;
+    }
+    return {
+      providerData: {
+        response_format: {
+          type: "json_object"
+        }
+      }
+    };
   }
 
   private buildItemRepairSystemPrompt(rule: SectionRule, targetIndex: number): string {
@@ -416,11 +476,13 @@ export class GenerationService {
     return { ok: false, errors: currentErrors };
   }
 
-  private buildWholeRepairSystemPrompt(rule: SectionRule): string {
+  private buildWholeRepairSystemPrompt(rule: SectionRule, jsonOutput = false): string {
     return [
       "你是专业亚马逊 Listing 文案专家。",
       "你正在修复一段已有文案。",
-      "只输出修复后的 section 文本，不要解释，不要 JSON，不要代码块。",
+      jsonOutput
+        ? "只输出修复后的 JSON 对象，不要解释，不要代码块，不要额外文本。"
+        : "只输出修复后的 section 文本，不要解释，不要 JSON，不要代码块。",
       `section=${rule.section}`,
       `规则:\n${rule.instruction}`
     ].join("\n");
@@ -430,7 +492,8 @@ export class GenerationService {
     requirements: ListingRequirements,
     rule: SectionRule,
     content: string,
-    errors: string[]
+    errors: string[],
+    jsonOutput = false
   ): string {
     const constraintsText = JSON.stringify(rule.constraints, null, 2);
     return [
@@ -442,7 +505,9 @@ export class GenerationService {
       `当前文案:\n${content}`,
       `校验错误:\n${errors.map((v) => `- ${v}`).join("\n")}`,
       `约束(JSON):\n${constraintsText}`,
-      "请重写整段内容，必须一次性满足约束。只输出修复后正文。"
+      jsonOutput
+        ? "请重写内容并一次性满足约束。只输出修复后的 JSON 对象。"
+        : "请重写整段内容，必须一次性满足约束。只输出修复后正文。"
     ].join("\n");
   }
 
@@ -452,7 +517,12 @@ export class GenerationService {
     step: string,
     content: string,
     validate: (content: string) => string[],
-    currentErrors: string[]
+    currentErrors: string[],
+    options?: {
+      jsonOutput?: boolean;
+      repairModelSettings?: Partial<ModelSettings>;
+      adaptContent?: (raw: string) => { content: string; error?: string };
+    }
   ): Promise<{ ok: true; content: string } | { ok: false; errors: string[] }> {
     const apiAttempts = Math.max(2, getNumber(rule.constraints, "api_attempts", 4));
     await this.appendTrace("section_whole_repair_start", "info", {
@@ -471,13 +541,15 @@ export class GenerationService {
     );
 
     const repaired = await this.llmClient.repairWithRepairAgent(
-      this.buildWholeRepairSystemPrompt(rule),
-      this.buildWholeRepairUserPrompt(requirements, rule, content, currentErrors),
+      this.buildWholeRepairSystemPrompt(rule, options?.jsonOutput ?? false),
+      this.buildWholeRepairUserPrompt(requirements, rule, content, currentErrors, options?.jsonOutput ?? false),
       `${step}_whole_repair`,
-      apiAttempts
+      apiAttempts,
+      options?.repairModelSettings
     );
-    const normalized = normalizeText(repaired);
-    const repairedErrors = validate(normalized);
+    const adapted = options?.adaptContent ? options.adaptContent(repaired) : { content: repaired };
+    const normalized = normalizeText(adapted.content);
+    const repairedErrors = adapted.error ? [adapted.error] : validate(normalized);
     if (repairedErrors.length === 0) {
       await this.appendTrace("section_whole_repair_ok", "info", {
         step,
@@ -537,14 +609,16 @@ export class GenerationService {
         "section generate start"
       );
       const content = await this.llmClient.writeWithWriterAgent(
-        this.buildSectionSystemPrompt(rule),
+        this.buildSectionSystemPrompt(rule, options?.jsonOutput ?? false),
         this.buildSectionUserPrompt(requirements, rule.section, feedback),
         `${step}_attempt_${attempt}`,
-        apiAttempts
+        apiAttempts,
+        options?.writerModelSettings
       );
 
-      const normalized = normalizeText(content);
-      let errors = validate(normalized);
+      const adapted = options?.adaptContent ? options.adaptContent(content) : { content };
+      const normalized = normalizeText(adapted.content);
+      let errors = adapted.error ? [adapted.error] : validate(normalized);
       if (errors.length === 0) {
         await this.appendTrace("section_generate_ok", "info", {
           step,
@@ -621,7 +695,12 @@ export class GenerationService {
           step,
           normalized,
           validate,
-          errors
+          errors,
+          {
+            jsonOutput: options?.jsonOutput,
+            repairModelSettings: options?.repairModelSettings,
+            adaptContent: options?.adaptContent
+          }
         );
         if (wholeRepaired.ok) {
           return wholeRepaired.content;
@@ -924,9 +1003,15 @@ export class GenerationService {
     const titleEnPromise = this.generateSectionWithValidation(requirements, titleRule, "title", (content) =>
       validateTitle(content, requirements, titleRule)
     );
+    const bulletsJSONModeSettings = this.deepseekJSONModeSettings();
     const bulletsRawPromise = this.generateSectionWithValidation(requirements, bulletsRule, "bullets", (content) => {
       const lines = splitLines(content);
       return validateBullets(lines, bulletsRule);
+    }, {
+      jsonOutput: true,
+      writerModelSettings: bulletsJSONModeSettings,
+      repairModelSettings: bulletsJSONModeSettings,
+      adaptContent: adaptBulletsJSONContent
     });
     const descriptionEnPromise = this.generateSectionWithValidation(requirements, descriptionRule, "description", (content) =>
       validateDescription(content, descriptionRule)
@@ -995,7 +1080,11 @@ export class GenerationService {
           (content) => validateBullets(splitLines(content), bulletsRule),
           {
             initialFeedback: this.buildJudgeFeedbackText(grouped.bullets),
-            maxRetries: 2
+            maxRetries: 2,
+            jsonOutput: true,
+            writerModelSettings: bulletsJSONModeSettings,
+            repairModelSettings: bulletsJSONModeSettings,
+            adaptContent: adaptBulletsJSONContent
           }
         );
         bulletsLinesEn = splitLines(bulletsRaw);

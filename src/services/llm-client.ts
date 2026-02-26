@@ -192,7 +192,8 @@ export class LLMClient {
     user: string,
     step: string,
     attempts: number,
-    role: "planner" | "orchestrator" | "writer" | "repair" | "judge" = "writer"
+    role: "planner" | "orchestrator" | "writer" | "repair" | "judge" = "writer",
+    modelSettingsOverride?: Partial<ModelSettings>
   ): Promise<string> {
     const generationProvider = this.getGenerationProvider();
     return withRetry(
@@ -223,14 +224,27 @@ export class LLMClient {
         );
 
         const started = Date.now();
-        const modelSettings: ModelSettings =
+        const baseModelSettings: ModelSettings =
           generationProvider === "fluxcode"
             ? { temperature: this.env.fluxcodeTemperature }
             : { temperature: this.env.deepseekTemperature };
         if (generationProvider === "fluxcode") {
           const effort = asReasoningEffort(this.env.fluxcodeReasoningEffort);
           if (effort) {
-            modelSettings.reasoning = { effort };
+            baseModelSettings.reasoning = { effort };
+          }
+        }
+        let modelSettings: ModelSettings = baseModelSettings;
+        if (modelSettingsOverride) {
+          modelSettings = {
+            ...baseModelSettings,
+            ...modelSettingsOverride
+          };
+          if (baseModelSettings.providerData || modelSettingsOverride.providerData) {
+            modelSettings.providerData = {
+              ...(baseModelSettings.providerData ?? {}),
+              ...(modelSettingsOverride.providerData ?? {})
+            };
           }
         }
 
@@ -420,29 +434,54 @@ export class LLMClient {
     );
   }
 
-  async planWithPlannerAgent(system: string, user: string, step: string, attempts: number): Promise<string> {
-    return this.generateWithFluxcode(system, user, step, attempts, "planner");
+  async planWithPlannerAgent(
+    system: string,
+    user: string,
+    step: string,
+    attempts: number,
+    modelSettingsOverride?: Partial<ModelSettings>
+  ): Promise<string> {
+    return this.generateWithFluxcode(system, user, step, attempts, "planner", modelSettingsOverride);
   }
 
   async orchestrateWithOrchestratorAgent(
     system: string,
     user: string,
     step: string,
-    attempts: number
+    attempts: number,
+    modelSettingsOverride?: Partial<ModelSettings>
   ): Promise<string> {
-    return this.generateWithFluxcode(system, user, step, attempts, "orchestrator");
+    return this.generateWithFluxcode(system, user, step, attempts, "orchestrator", modelSettingsOverride);
   }
 
-  async writeWithWriterAgent(system: string, user: string, step: string, attempts: number): Promise<string> {
-    return this.generateWithFluxcode(system, user, step, attempts, "writer");
+  async writeWithWriterAgent(
+    system: string,
+    user: string,
+    step: string,
+    attempts: number,
+    modelSettingsOverride?: Partial<ModelSettings>
+  ): Promise<string> {
+    return this.generateWithFluxcode(system, user, step, attempts, "writer", modelSettingsOverride);
   }
 
-  async repairWithRepairAgent(system: string, user: string, step: string, attempts: number): Promise<string> {
-    return this.generateWithFluxcode(system, user, step, attempts, "repair");
+  async repairWithRepairAgent(
+    system: string,
+    user: string,
+    step: string,
+    attempts: number,
+    modelSettingsOverride?: Partial<ModelSettings>
+  ): Promise<string> {
+    return this.generateWithFluxcode(system, user, step, attempts, "repair", modelSettingsOverride);
   }
 
-  async reviewWithJudgeAgent(system: string, user: string, step: string, attempts: number): Promise<string> {
-    return this.generateWithFluxcode(system, user, step, attempts, "judge");
+  async reviewWithJudgeAgent(
+    system: string,
+    user: string,
+    step: string,
+    attempts: number,
+    modelSettingsOverride?: Partial<ModelSettings>
+  ): Promise<string> {
+    return this.generateWithFluxcode(system, user, step, attempts, "judge", modelSettingsOverride);
   }
 
   async translateWithTranslatorAgent(system: string, user: string, step: string, attempts: number): Promise<string> {
