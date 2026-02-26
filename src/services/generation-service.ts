@@ -326,7 +326,8 @@ export class GenerationService {
         step,
         section: rule.section,
         round,
-        targets: targets.map((v) => v + 1)
+        targets: targets.map((v) => v + 1),
+        errors: currentErrors
       });
       this.logger.info(
         {
@@ -334,7 +335,8 @@ export class GenerationService {
           step,
           section: rule.section,
           round,
-          targets: targets.map((v) => v + 1)
+          targets: targets.map((v) => v + 1),
+          errors: currentErrors
         },
         "section item repair start"
       );
@@ -543,6 +545,22 @@ export class GenerationService {
       }
 
       if (this.supportsItemRepair(rule)) {
+        await this.appendTrace("section_repair_needed", "warn", {
+          step,
+          section: rule.section,
+          repair_mode: "item",
+          errors
+        });
+        this.logger.warn(
+          {
+            event: "section_repair_needed",
+            step,
+            section: rule.section,
+            repair_mode: "item",
+            errors
+          },
+          "section repair needed"
+        );
         const repaired = await this.tryItemRepair(
           requirements,
           rule,
@@ -558,6 +576,22 @@ export class GenerationService {
       }
 
       if (rule.execution.repair_mode !== "item") {
+        await this.appendTrace("section_repair_needed", "warn", {
+          step,
+          section: rule.section,
+          repair_mode: "whole",
+          errors
+        });
+        this.logger.warn(
+          {
+            event: "section_repair_needed",
+            step,
+            section: rule.section,
+            repair_mode: "whole",
+            errors
+          },
+          "section repair needed"
+        );
         const wholeRepaired = await this.tryWholeRepair(
           requirements,
           rule,

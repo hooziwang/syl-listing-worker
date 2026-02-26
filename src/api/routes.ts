@@ -384,6 +384,46 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
       };
     });
 
+    securedApp.get("/v1/jobs/:jobId/trace", async (request, reply) => {
+      const params = z.object({ jobId: z.string().min(1) }).parse(request.params);
+      const query = z
+        .object({
+          limit: z.coerce.number().int().positive().max(1000).optional(),
+          offset: z.coerce.number().int().min(0).optional()
+        })
+        .parse(request.query);
+      const tenantId = request.auth!.tenant_id;
+
+      const record = await ctx.jobStore.get(params.jobId);
+      if (!record || record.tenant_id !== tenantId) {
+        return reply.code(404).send(withTenant(tenantId, { error: "job_not_found" }));
+      }
+
+      const limit = query.limit ?? 200;
+      const offset = query.offset ?? 0;
+      const [items, traceCount] = await Promise.all([
+        ctx.traceStore.list(params.jobId, limit, offset),
+        ctx.traceStore.count(params.jobId)
+      ]);
+      const nextOffset = offset + items.length;
+      const hasMore = nextOffset < traceCount;
+
+      reply.header("x-tenant-id", tenantId);
+      return {
+        ok: true,
+        tenant_id: tenantId,
+        job_id: params.jobId,
+        job_status: record.status,
+        updated_at: record.updated_at,
+        trace_count: traceCount,
+        limit,
+        offset,
+        next_offset: nextOffset,
+        has_more: hasMore,
+        items
+      };
+    });
+
     securedApp.get("/v1/jobs/:jobId/result", async (request, reply) => {
       const params = z.object({ jobId: z.string().min(1) }).parse(request.params);
       const tenantId = request.auth!.tenant_id;
