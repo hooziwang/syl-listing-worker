@@ -260,11 +260,82 @@ export class GenerationService {
     this.llmClient = new LLMClient(env, logger, traceStore, traceContext);
   }
 
+  private baseDisplayLabel(token: string): string {
+    const rules = this.currentRules;
+    if (!rules) {
+      return "";
+    }
+    const key = token.trim();
+    if (!key) {
+      return "";
+    }
+    const mapped = rules.workflow.display_labels[key];
+    if (typeof mapped === "string" && mapped.trim() !== "") {
+      return mapped.trim();
+    }
+    const sectionRule = rules.sections.get(key);
+    if (sectionRule) {
+      const sectionMapped = rules.workflow.display_labels[sectionRule.section];
+      if (typeof sectionMapped === "string" && sectionMapped.trim() !== "") {
+        return sectionMapped.trim();
+      }
+    }
+    return "";
+  }
+
+  private resolveDisplayLabel(payload: Record<string, unknown> | undefined): string {
+    if (!payload) {
+      return "";
+    }
+    const exists = typeof payload.label === "string" ? payload.label.trim() : "";
+    if (exists) {
+      return exists;
+    }
+    const step = typeof payload.step === "string" ? payload.step.trim() : "";
+    const section = typeof payload.section === "string" ? payload.section.trim() : "";
+
+    if (step) {
+      const direct = this.baseDisplayLabel(step);
+      if (direct) {
+        return direct;
+      }
+      if (step.startsWith("translate_")) {
+        return this.baseDisplayLabel(step.slice("translate_".length));
+      }
+      const roundMatched = /^(.+)_judge_repair_round_(\d+)$/.exec(step);
+      if (roundMatched) {
+        return this.baseDisplayLabel(roundMatched[1]);
+      }
+      if (step.endsWith("_whole_repair")) {
+        return this.baseDisplayLabel(step.slice(0, -"_whole_repair".length));
+      }
+      const attemptIdx = step.indexOf("_attempt_");
+      if (attemptIdx > 0) {
+        return this.baseDisplayLabel(step.slice(0, attemptIdx));
+      }
+    }
+
+    if (section) {
+      return this.baseDisplayLabel(section);
+    }
+    return "";
+  }
+
   private async appendTrace(
     event: string,
     level: "info" | "warn" | "error" = "info",
     payload?: Record<string, unknown>
   ): Promise<void> {
+    const payloadWithLabel = (() => {
+      const label = this.resolveDisplayLabel(payload);
+      if (!label) {
+        return payload;
+      }
+      return {
+        ...(payload ?? {}),
+        label
+      };
+    })();
     try {
       await this.traceStore.append({
         ts: new Date().toISOString(),
@@ -273,7 +344,7 @@ export class GenerationService {
         level,
         tenant_id: this.traceContext.tenantId,
         job_id: this.traceContext.jobId,
-        payload
+        payload: payloadWithLabel
       });
     } catch (error) {
       this.logger.warn(

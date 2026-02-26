@@ -55,6 +55,7 @@ export interface WorkflowRules {
     keywords_item_template: string;
     bullets_item_template: string;
   };
+  display_labels: Record<string, string>;
 }
 
 export interface TemplateRules {
@@ -202,7 +203,19 @@ export async function loadTenantRules(
     render: {
       keywords_item_template: mustString(renderNode.keywords_item_template, "workflow.render.keywords_item_template"),
       bullets_item_template: mustString(renderNode.bullets_item_template, "workflow.render.bullets_item_template")
-    }
+    },
+    display_labels: (() => {
+      const node = (workflowDoc.display_labels as Record<string, unknown> | undefined) ?? {};
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(node)) {
+        const key = String(k).trim();
+        const value = asString(v).trim();
+        if (key && value) {
+          out[key] = value;
+        }
+      }
+      return out;
+    })()
   };
 
   const sectionsDir = join(rulesDir, "sections");
