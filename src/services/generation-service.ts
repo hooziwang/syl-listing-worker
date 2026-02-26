@@ -31,12 +31,6 @@ interface SectionGenerateOptions {
   adaptContent?: (raw: string) => { content: string; error?: string };
 }
 
-interface TranslationSlot {
-  step: string;
-  source: string;
-  promise: Promise<string>;
-}
-
 function normalizeText(input: string): string {
   return input.replace(/\r\n/g, "\n").trim();
 }
@@ -751,27 +745,6 @@ export class GenerationService {
     return messages.map((message) => `- ${message}`).join("\n");
   }
 
-  private startTranslationSlot(source: string, step: string, retries: number): TranslationSlot {
-    return {
-      step,
-      source,
-      promise: this.translateText(source, step, retries)
-    };
-  }
-
-  private refreshTranslationSlot(
-    current: TranslationSlot,
-    source: string,
-    retries: number,
-    stalePromises: Array<Promise<unknown>>
-  ): TranslationSlot {
-    if (normalizeText(current.source) === normalizeText(source)) {
-      return current;
-    }
-    stalePromises.push(current.promise.catch(() => undefined));
-    return this.startTranslationSlot(source, current.step, retries);
-  }
-
   private async translateText(text: string, step: string, retries: number): Promise<string> {
     const started = Date.now();
     await this.appendTrace("translate_start", "info", { step, input_chars: text.length, retries });
@@ -998,7 +971,6 @@ export class GenerationService {
     const categoryTranslationPromise = this.translateText(requirements.category, "translate_category", translationRetries);
     const keywordsText = requirements.keywords.join("\n");
     const keywordsTranslationPromise = this.translateText(keywordsText, "translate_keywords", translationRetries);
-    const staleTranslationPromises: Array<Promise<unknown>> = [];
 
     const titleEnPromise = this.generateSectionWithValidation(requirements, titleRule, "title", (content) =>
       validateTitle(content, requirements, titleRule)
@@ -1016,26 +988,13 @@ export class GenerationService {
     const descriptionEnPromise = this.generateSectionWithValidation(requirements, descriptionRule, "description", (content) =>
       validateDescription(content, descriptionRule)
     );
-    const titleSlotPromise = titleEnPromise.then((value) =>
-      this.startTranslationSlot(value, "translate_title", translationRetries)
-    );
-    const bulletsSlotPromise = bulletsRawPromise.then((value) =>
-      this.startTranslationSlot(splitLines(value).join("\n"), "translate_bullets", translationRetries)
-    );
-    const descriptionSlotPromise = descriptionEnPromise.then((value) =>
-      this.startTranslationSlot(value, "translate_description", translationRetries)
-    );
 
     let titleEn = await titleEnPromise;
     let bulletsRaw = await bulletsRawPromise;
     let bulletsLinesEn = splitLines(bulletsRaw);
     let descriptionEn = await descriptionEnPromise;
-    let titleTranslation = await titleSlotPromise;
-    let bulletsTranslation = await bulletsSlotPromise;
-    let descriptionTranslation = await descriptionSlotPromise;
 
     const searchTermsEn = dedupeKeepOrder(requirements.keywords).join(" ");
-    const searchTermsCnPromise = this.translateText(searchTermsEn, "translate_search_terms", translationRetries);
 
     const maxJudgeRounds = 2;
     let judgeIssues = await this.runQualityJudge(requirements, {
@@ -1064,12 +1023,6 @@ export class GenerationService {
             maxRetries: 2
           }
         );
-        titleTranslation = this.refreshTranslationSlot(
-          titleTranslation,
-          titleEn,
-          translationRetries,
-          staleTranslationPromises
-        );
       }
 
       if (grouped.bullets.length > 0) {
@@ -1088,12 +1041,6 @@ export class GenerationService {
           }
         );
         bulletsLinesEn = splitLines(bulletsRaw);
-        bulletsTranslation = this.refreshTranslationSlot(
-          bulletsTranslation,
-          bulletsLinesEn.join("\n"),
-          translationRetries,
-          staleTranslationPromises
-        );
       }
 
       if (grouped.description.length > 0) {
@@ -1106,12 +1053,6 @@ export class GenerationService {
             initialFeedback: this.buildJudgeFeedbackText(grouped.description),
             maxRetries: 2
           }
-        );
-        descriptionTranslation = this.refreshTranslationSlot(
-          descriptionTranslation,
-          descriptionEn,
-          translationRetries,
-          staleTranslationPromises
         );
       }
 
@@ -1132,15 +1073,16 @@ export class GenerationService {
       });
     }
 
-    if (staleTranslationPromises.length > 0) {
-      void Promise.allSettled(staleTranslationPromises);
-    }
+    const titleCnPromise = this.translateText(titleEn, "translate_title", translationRetries);
+    const bulletsCnPromise = this.translateText(bulletsLinesEn.join("\n"), "translate_bullets", translationRetries);
+    const descriptionCnPromise = this.translateText(descriptionEn, "translate_description", translationRetries);
+    const searchTermsCnPromise = this.translateText(searchTermsEn, "translate_search_terms", translationRetries);
 
     const categoryCn = await promiseValue(categoryTranslationPromise, "分类翻译");
     const keywordsCnRaw = await promiseValue(keywordsTranslationPromise, "关键词翻译");
-    const titleCn = await promiseValue(titleTranslation.promise, "标题翻译");
-    const bulletsCnRaw = await promiseValue(bulletsTranslation.promise, "五点翻译");
-    const descriptionCn = await promiseValue(descriptionTranslation.promise, "描述翻译");
+    const titleCn = await promiseValue(titleCnPromise, "标题翻译");
+    const bulletsCnRaw = await promiseValue(bulletsCnPromise, "五点翻译");
+    const descriptionCn = await promiseValue(descriptionCnPromise, "描述翻译");
     const searchTermsCn = await promiseValue(searchTermsCnPromise, "搜索词翻译");
 
     const keywordsCn = splitLines(keywordsCnRaw);
