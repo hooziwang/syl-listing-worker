@@ -17,7 +17,7 @@
 - compose 变量文件：`.compose.env`（脚本自动生成，不手改）
 
 `worker.config.json` 负责：域名、端口、重试参数、模型非密钥参数等。  
-`.env` 仅保留：`JWT_SECRET`、`SYL_LISTING_KEYS`、`ADMIN_TOKEN`、`FLUXCODE_API_KEY`、`DEEPSEEK_API_KEY`（可选 `WORKER_CONFIG_FILE`）。
+`.env` 仅保留：`JWT_SECRET`、`SYL_LISTING_KEYS`、`ADMIN_TOKEN`、`FLUXCODE_API_KEY`、`DEEPSEEK_API_KEY`。
 
 ## 部署前准备
 
@@ -71,6 +71,22 @@ bash scripts/deploy.sh \
 
 部署脚本默认会等待 HTTPS 就绪（证书签发后自动切换 nginx 到 443）。
 可选：`--skip-wait-https`、`--https-timeout`、`--https-interval`。
+
+## Makefile 服务器清单
+
+`Makefile` 内置服务器别名，可直接使用：
+
+```bash
+make servers
+```
+
+默认别名：
+
+- `SERVER=syl-server`
+- `REMOTE_HOST=43.135.112.167`
+- `REMOTE_USER=ubuntu`
+- `REMOTE_PORT=22`
+- `REMOTE_DIR=/opt/syl-listing-worker`
 
 ## 部署后验证
 
@@ -126,28 +142,6 @@ curl -i -X POST 'https://worker.aelus.tech/v1/auth/exchange' \
 2. 在新服务器重复“部署前准备 + 首次部署”。
 3. 启动后执行“部署后验证”。
 
-## 从旧 systemd 方案切换（同机迁移）
-
-如果此前使用宿主机 `systemd + nginx`：
-
-1. 停止旧服务：
-
-```bash
-sudo systemctl stop syl-listing-worker-api.service syl-listing-worker-runner.service nginx
-sudo systemctl disable syl-listing-worker-api.service syl-listing-worker-runner.service nginx
-```
-
-2. 将旧数据复制到当前项目 `data/`：
-
-- 规则目录复制到 `data/rules`
-- 证书目录复制到 `data/letsencrypt`
-
-3. 运行：
-
-```bash
-bash scripts/deploy.sh
-```
-
 ## 运维命令
 
 启动/重启：
@@ -177,16 +171,25 @@ git pull
 bash scripts/deploy.sh
 ```
 
-## 数据与备份
+下发 `.env` 到远端并重启 worker（默认走 `syl-server`）：
 
-关键数据均在项目内：
+```bash
+make push-env
+```
 
-- `data/rules`
-- `data/redis`
-- `data/letsencrypt`
-- `data/certbot-webroot`
+说明：`make push-env` 在下发 `.env` 后会自动重建并重启 `worker-api`、`worker-runner`，确保新环境变量生效。
 
-建议定期打包备份 `data/`。
+按别名下发：
+
+```bash
+make push-env SERVER=syl-server
+```
+
+远端完整部署（按别名）：
+
+```bash
+make deploy-remote SERVER=syl-server
+```
 
 ## 常见故障
 
@@ -210,18 +213,3 @@ bash scripts/deploy.sh
 - `POST /v1/generate`
 - `GET /v1/jobs/:jobId`
 - `GET /v1/jobs/:jobId/result`
-
-## 本地开发（非容器）
-
-```bash
-npm install
-npm run dev
-npm run dev:runner
-```
-
-## 自检
-
-```bash
-npm run typecheck
-npm run build
-```
