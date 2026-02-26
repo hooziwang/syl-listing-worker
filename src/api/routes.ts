@@ -63,7 +63,13 @@ function requestBaseURL(request: FastifyRequest): string {
 }
 
 export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Promise<void> {
-  app.get("/healthz", async () => ({ ok: true }));
+  app.get("/healthz", async (_request, reply) => {
+    const report = await ctx.llmHealthService.check();
+    if (!report.ok) {
+      reply.code(503);
+    }
+    return report;
+  });
 
   app.post("/v1/auth/exchange", async (request, reply) => {
     const authHeader = request.headers.authorization;

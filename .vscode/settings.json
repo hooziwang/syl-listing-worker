@@ -1,0 +1,8 @@
+{
+  "explorer.excludeGitIgnore": false,
+  "files.exclude": {
+    ".env": false,
+    "**/.env": false,
+    "**/.env.*": false
+  }
+}

@@ -1,42 +1,77 @@
 import { config as loadDotenv } from "dotenv";
+import { readFileSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { z } from "zod";
 
 loadDotenv();
 
-const schema = z.object({
-  NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
-  HOST: z.string().default("0.0.0.0"),
-  PORT: z.coerce.number().int().positive().default(8080),
-  LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
-  REDIS_URL: z.string().default("redis://127.0.0.1:6379"),
-  QUEUE_NAME: z.string().default("syl_listing_jobs"),
-  WORKER_CONCURRENCY: z.coerce.number().int().positive().default(10),
+const secretSchema = z.object({
+  WORKER_CONFIG_FILE: z.string().optional(),
   JWT_SECRET: z.string().min(16, "JWT_SECRET 太短，至少 16 位"),
-  JWT_EXPIRES_SECONDS: z.coerce.number().int().positive().default(900),
   SYL_LISTING_KEYS: z.string().min(1, "SYL_LISTING_KEYS 不能为空"),
-  API_PUBLIC_BASE_URL: z.string().url().default("http://127.0.0.1:8080"),
   ADMIN_TOKEN: z.string().min(8, "ADMIN_TOKEN 太短"),
-  RULES_FS_DIR: z.string().default("/data/syl-listing/rules"),
-  BOOTSTRAP_RULES_TENANT: z.string().default("demo"),
-  BOOTSTRAP_RULES_VERSION: z.string().default("tenant-demo-v1"),
-  BOOTSTRAP_RULES_MANIFEST_SHA256: z.string().default("demo_sha256"),
-  BOOTSTRAP_RULES_SIGNATURE_BASE64: z.string().default(""),
-  BOOTSTRAP_RULES_SIGNATURE_ALGO: z.string().default("ed25519"),
-  FLUXCODE_BASE_URL: z.string().url().default("https://flux-code.cc"),
-  FLUXCODE_RESPONSES_PATH: z.string().default("/v1/responses"),
   FLUXCODE_API_KEY: z.string().min(1, "FLUXCODE_API_KEY 不能为空"),
-  FLUXCODE_MODEL: z.string().default("gpt-5.3-codex"),
-  FLUXCODE_REASONING_EFFORT: z.string().default("high"),
-  FLUXCODE_TEMPERATURE: z.coerce.number().min(0).max(2).default(1.2),
-  DEEPSEEK_BASE_URL: z.string().url().default("https://api.deepseek.com"),
-  DEEPSEEK_CHAT_PATH: z.string().default("/chat/completions"),
   DEEPSEEK_API_KEY: z.string().min(1, "DEEPSEEK_API_KEY 不能为空"),
-  DEEPSEEK_MODEL: z.string().default("deepseek-chat"),
-  DEEPSEEK_TEMPERATURE: z.coerce.number().min(0).max(2).default(1.3),
-  RETRY_BASE_MS: z.coerce.number().int().positive().default(400),
-  RETRY_MAX_MS: z.coerce.number().int().positive().default(8000),
-  RETRY_JITTER: z.coerce.number().min(0).max(1).default(0.25),
-  JOB_TTL_SECONDS: z.coerce.number().int().positive().default(3600)
+});
+
+const fileSchema = z.object({
+  server: z.object({
+    domain: z.string().min(1, "config.server.domain 不能为空"),
+    letsencrypt_email: z.string().default(""),
+    node_env: z.enum(["development", "test", "production"]).default("production"),
+    host: z.string().default("0.0.0.0"),
+    port: z.number().int().positive().default(8080),
+    log_level: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
+    api_public_base_url: z.string().url().default("http://127.0.0.1:8080")
+  }),
+  redis: z.object({
+    url: z.string().default("redis://redis:6379")
+  }),
+  queue: z.object({
+    name: z.string().default("syl_listing_jobs"),
+    worker_concurrency: z.number().int().positive().default(10),
+    job_ttl_seconds: z.number().int().positive().default(3600)
+  }),
+  auth: z.object({
+    jwt_expires_seconds: z.number().int().positive().default(900)
+  }),
+  rules: z.object({
+    fs_dir: z.string().default("/data/syl-listing/rules"),
+    bootstrap: z.object({
+      tenant: z.string().default("demo"),
+      version: z.string().default("tenant-demo-v1"),
+      manifest_sha256: z.string().default("demo_sha256"),
+      signature_base64: z.string().default(""),
+      signature_algo: z.string().default("ed25519")
+    })
+  }),
+  providers: z.object({
+    fluxcode: z.object({
+      base_url: z.string().url().default("https://flux-code.cc"),
+      responses_path: z.string().default("/v1/responses"),
+      model: z.string().default("gpt-5.3-codex"),
+      reasoning_effort: z.string().default("high"),
+      temperature: z.number().min(0).max(2).default(1.2)
+    }),
+    deepseek: z.object({
+      base_url: z.string().url().default("https://api.deepseek.com"),
+      chat_path: z.string().default("/chat/completions"),
+      model: z.string().default("deepseek-chat"),
+      temperature: z.number().min(0).max(2).default(1.3)
+    })
+  }),
+  healthcheck: z.object({
+    llm: z.object({
+      cache_seconds: z.number().int().positive().default(300),
+      timeout_seconds: z.number().int().positive().default(12),
+      retries: z.number().int().positive().default(2)
+    })
+  }),
+  retry: z.object({
+    base_ms: z.number().int().positive().default(400),
+    max_ms: z.number().int().positive().default(8000),
+    jitter: z.number().min(0).max(1).default(0.25)
+  })
 });
 
 export interface AppEnv {
@@ -69,10 +104,44 @@ export interface AppEnv {
   deepseekApiKey: string;
   deepseekModel: string;
   deepseekTemperature: number;
+  healthcheckLlmCacheSeconds: number;
+  healthcheckLlmTimeoutSeconds: number;
+  healthcheckLlmRetries: number;
   retryBaseMs: number;
   retryMaxMs: number;
   retryJitter: number;
   jobTtlSeconds: number;
+}
+
+function resolveConfigFilePath(raw: string | undefined): string {
+  const fallback = "worker.config.json";
+  const value = (raw || "").trim();
+  if (value === "") {
+    return join(process.cwd(), fallback);
+  }
+  if (isAbsolute(value)) {
+    return value;
+  }
+  return join(process.cwd(), value);
+}
+
+function loadConfigFile(path: string): z.infer<typeof fileSchema> {
+  let raw = "";
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    throw new Error(`读取配置文件失败: ${path} (${msg})`);
+  }
+
+  let json: unknown;
+  try {
+    json = JSON.parse(raw);
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    throw new Error(`解析配置文件失败: ${path} (${msg})`);
+  }
+  return fileSchema.parse(json);
 }
 
 function parseTenantKeys(raw: string): Map<string, string> {
@@ -100,41 +169,46 @@ function parseTenantKeys(raw: string): Map<string, string> {
 }
 
 export function loadEnv(): AppEnv {
-  const parsed = schema.parse(process.env);
+  const secrets = secretSchema.parse(process.env);
+  const configFilePath = resolveConfigFilePath(secrets.WORKER_CONFIG_FILE);
+  const config = loadConfigFile(configFilePath);
 
   return {
-    nodeEnv: parsed.NODE_ENV,
-    host: parsed.HOST,
-    port: parsed.PORT,
-    logLevel: parsed.LOG_LEVEL,
-    redisUrl: parsed.REDIS_URL,
-    queueName: parsed.QUEUE_NAME,
-    workerConcurrency: parsed.WORKER_CONCURRENCY,
-    jwtSecret: parsed.JWT_SECRET,
-    jwtExpiresSeconds: parsed.JWT_EXPIRES_SECONDS,
-    sylListingKeys: parseTenantKeys(parsed.SYL_LISTING_KEYS),
-    apiPublicBaseUrl: parsed.API_PUBLIC_BASE_URL,
-    adminToken: parsed.ADMIN_TOKEN,
-    rulesFsDir: parsed.RULES_FS_DIR,
-    bootstrapRulesTenant: parsed.BOOTSTRAP_RULES_TENANT,
-    bootstrapRulesVersion: parsed.BOOTSTRAP_RULES_VERSION,
-    bootstrapRulesManifestSha256: parsed.BOOTSTRAP_RULES_MANIFEST_SHA256,
-    bootstrapRulesSignatureBase64: parsed.BOOTSTRAP_RULES_SIGNATURE_BASE64,
-    bootstrapRulesSignatureAlgo: parsed.BOOTSTRAP_RULES_SIGNATURE_ALGO,
-    fluxcodeBaseUrl: parsed.FLUXCODE_BASE_URL,
-    fluxcodeResponsesPath: parsed.FLUXCODE_RESPONSES_PATH,
-    fluxcodeApiKey: parsed.FLUXCODE_API_KEY,
-    fluxcodeModel: parsed.FLUXCODE_MODEL,
-    fluxcodeReasoningEffort: parsed.FLUXCODE_REASONING_EFFORT,
-    fluxcodeTemperature: parsed.FLUXCODE_TEMPERATURE,
-    deepseekBaseUrl: parsed.DEEPSEEK_BASE_URL,
-    deepseekChatPath: parsed.DEEPSEEK_CHAT_PATH,
-    deepseekApiKey: parsed.DEEPSEEK_API_KEY,
-    deepseekModel: parsed.DEEPSEEK_MODEL,
-    deepseekTemperature: parsed.DEEPSEEK_TEMPERATURE,
-    retryBaseMs: parsed.RETRY_BASE_MS,
-    retryMaxMs: parsed.RETRY_MAX_MS,
-    retryJitter: parsed.RETRY_JITTER,
-    jobTtlSeconds: parsed.JOB_TTL_SECONDS
+    nodeEnv: config.server.node_env,
+    host: config.server.host,
+    port: config.server.port,
+    logLevel: config.server.log_level,
+    redisUrl: config.redis.url,
+    queueName: config.queue.name,
+    workerConcurrency: config.queue.worker_concurrency,
+    jwtSecret: secrets.JWT_SECRET,
+    jwtExpiresSeconds: config.auth.jwt_expires_seconds,
+    sylListingKeys: parseTenantKeys(secrets.SYL_LISTING_KEYS),
+    apiPublicBaseUrl: config.server.api_public_base_url,
+    adminToken: secrets.ADMIN_TOKEN,
+    rulesFsDir: config.rules.fs_dir,
+    bootstrapRulesTenant: config.rules.bootstrap.tenant,
+    bootstrapRulesVersion: config.rules.bootstrap.version,
+    bootstrapRulesManifestSha256: config.rules.bootstrap.manifest_sha256,
+    bootstrapRulesSignatureBase64: config.rules.bootstrap.signature_base64,
+    bootstrapRulesSignatureAlgo: config.rules.bootstrap.signature_algo,
+    fluxcodeBaseUrl: config.providers.fluxcode.base_url,
+    fluxcodeResponsesPath: config.providers.fluxcode.responses_path,
+    fluxcodeApiKey: secrets.FLUXCODE_API_KEY,
+    fluxcodeModel: config.providers.fluxcode.model,
+    fluxcodeReasoningEffort: config.providers.fluxcode.reasoning_effort,
+    fluxcodeTemperature: config.providers.fluxcode.temperature,
+    deepseekBaseUrl: config.providers.deepseek.base_url,
+    deepseekChatPath: config.providers.deepseek.chat_path,
+    deepseekApiKey: secrets.DEEPSEEK_API_KEY,
+    deepseekModel: config.providers.deepseek.model,
+    deepseekTemperature: config.providers.deepseek.temperature,
+    healthcheckLlmCacheSeconds: config.healthcheck.llm.cache_seconds,
+    healthcheckLlmTimeoutSeconds: config.healthcheck.llm.timeout_seconds,
+    healthcheckLlmRetries: config.healthcheck.llm.retries,
+    retryBaseMs: config.retry.base_ms,
+    retryMaxMs: config.retry.max_ms,
+    retryJitter: config.retry.jitter,
+    jobTtlSeconds: config.queue.job_ttl_seconds
   };
 }

@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${ENV_FILE:-${ROOT_DIR}/.env}"
 ENV_EXAMPLE_FILE="${ROOT_DIR}/.env.example"
+CONFIG_FILE="${CONFIG_FILE:-${ROOT_DIR}/worker.config.json}"
+COMPOSE_ENV_FILE="${COMPOSE_ENV_FILE:-${ROOT_DIR}/.compose.env}"
 SKIP_BUILD=0
 STOP_LEGACY=0
 INSTALL_DOCKER=0
@@ -28,24 +30,26 @@ die() {
 }
 
 usage() {
-  cat <<'EOF'
+  cat <<'USAGE'
 用法:
   bash scripts/deploy.sh [选项]
 
 选项:
-  --skip-build       跳过镜像构建（等同 docker compose up -d）
-  --stop-legacy      停止并禁用旧 systemd 服务（api/runner/nginx）
-  --install-docker   缺少 docker 时尝试自动安装（Ubuntu）
-  --skip-wait-https  部署后不等待 HTTPS 就绪（默认等待）
-  --https-timeout    等待 HTTPS 就绪超时秒数，默认 240
-  --https-interval   等待 HTTPS 轮询间隔秒数，默认 2
-  --remote-host      远端主机（启用远程部署模式）
-  --remote-user      远端 SSH 用户，默认 ubuntu
-  --remote-port      远端 SSH 端口，默认 22
-  --remote-dir       远端部署目录，默认 /opt/syl-listing-worker
-  --skip-diagnose    远程部署完成后跳过诊断
-  -h, --help         显示帮助
-EOF
+  --skip-build              跳过镜像构建（等同 docker compose up -d）
+  --stop-legacy             停止并禁用旧 systemd 服务（api/runner/nginx）
+  --install-docker          缺少 docker 时尝试自动安装（Ubuntu）
+  --skip-wait-https         部署后不等待 HTTPS 就绪（默认等待）
+  --https-timeout <sec>     等待 HTTPS 就绪超时秒数，默认 240
+  --https-interval <sec>    等待 HTTPS 轮询间隔秒数，默认 2
+  --config-file <path>      配置文件路径（默认 worker.config.json）
+  --compose-env-file <path> compose 变量文件输出路径（默认 .compose.env）
+  --remote-host <host>      远端主机（启用远程部署模式）
+  --remote-user <user>      远端 SSH 用户，默认 ubuntu
+  --remote-port <port>      远端 SSH 端口，默认 22
+  --remote-dir <dir>        远端部署目录，默认 /opt/syl-listing-worker
+  --skip-diagnose           远程部署完成后跳过诊断
+  -h, --help                显示帮助
+USAGE
 }
 
 parse_args() {
@@ -69,6 +73,14 @@ parse_args() {
         ;;
       --https-interval)
         HTTPS_INTERVAL_SECONDS="${2:-}"
+        shift
+        ;;
+      --config-file)
+        CONFIG_FILE="${2:-}"
+        shift
+        ;;
+      --compose-env-file)
+        COMPOSE_ENV_FILE="${2:-}"
         shift
         ;;
       --remote-host)
@@ -137,7 +149,7 @@ ensure_docker() {
 
   log "未检测到 docker，开始安装..."
   sudo apt-get update -y
-  sudo apt-get install -y docker.io docker-compose-v2
+  sudo apt-get install -y docker.io docker-compose-v2 python3
   sudo systemctl enable --now docker
 }
 
@@ -181,7 +193,48 @@ ensure_env_file() {
   fi
 
   cp "${ENV_EXAMPLE_FILE}" "${ENV_FILE}"
-  die "已生成 ${ENV_FILE}，请先补全配置后重试"
+  die "已生成 ${ENV_FILE}，请先补全敏感配置后重试"
+}
+
+ensure_config_file() {
+  [[ -f "${CONFIG_FILE}" ]] || die "未找到配置文件: ${CONFIG_FILE}"
+}
+
+read_config_value() {
+  local key="$1"
+  python3 - "${CONFIG_FILE}" "${key}" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+path = sys.argv[1]
+key = sys.argv[2]
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+value = data
+for part in key.split("."):
+    if not isinstance(value, dict) or part not in value:
+        raise SystemExit(2)
+    value = value[part]
+if isinstance(value, bool):
+    print("true" if value else "false", end="")
+else:
+    print(str(value), end="")
+PY
+}
+
+read_config_required() {
+  local key="$1"
+  local value
+  value="$(read_config_value "${key}")"
+  if [[ -z "${value}" ]]; then
+    die "配置文件缺少必填项: ${key} (${CONFIG_FILE})"
+  fi
+  printf '%s' "${value}"
+}
+
+read_config_optional() {
+  local key="$1"
+  read_config_value "${key}" || true
 }
 
 required_env() {
@@ -193,18 +246,24 @@ required_env() {
   fi
 }
 
-read_env_value() {
-  local key="$1"
-  grep -E "^${key}=" "${ENV_FILE}" | tail -n 1 | cut -d'=' -f2- || true
-}
-
 validate_env() {
-  required_env "DOMAIN"
   required_env "SYL_LISTING_KEYS"
   required_env "JWT_SECRET"
   required_env "ADMIN_TOKEN"
   required_env "FLUXCODE_API_KEY"
   required_env "DEEPSEEK_API_KEY"
+}
+
+prepare_compose_env() {
+  local domain email
+  domain="$(read_config_required "server.domain")"
+  email="$(read_config_optional "server.letsencrypt_email")"
+
+  mkdir -p "$(dirname "${COMPOSE_ENV_FILE}")"
+  cat > "${COMPOSE_ENV_FILE}" <<COMPOSE_ENV
+DOMAIN=${domain}
+LETSENCRYPT_EMAIL=${email}
+COMPOSE_ENV
 }
 
 prepare_dirs() {
@@ -233,9 +292,9 @@ stop_legacy_services() {
 deploy() {
   cd "${ROOT_DIR}"
   if [[ "${SKIP_BUILD}" -eq 1 ]]; then
-    "${COMPOSE_CMD[@]}" --env-file "${ENV_FILE}" up -d
+    "${COMPOSE_CMD[@]}" --env-file "${COMPOSE_ENV_FILE}" up -d
   else
-    "${COMPOSE_CMD[@]}" --env-file "${ENV_FILE}" up -d --build
+    "${COMPOSE_CMD[@]}" --env-file "${COMPOSE_ENV_FILE}" up -d --build
   fi
 }
 
@@ -245,8 +304,7 @@ wait_https_ready() {
   fi
 
   local domain
-  domain="$(read_env_value "DOMAIN")"
-  [[ -n "${domain}" ]] || return
+  domain="$(read_config_required "server.domain")"
 
   local deadline now restarted
   deadline=$(( $(date +%s) + HTTPS_TIMEOUT_SECONDS ))
@@ -254,7 +312,7 @@ wait_https_ready() {
 
   log "等待 HTTPS 就绪（domain=${domain}，timeout=${HTTPS_TIMEOUT_SECONDS}s）..."
   while true; do
-    if "${COMPOSE_CMD[@]}" --env-file "${ENV_FILE}" exec -T nginx sh -lc \
+    if "${COMPOSE_CMD[@]}" --env-file "${COMPOSE_ENV_FILE}" exec -T nginx sh -lc \
       "test -s /etc/letsencrypt/live/${domain}/fullchain.pem && \
        test -s /etc/letsencrypt/live/${domain}/privkey.pem && \
        [ \"\$(cat /var/run/nginx_tls_mode 2>/dev/null || true)\" = \"https\" ] && \
@@ -263,12 +321,12 @@ wait_https_ready() {
       return
     fi
 
-    if [[ "${restarted}" -eq 0 ]] && "${COMPOSE_CMD[@]}" --env-file "${ENV_FILE}" exec -T nginx sh -lc \
+    if [[ "${restarted}" -eq 0 ]] && "${COMPOSE_CMD[@]}" --env-file "${COMPOSE_ENV_FILE}" exec -T nginx sh -lc \
       "test -s /etc/letsencrypt/live/${domain}/fullchain.pem && \
        test -s /etc/letsencrypt/live/${domain}/privkey.pem && \
        [ \"\$(cat /var/run/nginx_tls_mode 2>/dev/null || true)\" != \"https\" ]" >/dev/null 2>&1; then
       log "证书已签发，重启 nginx 以立即切换 HTTPS..."
-      "${COMPOSE_CMD[@]}" --env-file "${ENV_FILE}" restart nginx >/dev/null
+      "${COMPOSE_CMD[@]}" --env-file "${COMPOSE_ENV_FILE}" restart nginx >/dev/null
       restarted=1
     fi
 
@@ -283,18 +341,21 @@ wait_https_ready() {
 run_local_deploy() {
   validate_positive_integer "https-timeout" "${HTTPS_TIMEOUT_SECONDS}"
   validate_positive_integer "https-interval" "${HTTPS_INTERVAL_SECONDS}"
+  need_cmd python3
   ensure_docker
   resolve_docker_cmd
   resolve_compose_cmd
   ensure_env_file
+  ensure_config_file
   validate_env
+  prepare_compose_env
   prepare_dirs
   stop_legacy_services
 
   log "开始部署..."
   deploy
   wait_https_ready
-  "${COMPOSE_CMD[@]}" --env-file "${ENV_FILE}" ps
+  "${COMPOSE_CMD[@]}" --env-file "${COMPOSE_ENV_FILE}" ps
   log "部署完成"
 }
 
@@ -344,6 +405,7 @@ sync_source_to_remote() {
       fi; \
     fi; \
     find ${q_dir} -mindepth 1 -maxdepth 1 ! -name data ! -name .env -exec rm -rf {} +"
+
   COPYFILE_DISABLE=1 tar \
     --format=ustar \
     --no-mac-metadata \
@@ -352,6 +414,7 @@ sync_source_to_remote() {
     --exclude='dist' \
     --exclude='data' \
     --exclude='.env' \
+    --exclude='.compose.env' \
     -C "${ROOT_DIR}" -czf - . \
     | ssh -p "${REMOTE_PORT}" -o ConnectTimeout=20 "$(ssh_target)" "tar -xzf - -C ${q_dir}"
 }
@@ -406,9 +469,12 @@ run_remote_deploy() {
   need_cmd tar
   need_cmd ssh-keygen
   need_cmd ssh-keyscan
+  need_cmd python3
 
   [[ -n "${REMOTE_HOST}" ]] || die "--remote-host 不能为空"
   ensure_env_file
+  ensure_config_file
+  validate_env
   ensure_ssh_ready
 
   local q_dir opts_str

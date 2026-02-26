@@ -109,6 +109,38 @@ else:
 ' "$key"
 }
 
+json_get_bool_path() {
+  local input="$1"
+  local path="$2"
+  printf '%s' "$input" | python3 -c '
+import json
+import sys
+
+raw = sys.stdin.read().strip()
+path = sys.argv[1].split(".")
+if not raw:
+    print("")
+    raise SystemExit(0)
+try:
+    data = json.loads(raw)
+except Exception:
+    print("")
+    raise SystemExit(0)
+
+cur = data
+for key in path:
+    if not isinstance(cur, dict) or key not in cur:
+        print("")
+        raise SystemExit(0)
+    cur = cur[key]
+
+if isinstance(cur, bool):
+    print("true" if cur else "false")
+else:
+    print("")
+' "$path"
+}
+
 api_call() {
   local method="$1"
   local path="$2"
@@ -141,9 +173,11 @@ check_healthz() {
   resp="$(api_call GET /healthz "" "")"
   status="$(printf '%s' "$resp" | sed -n '1p')"
   body="$(printf '%s' "$resp" | sed -n '2,$p')"
-  [[ "$status" == "200" ]] || fail "/healthz 状态异常: ${status}"
+  [[ "$status" == "200" ]] || fail "/healthz 状态异常: ${status} ${body}"
   [[ "$(json_get "$body" ok)" == "True" || "$(json_get "$body" ok)" == "true" ]] || fail "/healthz 响应异常: ${body}"
-  log "外部健康检查通过"
+  [[ "$(json_get_bool_path "$body" "llm.fluxcode.ok")" == "true" ]] || fail "fluxcode key 检查未通过: ${body}"
+  [[ "$(json_get_bool_path "$body" "llm.deepseek.ok")" == "true" ]] || fail "deepseek key 检查未通过: ${body}"
+  log "外部健康检查通过（含 LLM Key 校验）"
 }
 
 check_auth() {

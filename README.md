@@ -10,6 +10,15 @@
 - `nginx`：公网入口（80/443）
 - `certbot`：证书签发与自动续期
 
+## 配置模型
+
+- 非敏感配置：`worker.config.json`（纳入仓库管理）
+- 敏感配置：`.env`（不入库，只保存密钥与口令）
+- compose 变量文件：`.compose.env`（脚本自动生成，不手改）
+
+`worker.config.json` 负责：域名、端口、重试参数、模型非密钥参数等。  
+`.env` 仅保留：`JWT_SECRET`、`SYL_LISTING_KEYS`、`ADMIN_TOKEN`、`FLUXCODE_API_KEY`、`DEEPSEEK_API_KEY`（可选 `WORKER_CONFIG_FILE`）。
+
 ## 部署前准备
 
 - 域名 A 记录指向服务器公网 IP（例如 `worker.aelus.tech`）。
@@ -20,7 +29,7 @@ Ubuntu 安装示例：
 
 ```bash
 sudo apt-get update -y
-sudo apt-get install -y docker.io docker-compose-v2
+sudo apt-get install -y docker.io docker-compose-v2 python3
 sudo systemctl enable --now docker
 docker --version
 docker compose version
@@ -28,37 +37,28 @@ docker compose version
 
 ## 首次部署
 
-1. 准备配置：
+1. 编辑非敏感配置 `worker.config.json`（至少确认 `server.domain`、`server.api_public_base_url`）。
+2. 准备敏感配置：
 
 ```bash
 cp .env.example .env
 ```
 
-2. 编辑 `.env` 必填项：
+3. 编辑 `.env` 必填项：
 
-- `DOMAIN`：域名，例如 `worker.aelus.tech`
 - `SYL_LISTING_KEYS`：租户 Key 映射，格式 `tenant_id:key,tenant2:key2`
 - `JWT_SECRET`：至少 16 位
 - `ADMIN_TOKEN`：规则发布鉴权口令
 - `FLUXCODE_API_KEY`
 - `DEEPSEEK_API_KEY`
 
-可选项：
-
-- `LETSENCRYPT_EMAIL`：留空时会使用 `--register-unsafely-without-email`
-
-3. 启动：
-
-```bash
-mkdir -p data/rules data/redis data/letsencrypt data/certbot-webroot
-docker compose up -d --build
-```
-
-或直接使用部署脚本：
+4. 启动：
 
 ```bash
 bash scripts/deploy.sh
 ```
+
+说明：部署脚本会自动从 `worker.config.json` 生成 `.compose.env`，并用于 `docker compose` 变量替换（`DOMAIN`、`LETSENCRYPT_EMAIL`）。
 
 从本地直接远程部署（推荐，内置主机指纹自动修复）：
 
@@ -69,18 +69,15 @@ bash scripts/deploy.sh \
   --install-docker
 ```
 
-首次重装服务器后，若主机指纹变化，脚本会自动清理旧 `known_hosts` 指纹并拉取新指纹，再继续部署。
-部署脚本默认会等待 HTTPS 就绪（证书签发后会自动触发 nginx 切换），避免刚部署完出现 443 握手失败窗口期。
-
-远程目录默认 `/opt/syl-listing-worker`，可通过 `--remote-dir` 覆盖。
-可选：`--skip-wait-https`（跳过等待）、`--https-timeout`、`--https-interval`（调整等待策略）。
+部署脚本默认会等待 HTTPS 就绪（证书签发后自动切换 nginx 到 443）。
+可选：`--skip-wait-https`、`--https-timeout`、`--https-interval`。
 
 ## 部署后验证
 
 查看容器状态：
 
 ```bash
-docker compose ps
+docker compose --env-file .compose.env ps
 ```
 
 服务器内诊断（推荐）：
@@ -98,8 +95,11 @@ make diagnose-external BASE_URL=https://worker.aelus.tech SYL_KEY=<SYL_LISTING_K
 # 需要额外检查生成链路时加: DIAGNOSE_EXTERNAL_OPTS="--with-generate"
 ```
 
-说明：外部诊断默认不发起 `generate` 任务；仅检查健康、鉴权、规则接口。  
-如需附加检查生成链路，可加 `--with-generate`，这会发起一次真实 `generate` 任务。
+说明：外部诊断默认不发起 `generate`；只检查健康、鉴权、规则接口。  
+如需附加检查生成链路，增加 `--with-generate`。
+
+说明：`/healthz` 会校验 `FLUXCODE_API_KEY` 与 `DEEPSEEK_API_KEY` 有效性（带缓存）。  
+任一 key 无效时，`/healthz` 返回非 200，`diagnose` 与 `diagnose-external` 会失败。
 
 验证 HTTP 跳转 HTTPS：
 
@@ -116,15 +116,14 @@ curl -i -X POST 'https://worker.aelus.tech/v1/auth/exchange' \
 
 ## 迁移到新服务器
 
-1. 将仓库和 `data/` 一并迁移（尤其是规则与证书数据）：
+1. 将仓库和 `data/` 一并迁移（尤其规则和证书数据）：
 
 - `data/rules`
 - `data/redis`
 - `data/letsencrypt`
 - `data/certbot-webroot`
 
-2. 在新服务器重复“部署前准备 + 首次部署”步骤。
-
+2. 在新服务器重复“部署前准备 + 首次部署”。
 3. 启动后执行“部署后验证”。
 
 ## 从旧 systemd 方案切换（同机迁移）
@@ -143,35 +142,39 @@ sudo systemctl disable syl-listing-worker-api.service syl-listing-worker-runner.
 - 规则目录复制到 `data/rules`
 - 证书目录复制到 `data/letsencrypt`
 
-3. 运行 `docker compose up -d --build`。
+3. 运行：
+
+```bash
+bash scripts/deploy.sh
+```
 
 ## 运维命令
 
 启动/重启：
 
 ```bash
-docker compose up -d
-docker compose restart
+make docker-up
+docker compose --env-file .compose.env restart
 ```
 
 停止/删除容器：
 
 ```bash
-docker compose down
+make docker-down
 ```
 
 查看日志：
 
 ```bash
-docker compose logs -f --tail=200
-docker compose logs -f --tail=200 worker-api worker-runner nginx certbot
+make docker-logs
+docker compose --env-file .compose.env logs -f --tail=200 worker-api worker-runner nginx certbot
 ```
 
 升级发布（代码更新后）：
 
 ```bash
 git pull
-docker compose up -d --build
+bash scripts/deploy.sh
 ```
 
 ## 数据与备份
@@ -188,15 +191,15 @@ docker compose up -d --build
 ## 常见故障
 
 - `certbot` 持续重启：
-  - 检查 `DOMAIN` 是否正确解析到本机公网 IP。
+  - 检查 `worker.config.json` 中 `server.domain` 是否正确解析到本机公网 IP。
   - 检查 `80` 端口是否被云防火墙拦截。
 - HTTPS 超时：
-  - 检查 `docker compose ps` 中 `nginx` 是否 `Up`。
+  - 检查 `docker compose --env-file .compose.env ps` 中 `nginx` 是否 `Up`。
   - 检查 `443` 端口放通。
 - `docker compose` 不存在：
   - 安装 `docker-compose-v2`，使用 `docker compose` 命令。
 - 服务器重装后 SSH 指纹变化：
-  - 使用 `scripts/deploy.sh --remote-host ...`，会自动清理旧 `known_hosts` 指纹并拉取新指纹后重试连接。
+  - 使用 `scripts/deploy.sh --remote-host ...`，脚本会自动修复 `known_hosts`。
 
 ## 关键接口
 
