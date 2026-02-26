@@ -15,8 +15,8 @@ const publishSchema = z.object({
   rules_version: z.string().min(1),
   manifest_sha256: z.string().regex(/^[a-f0-9]{64}$/i),
   archive_base64: z.string().min(1),
-  signature_base64: z.string().optional(),
-  signature_algo: z.string().default("ed25519")
+  signature_base64: z.string().min(1),
+  signature_algo: z.string().min(1)
 });
 
 function withTenant<T extends object>(tenantId: string, payload: T): T & { tenant_id: string } {

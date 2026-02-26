@@ -32,6 +32,6 @@ export interface RulesResolveResponse {
   rules_version: string;
   manifest_sha256: string;
   download_url: string;
-  signature_base64?: string;
-  signature_algo?: string;
+  signature_base64: string;
+  signature_algo: string;
 }

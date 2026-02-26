@@ -52,12 +52,18 @@ export class RulesService {
     if (current) {
       return;
     }
+    // 未提供签名时不写入 bootstrap 元数据，避免向客户端下发不可验证规则。
+    const sig = (input.signature_base64 || "").trim();
+    const sigAlgo = (input.signature_algo || "").trim();
+    if (!sig || !sigAlgo) {
+      return;
+    }
 
     const key = this.metaKey(input.tenant_id, input.rules_version);
     await this.redis.hset(key, {
       manifest_sha256: input.manifest_sha256,
-      signature_base64: input.signature_base64 || "",
-      signature_algo: input.signature_algo || "ed25519"
+      signature_base64: sig,
+      signature_algo: sigAlgo
     });
     await this.redis.set(this.currentKey(input.tenant_id), input.rules_version);
   }
@@ -73,6 +79,12 @@ export class RulesService {
       signature_base64: metaHash.signature_base64 || undefined,
       signature_algo: metaHash.signature_algo || undefined
     };
+    if (!meta.manifest_sha256) {
+      throw new Error(`tenant(${tenantId}) rules(${activeVersion}) 缺少 manifest_sha256`);
+    }
+    if (!meta.signature_base64 || !meta.signature_algo) {
+      throw new Error(`tenant(${tenantId}) rules(${activeVersion}) 缺少签名信息`);
+    }
 
     return {
       up_to_date: currentVersion === activeVersion,
@@ -85,6 +97,11 @@ export class RulesService {
   }
 
   async publish(input: PublishRulesInput): Promise<void> {
+    const signatureBase64 = (input.signature_base64 || "").trim();
+    const signatureAlgo = (input.signature_algo || "").trim();
+    if (!signatureBase64 || !signatureAlgo) {
+      throw new Error("signature is required");
+    }
     const raw = Buffer.from(input.archive_base64, "base64");
     const got = createHash("sha256").update(raw).digest("hex");
     if (got !== input.manifest_sha256) {
@@ -98,8 +115,8 @@ export class RulesService {
     const key = this.metaKey(input.tenant_id, input.rules_version);
     await this.redis.hset(key, {
       manifest_sha256: input.manifest_sha256,
-      signature_base64: input.signature_base64 || "",
-      signature_algo: input.signature_algo || "ed25519"
+      signature_base64: signatureBase64,
+      signature_algo: signatureAlgo
     });
     await this.redis.set(this.currentKey(input.tenant_id), input.rules_version);
   }
