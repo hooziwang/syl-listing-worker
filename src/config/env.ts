@@ -10,7 +10,7 @@ const secretSchema = z.object({
   JWT_SECRET: z.string().min(16, "JWT_SECRET 太短，至少 16 位"),
   SYL_LISTING_KEYS: z.string().min(1, "SYL_LISTING_KEYS 不能为空"),
   ADMIN_TOKEN: z.string().min(8, "ADMIN_TOKEN 太短"),
-  FLUXCODE_API_KEY: z.string().min(1, "FLUXCODE_API_KEY 不能为空"),
+  FLUXCODE_API_KEY: z.string().optional(),
   DEEPSEEK_API_KEY: z.string().min(1, "DEEPSEEK_API_KEY 不能为空"),
 });
 
@@ -60,6 +60,9 @@ const fileSchema = z.object({
       temperature: z.number().min(0).max(2).default(1.3)
     })
   }),
+  generation: z.object({
+    provider: z.enum(["fluxcode", "deepseek"]).default("deepseek")
+  }),
   healthcheck: z.object({
     llm: z.object({
       cache_seconds: z.number().int().positive().default(300),
@@ -95,7 +98,7 @@ export interface AppEnv {
   bootstrapRulesSignatureAlgo: string;
   fluxcodeBaseUrl: string;
   fluxcodeResponsesPath: string;
-  fluxcodeApiKey: string;
+  fluxcodeApiKey?: string;
   fluxcodeModel: string;
   fluxcodeReasoningEffort: string;
   fluxcodeTemperature: number;
@@ -104,6 +107,7 @@ export interface AppEnv {
   deepseekApiKey: string;
   deepseekModel: string;
   deepseekTemperature: number;
+  generationProvider: "fluxcode" | "deepseek";
   healthcheckLlmCacheSeconds: number;
   healthcheckLlmTimeoutSeconds: number;
   healthcheckLlmRetries: number;
@@ -194,7 +198,7 @@ export function loadEnv(): AppEnv {
     bootstrapRulesSignatureAlgo: config.rules.bootstrap.signature_algo,
     fluxcodeBaseUrl: config.providers.fluxcode.base_url,
     fluxcodeResponsesPath: config.providers.fluxcode.responses_path,
-    fluxcodeApiKey: secrets.FLUXCODE_API_KEY,
+    fluxcodeApiKey: secrets.FLUXCODE_API_KEY?.trim() || undefined,
     fluxcodeModel: config.providers.fluxcode.model,
     fluxcodeReasoningEffort: config.providers.fluxcode.reasoning_effort,
     fluxcodeTemperature: config.providers.fluxcode.temperature,
@@ -203,6 +207,7 @@ export function loadEnv(): AppEnv {
     deepseekApiKey: secrets.DEEPSEEK_API_KEY,
     deepseekModel: config.providers.deepseek.model,
     deepseekTemperature: config.providers.deepseek.temperature,
+    generationProvider: config.generation.provider,
     healthcheckLlmCacheSeconds: config.healthcheck.llm.cache_seconds,
     healthcheckLlmTimeoutSeconds: config.healthcheck.llm.timeout_seconds,
     healthcheckLlmRetries: config.healthcheck.llm.retries,

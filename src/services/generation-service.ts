@@ -14,6 +14,24 @@ interface GenerationInput {
   inputMarkdown: string;
 }
 
+type ENSectionKey = "title" | "bullets" | "description" | "search_terms";
+
+interface JudgeIssue {
+  section: ENSectionKey;
+  message: string;
+}
+
+interface SectionGenerateOptions {
+  initialFeedback?: string;
+  maxRetries?: number;
+}
+
+interface TranslationSlot {
+  step: string;
+  source: string;
+  promise: Promise<string>;
+}
+
 function normalizeText(input: string): string {
   return input.replace(/\r\n/g, "\n").trim();
 }
@@ -181,6 +199,7 @@ async function promiseValue<T>(promise: Promise<T>, label: string): Promise<T> {
 
 export class GenerationService {
   private readonly llmClient: LLMClient;
+  private executionBrief = "";
 
   constructor(
     private readonly env: AppEnv,
@@ -231,6 +250,7 @@ export class GenerationService {
     const keywords = requirements.keywords.join("\n");
     return [
       `任务: 生成 section=${section}（英文）`,
+      this.executionBrief ? `执行简报:\n${this.executionBrief}` : "",
       `品牌: ${requirements.brand}`,
       `分类: ${requirements.category}`,
       `关键词库:\n${keywords}`,
@@ -282,6 +302,7 @@ export class GenerationService {
     const numbered = lines.map((line, i) => `${i + 1}. ${line}`).join("\n");
     return [
       `任务: 修复 section=${rule.section} 的第 ${targetIndex + 1} 行（英文）`,
+      this.executionBrief ? `执行简报:\n${this.executionBrief}` : "",
       `品牌: ${requirements.brand}`,
       `分类: ${requirements.category}`,
       `关键词库:\n${requirements.keywords.join("\n")}`,
@@ -343,7 +364,7 @@ export class GenerationService {
 
       for (const idx of targets) {
         const lineErrors = currentErrors.filter((err) => extractLineErrorIndex(err) === idx);
-        const repaired = await this.llmClient.generateWithFluxcode(
+        const repaired = await this.llmClient.repairWithRepairAgent(
           this.buildItemRepairSystemPrompt(rule, idx),
           this.buildItemRepairUserPrompt(requirements, rule, lines, idx, lineErrors),
           `${step}_item_${idx + 1}_round_${round}`,
@@ -414,6 +435,7 @@ export class GenerationService {
     const constraintsText = JSON.stringify(rule.constraints, null, 2);
     return [
       `任务: 修复 section=${rule.section}（英文）`,
+      this.executionBrief ? `执行简报:\n${this.executionBrief}` : "",
       `品牌: ${requirements.brand}`,
       `分类: ${requirements.category}`,
       `关键词库:\n${requirements.keywords.join("\n")}`,
@@ -448,7 +470,7 @@ export class GenerationService {
       "section whole repair start"
     );
 
-    const repaired = await this.llmClient.generateWithFluxcode(
+    const repaired = await this.llmClient.repairWithRepairAgent(
       this.buildWholeRepairSystemPrompt(rule),
       this.buildWholeRepairUserPrompt(requirements, rule, content, currentErrors),
       `${step}_whole_repair`,
@@ -495,11 +517,12 @@ export class GenerationService {
     requirements: ListingRequirements,
     rule: SectionRule,
     step: string,
-    validate: (content: string) => string[]
+    validate: (content: string) => string[],
+    options?: SectionGenerateOptions
   ): Promise<string> {
-    const retries = Math.max(1, rule.execution.retries || 3);
+    const retries = Math.max(1, options?.maxRetries ?? rule.execution.retries ?? 3);
     const apiAttempts = Math.max(2, getNumber(rule.constraints, "api_attempts", 4));
-    let feedback = "";
+    let feedback = options?.initialFeedback?.trim() ?? "";
 
     for (let attempt = 1; attempt <= retries; attempt += 1) {
       const started = Date.now();
@@ -513,7 +536,7 @@ export class GenerationService {
         { event: "section_generate_start", step, section: rule.section, attempt, max_attempts: retries },
         "section generate start"
       );
-      const content = await this.llmClient.generateWithFluxcode(
+      const content = await this.llmClient.writeWithWriterAgent(
         this.buildSectionSystemPrompt(rule),
         this.buildSectionUserPrompt(requirements, rule.section, feedback),
         `${step}_attempt_${attempt}`,
@@ -632,11 +655,49 @@ export class GenerationService {
     throw new Error(`${step} 未生成有效内容`);
   }
 
+  private groupJudgeIssuesBySection(issues: JudgeIssue[]): Record<ENSectionKey, string[]> {
+    const grouped: Record<ENSectionKey, string[]> = {
+      title: [],
+      bullets: [],
+      description: [],
+      search_terms: []
+    };
+    for (const issue of issues) {
+      grouped[issue.section].push(issue.message);
+    }
+    return grouped;
+  }
+
+  private buildJudgeFeedbackText(messages: string[]): string {
+    return messages.map((message) => `- ${message}`).join("\n");
+  }
+
+  private startTranslationSlot(source: string, step: string, retries: number): TranslationSlot {
+    return {
+      step,
+      source,
+      promise: this.translateText(source, step, retries)
+    };
+  }
+
+  private refreshTranslationSlot(
+    current: TranslationSlot,
+    source: string,
+    retries: number,
+    stalePromises: Array<Promise<unknown>>
+  ): TranslationSlot {
+    if (normalizeText(current.source) === normalizeText(source)) {
+      return current;
+    }
+    stalePromises.push(current.promise.catch(() => undefined));
+    return this.startTranslationSlot(source, current.step, retries);
+  }
+
   private async translateText(text: string, step: string, retries: number): Promise<string> {
     const started = Date.now();
     await this.appendTrace("translate_start", "info", { step, input_chars: text.length, retries });
     this.logger.info({ event: "translate_start", step, input_chars: text.length, retries }, "translate start");
-    const translated = await this.llmClient.translateWithDeepseek(
+    const translated = await this.llmClient.translateWithTranslatorAgent(
       "你是专业翻译。将输入英文翻译成简体中文，保持语义准确，不要解释。",
       text,
       step,
@@ -652,6 +713,151 @@ export class GenerationService {
       output_chars: translated.length
     });
     return translated;
+  }
+
+  private buildPlanningSystemPrompt(): string {
+    return [
+      "你是电商文案执行编排师（Orchestrator）。",
+      "请根据输入需求输出一份简洁的英文执行简报，用于后续多阶段文案生成与修复。",
+      "只输出纯文本，不要 JSON，不要代码块，不要解释过程。"
+    ].join("\n");
+  }
+
+  private buildPlanningUserPrompt(requirements: ListingRequirements): string {
+    return [
+      "任务：输出 listing 生成执行简报（英文）",
+      `品牌: ${requirements.brand}`,
+      `分类: ${requirements.category}`,
+      `关键词库:\n${requirements.keywords.join("\n")}`,
+      "需求原文:",
+      requirements.raw,
+      "输出要求：",
+      "1) 给出标题策略、五点策略、描述策略、搜索词策略；",
+      "2) 给出执行顺序建议（先并发生成哪些 section，再做哪些复核）；",
+      "3) 每条策略一句话，强调关键词覆盖与可读性平衡；",
+      "4) 总长度控制在 700 字符以内。"
+    ].join("\n");
+  }
+
+  private async planExecution(requirements: ListingRequirements): Promise<string> {
+    const started = Date.now();
+    await this.appendTrace("planning_start", "info", {
+      brand: requirements.brand,
+      category: requirements.category,
+      keywords_count: requirements.keywords.length
+    });
+    try {
+      const brief = await this.llmClient.orchestrateWithOrchestratorAgent(
+        this.buildPlanningSystemPrompt(),
+        this.buildPlanningUserPrompt(requirements),
+        "orchestration",
+        2
+      );
+      const normalized = normalizeText(brief);
+      await this.appendTrace("planning_ok", "info", {
+        duration_ms: Date.now() - started,
+        output_chars: normalized.length
+      });
+      return normalized;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await this.appendTrace("planning_failed", "warn", {
+        duration_ms: Date.now() - started,
+        error: msg
+      });
+      this.logger.warn({ event: "planning_failed", error: msg }, "planning failed");
+      return "";
+    }
+  }
+
+  private buildJudgeSystemPrompt(): string {
+    return [
+      "你是亚马逊 Listing 质量审查专家。",
+      "你将审查英文 listing 各 section 的一致性与规则匹配度。",
+      "若无问题，只输出：OK",
+      "若有问题，按以下格式逐行输出：",
+      "- [title] <问题>",
+      "- [bullets] <问题>",
+      "- [description] <问题>",
+      "- [search_terms] <问题>",
+      "禁止输出其他格式。"
+    ].join("\n");
+  }
+
+  private buildJudgeUserPrompt(requirements: ListingRequirements, sections: Record<ENSectionKey, string>): string {
+    return [
+      `品牌: ${requirements.brand}`,
+      `分类: ${requirements.category}`,
+      `关键词库:\n${requirements.keywords.join("\n")}`,
+      "",
+      "【TITLE】",
+      sections.title,
+      "",
+      "【BULLETS】",
+      sections.bullets,
+      "",
+      "【DESCRIPTION】",
+      sections.description,
+      "",
+      "【SEARCH_TERMS】",
+      sections.search_terms
+    ].join("\n");
+  }
+
+  private parseJudgeIssues(text: string): JudgeIssue[] {
+    const normalized = normalizeText(text);
+    if (normalized.toUpperCase() === "OK") {
+      return [];
+    }
+    const lines = normalized.split("\n").map((v) => v.trim()).filter(Boolean);
+    const out: JudgeIssue[] = [];
+    for (const line of lines) {
+      const m = /^-?\s*\[(title|bullets|description|search_terms)\]\s*(.+)$/i.exec(line);
+      if (!m) {
+        continue;
+      }
+      out.push({
+        section: m[1].toLowerCase() as ENSectionKey,
+        message: m[2].trim()
+      });
+    }
+    return out;
+  }
+
+  private async runQualityJudge(
+    requirements: ListingRequirements,
+    sections: Record<ENSectionKey, string>
+  ): Promise<JudgeIssue[]> {
+    const started = Date.now();
+    await this.appendTrace("quality_judge_start", "info", {});
+    try {
+      const judgeOutput = await this.llmClient.reviewWithJudgeAgent(
+        this.buildJudgeSystemPrompt(),
+        this.buildJudgeUserPrompt(requirements, sections),
+        "quality_judge",
+        2
+      );
+      const issues = this.parseJudgeIssues(judgeOutput);
+      if (issues.length > 0) {
+        await this.appendTrace("quality_judge_issues", "warn", {
+          duration_ms: Date.now() - started,
+          issues
+        });
+      } else {
+        await this.appendTrace("quality_judge_ok", "info", {
+          duration_ms: Date.now() - started
+        });
+      }
+      return issues;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await this.appendTrace("quality_judge_failed", "warn", {
+        duration_ms: Date.now() - started,
+        error: msg
+      });
+      this.logger.warn({ event: "quality_judge_failed", error: msg }, "quality judge failed");
+      return [];
+    }
   }
 
   async generate(input: GenerationInput): Promise<ListingResult> {
@@ -708,36 +914,144 @@ export class GenerationService {
     }
 
     const translationRetries = Math.max(1, translationRule.execution.retries || 2);
+    this.executionBrief = await this.planExecution(requirements);
 
     const categoryTranslationPromise = this.translateText(requirements.category, "translate_category", translationRetries);
     const keywordsText = requirements.keywords.join("\n");
     const keywordsTranslationPromise = this.translateText(keywordsText, "translate_keywords", translationRetries);
+    const staleTranslationPromises: Array<Promise<unknown>> = [];
 
-    const titleEn = await this.generateSectionWithValidation(requirements, titleRule, "title", (content) =>
+    const titleEnPromise = this.generateSectionWithValidation(requirements, titleRule, "title", (content) =>
       validateTitle(content, requirements, titleRule)
     );
-    const titleCnPromise = this.translateText(titleEn, "translate_title", translationRetries);
-
-    const bulletsRaw = await this.generateSectionWithValidation(requirements, bulletsRule, "bullets", (content) => {
+    const bulletsRawPromise = this.generateSectionWithValidation(requirements, bulletsRule, "bullets", (content) => {
       const lines = splitLines(content);
       return validateBullets(lines, bulletsRule);
     });
-    const bulletsLinesEn = splitLines(bulletsRaw);
-    const bulletsCnPromise = this.translateText(bulletsLinesEn.join("\n"), "translate_bullets", translationRetries);
-
-    const descriptionEn = await this.generateSectionWithValidation(requirements, descriptionRule, "description", (content) =>
+    const descriptionEnPromise = this.generateSectionWithValidation(requirements, descriptionRule, "description", (content) =>
       validateDescription(content, descriptionRule)
     );
-    const descriptionCnPromise = this.translateText(descriptionEn, "translate_description", translationRetries);
+    const titleSlotPromise = titleEnPromise.then((value) =>
+      this.startTranslationSlot(value, "translate_title", translationRetries)
+    );
+    const bulletsSlotPromise = bulletsRawPromise.then((value) =>
+      this.startTranslationSlot(splitLines(value).join("\n"), "translate_bullets", translationRetries)
+    );
+    const descriptionSlotPromise = descriptionEnPromise.then((value) =>
+      this.startTranslationSlot(value, "translate_description", translationRetries)
+    );
+
+    let titleEn = await titleEnPromise;
+    let bulletsRaw = await bulletsRawPromise;
+    let bulletsLinesEn = splitLines(bulletsRaw);
+    let descriptionEn = await descriptionEnPromise;
+    let titleTranslation = await titleSlotPromise;
+    let bulletsTranslation = await bulletsSlotPromise;
+    let descriptionTranslation = await descriptionSlotPromise;
 
     const searchTermsEn = dedupeKeepOrder(requirements.keywords).join(" ");
     const searchTermsCnPromise = this.translateText(searchTermsEn, "translate_search_terms", translationRetries);
 
+    const maxJudgeRounds = 2;
+    let judgeIssues = await this.runQualityJudge(requirements, {
+      title: titleEn,
+      bullets: bulletsLinesEn.join("\n"),
+      description: descriptionEn,
+      search_terms: searchTermsEn
+    });
+
+    for (let judgeRound = 1; judgeRound <= maxJudgeRounds && judgeIssues.length > 0; judgeRound += 1) {
+      const grouped = this.groupJudgeIssuesBySection(judgeIssues);
+      await this.appendTrace("quality_judge_repair_round_start", "warn", {
+        round: judgeRound,
+        issues_count: judgeIssues.length,
+        grouped
+      });
+
+      if (grouped.title.length > 0) {
+        titleEn = await this.generateSectionWithValidation(
+          requirements,
+          titleRule,
+          `title_judge_repair_round_${judgeRound}`,
+          (content) => validateTitle(content, requirements, titleRule),
+          {
+            initialFeedback: this.buildJudgeFeedbackText(grouped.title),
+            maxRetries: 2
+          }
+        );
+        titleTranslation = this.refreshTranslationSlot(
+          titleTranslation,
+          titleEn,
+          translationRetries,
+          staleTranslationPromises
+        );
+      }
+
+      if (grouped.bullets.length > 0) {
+        bulletsRaw = await this.generateSectionWithValidation(
+          requirements,
+          bulletsRule,
+          `bullets_judge_repair_round_${judgeRound}`,
+          (content) => validateBullets(splitLines(content), bulletsRule),
+          {
+            initialFeedback: this.buildJudgeFeedbackText(grouped.bullets),
+            maxRetries: 2
+          }
+        );
+        bulletsLinesEn = splitLines(bulletsRaw);
+        bulletsTranslation = this.refreshTranslationSlot(
+          bulletsTranslation,
+          bulletsLinesEn.join("\n"),
+          translationRetries,
+          staleTranslationPromises
+        );
+      }
+
+      if (grouped.description.length > 0) {
+        descriptionEn = await this.generateSectionWithValidation(
+          requirements,
+          descriptionRule,
+          `description_judge_repair_round_${judgeRound}`,
+          (content) => validateDescription(content, descriptionRule),
+          {
+            initialFeedback: this.buildJudgeFeedbackText(grouped.description),
+            maxRetries: 2
+          }
+        );
+        descriptionTranslation = this.refreshTranslationSlot(
+          descriptionTranslation,
+          descriptionEn,
+          translationRetries,
+          staleTranslationPromises
+        );
+      }
+
+      if (grouped.search_terms.length > 0) {
+        await this.appendTrace("quality_judge_repair_skip", "warn", {
+          round: judgeRound,
+          section: "search_terms",
+          reason: "search_terms 固定由关键词库复制，不进行模型改写",
+          issues: grouped.search_terms
+        });
+      }
+
+      judgeIssues = await this.runQualityJudge(requirements, {
+        title: titleEn,
+        bullets: bulletsLinesEn.join("\n"),
+        description: descriptionEn,
+        search_terms: searchTermsEn
+      });
+    }
+
+    if (staleTranslationPromises.length > 0) {
+      void Promise.allSettled(staleTranslationPromises);
+    }
+
     const categoryCn = await promiseValue(categoryTranslationPromise, "分类翻译");
     const keywordsCnRaw = await promiseValue(keywordsTranslationPromise, "关键词翻译");
-    const titleCn = await promiseValue(titleCnPromise, "标题翻译");
-    const bulletsCnRaw = await promiseValue(bulletsCnPromise, "五点翻译");
-    const descriptionCn = await promiseValue(descriptionCnPromise, "描述翻译");
+    const titleCn = await promiseValue(titleTranslation.promise, "标题翻译");
+    const bulletsCnRaw = await promiseValue(bulletsTranslation.promise, "五点翻译");
+    const descriptionCn = await promiseValue(descriptionTranslation.promise, "描述翻译");
     const searchTermsCn = await promiseValue(searchTermsCnPromise, "搜索词翻译");
 
     const keywordsCn = splitLines(keywordsCnRaw);
@@ -814,12 +1128,13 @@ export class GenerationService {
       validation_report: [
         `rules_version=${tenantRules.version}`,
         `keywords_count=${requirements.keywords.length}`,
-        `bullets_count=${bulletsLinesEn.length}`
+        `bullets_count=${bulletsLinesEn.length}`,
+        `judge_issues_count=${judgeIssues.length}`
       ],
       timing_ms: Date.now() - start,
       billing_summary: {
-        provider: "fluxcode+deepseek",
-        model: `${this.env.fluxcodeModel}+${this.env.deepseekModel}`,
+        provider: "deepseek",
+        model: this.env.deepseekModel,
         note: "english generation + chinese translation"
       }
     };

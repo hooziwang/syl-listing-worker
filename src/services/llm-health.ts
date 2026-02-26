@@ -5,6 +5,7 @@ import { withRetry } from "../utils/retry.js";
 export interface ProviderHealth {
   ok: boolean;
   checked_at: string;
+  required?: boolean;
   error?: string;
 }
 
@@ -67,6 +68,23 @@ export class LLMHealthService {
 
   private async checkFluxcode(): Promise<ProviderHealth> {
     const checkedAt = new Date().toISOString();
+    const required = this.env.generationProvider === "fluxcode";
+    if (!this.env.fluxcodeApiKey) {
+      if (!required) {
+        return {
+          ok: true,
+          checked_at: checkedAt,
+          required: false,
+          error: "not_required"
+        };
+      }
+      return {
+        ok: false,
+        checked_at: checkedAt,
+        required: true,
+        error: "FLUXCODE_API_KEY 未配置"
+      };
+    }
     const url = joinUrl(this.env.fluxcodeBaseUrl, this.env.fluxcodeResponsesPath);
 
     try {
@@ -100,11 +118,11 @@ export class LLMHealthService {
           jitter: this.env.retryJitter
         }
       );
-      return { ok: true, checked_at: checkedAt };
+      return { ok: true, checked_at: checkedAt, required };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.warn({ event: "health_fluxcode_invalid", error: message }, "fluxcode key check failed");
-      return { ok: false, checked_at: checkedAt, error: message };
+      return { ok: false, checked_at: checkedAt, required, error: message };
     }
   }
 
@@ -143,11 +161,11 @@ export class LLMHealthService {
           jitter: this.env.retryJitter
         }
       );
-      return { ok: true, checked_at: checkedAt };
+      return { ok: true, checked_at: checkedAt, required: true };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.warn({ event: "health_deepseek_invalid", error: message }, "deepseek key check failed");
-      return { ok: false, checked_at: checkedAt, error: message };
+      return { ok: false, checked_at: checkedAt, required: true, error: message };
     }
   }
 }

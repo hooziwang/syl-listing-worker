@@ -250,7 +250,6 @@ validate_env() {
   required_env "SYL_LISTING_KEYS"
   required_env "JWT_SECRET"
   required_env "ADMIN_TOKEN"
-  required_env "FLUXCODE_API_KEY"
   required_env "DEEPSEEK_API_KEY"
 }
 

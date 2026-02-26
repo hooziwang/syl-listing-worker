@@ -17,7 +17,7 @@
 - compose 变量文件：`.compose.env`（脚本自动生成，不手改）
 
 `worker.config.json` 负责：域名、端口、重试参数、模型非密钥参数等。  
-`.env` 仅保留：`JWT_SECRET`、`SYL_LISTING_KEYS`、`ADMIN_TOKEN`、`FLUXCODE_API_KEY`、`DEEPSEEK_API_KEY`。
+`.env` 仅保留：`JWT_SECRET`、`SYL_LISTING_KEYS`、`ADMIN_TOKEN`、`DEEPSEEK_API_KEY`。
 
 ## 部署前准备
 
@@ -49,7 +49,6 @@ cp .env.example .env
 - `SYL_LISTING_KEYS`：租户 Key 映射，格式 `tenant_id:key,tenant2:key2`
 - `JWT_SECRET`：至少 16 位
 - `ADMIN_TOKEN`：规则发布鉴权口令
-- `FLUXCODE_API_KEY`
 - `DEEPSEEK_API_KEY`
 
 4. 启动：
@@ -114,8 +113,8 @@ make diagnose-external BASE_URL=https://worker.aelus.tech SYL_KEY=<SYL_LISTING_K
 说明：外部诊断默认不发起 `generate`；只检查健康、鉴权、规则接口。  
 如需附加检查生成链路，增加 `--with-generate`。
 
-说明：`/healthz` 会校验 `FLUXCODE_API_KEY` 与 `DEEPSEEK_API_KEY` 有效性（带缓存）。  
-任一 key 无效时，`/healthz` 返回非 200，`diagnose` 与 `diagnose-external` 会失败。
+说明：`/healthz` 会校验 `DEEPSEEK_API_KEY` 有效性（带缓存）。  
+若切换 `generation.provider=fluxcode`，同时会校验 `FLUXCODE_API_KEY`。
 
 验证 HTTP 跳转 HTTPS：
 

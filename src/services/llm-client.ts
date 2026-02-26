@@ -1,14 +1,10 @@
+import { Agent, OpenAIProvider, Runner, type ModelSettings } from "@openai/agents";
 import type { Logger } from "pino";
 import type { AppEnv } from "../config/env.js";
 import type { RedisTraceStore } from "../store/trace-store.js";
 import { withRetry } from "../utils/retry.js";
 
 const llmRequestTimeoutMs = 90_000;
-
-interface ChatMessage {
-  role: "system" | "user" | "assistant";
-  content: string;
-}
 
 function safeSnippet(input: string, max = 600): string {
   const s = input.trim();
@@ -21,74 +17,110 @@ function safeSnippet(input: string, max = 600): string {
   return `${s.slice(0, max)}...<truncated>`;
 }
 
-function parseJSONSafe(text: string): unknown {
-  if (!text.trim()) {
-    return {};
-  }
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return { raw_text: safeSnippet(text) };
-  }
-}
-
-function pickHeader(response: Response, names: string[]): string {
-  for (const name of names) {
-    const value = response.headers.get(name);
-    if (value) {
-      return value;
-    }
-  }
-  return "";
-}
-
 function joinUrl(baseUrl: string, path: string): string {
   const b = baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
   const p = path.startsWith("/") ? path : `/${path}`;
   return `${b}${p}`;
 }
 
-function parseDeepseekText(payload: unknown): string {
-  const obj = payload as { choices?: Array<{ message?: { content?: string } }> };
-  const text = obj.choices?.[0]?.message?.content;
-  if (!text) {
-    throw new Error("deepseek response content missing");
+function normalizePath(path: string): string {
+  const trimmed = path.trim();
+  if (trimmed === "") {
+    return "";
   }
-  return text.trim();
+  const withSlash = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  return withSlash.replace(/\/+$/g, "");
 }
 
-function parseResponsesText(payload: unknown): string {
-  const obj = payload as {
-    output_text?: string;
-    output?: Array<{ content?: Array<{ type?: string; text?: string }> }>;
-  };
+function resolveProviderBaseURL(baseUrl: string, endpointPath: string, endpointSuffix: string): string {
+  const base = baseUrl.replace(/\/+$/g, "");
+  const endpoint = normalizePath(endpointPath);
+  const suffix = normalizePath(endpointSuffix);
 
-  if (typeof obj.output_text === "string" && obj.output_text.trim()) {
-    return obj.output_text.trim();
+  if (!endpoint || endpoint === suffix) {
+    return base;
+  }
+  if (!endpoint.endsWith(suffix)) {
+    return base;
   }
 
-  const parts: string[] = [];
-  for (const m of obj.output ?? []) {
-    for (const c of m.content ?? []) {
-      if (typeof c.text === "string" && c.text.trim()) {
-        parts.push(c.text.trim());
-      }
-    }
+  const prefix = endpoint.slice(0, endpoint.length - suffix.length);
+  if (!prefix || prefix === "/") {
+    return base;
   }
+  return `${base}${prefix}`;
+}
 
-  if (parts.length === 0) {
-    throw new Error("responses output text missing");
+type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+function asReasoningEffort(v: string): ReasoningEffort | undefined {
+  const value = v.trim().toLowerCase();
+  if (value === "") {
+    return undefined;
   }
-  return parts.join("\n").trim();
+  switch (value) {
+    case "none":
+    case "minimal":
+    case "low":
+    case "medium":
+    case "high":
+    case "xhigh":
+      return value;
+    default:
+      return undefined;
+  }
+}
+
+function outputToText(output: unknown): string {
+  if (typeof output === "string") {
+    return output.trim();
+  }
+  if (output == null) {
+    return "";
+  }
+  return String(output).trim();
 }
 
 export class LLMClient {
+  private readonly fluxRunner?: Runner;
+  private readonly deepseekRunner: Runner;
+  private readonly fluxRequestURL: string;
+  private readonly deepseekRequestURL: string;
+
   constructor(
     private readonly env: AppEnv,
     private readonly logger: Logger,
     private readonly traceStore?: RedisTraceStore,
     private readonly traceContext?: { tenantId: string; jobId: string }
-  ) {}
+  ) {
+    const fluxBaseURL = resolveProviderBaseURL(env.fluxcodeBaseUrl, env.fluxcodeResponsesPath, "/responses");
+    const deepseekBaseURL = resolveProviderBaseURL(env.deepseekBaseUrl, env.deepseekChatPath, "/chat/completions");
+
+    if (env.fluxcodeApiKey) {
+      const fluxProvider = new OpenAIProvider({
+        apiKey: env.fluxcodeApiKey,
+        baseURL: fluxBaseURL,
+        useResponses: true
+      });
+      this.fluxRunner = new Runner({
+        modelProvider: fluxProvider,
+        tracingDisabled: true
+      });
+    }
+    const deepseekProvider = new OpenAIProvider({
+      apiKey: env.deepseekApiKey,
+      baseURL: deepseekBaseURL,
+      useResponses: false
+    });
+
+    this.deepseekRunner = new Runner({
+      modelProvider: deepseekProvider,
+      tracingDisabled: true
+    });
+
+    this.fluxRequestURL = joinUrl(env.fluxcodeBaseUrl, env.fluxcodeResponsesPath);
+    this.deepseekRequestURL = joinUrl(env.deepseekBaseUrl, env.deepseekChatPath);
+  }
 
   private async appendTrace(
     event: string,
@@ -120,103 +152,146 @@ export class LLMClient {
     }
   }
 
-  private async fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  private async runAgentText(runner: Runner, agent: Agent, input: string): Promise<string> {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), llmRequestTimeoutMs);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new Error(`agent request timeout after ${llmRequestTimeoutMs}ms`));
+      }, llmRequestTimeoutMs);
+    });
+    const runPromise = runner.run(agent, input, { maxTurns: 2, signal: controller.signal }).then((result) => {
+      const text = outputToText(result.finalOutput);
+      if (!text) {
+        throw new Error("agent output empty");
+      }
+      return text;
+    });
     try {
-      return await fetch(url, {
-        ...init,
-        signal: controller.signal
-      });
+      return await Promise.race([runPromise, timeoutPromise]);
     } finally {
-      clearTimeout(timeout);
+      if (timer) {
+        clearTimeout(timer);
+      }
     }
   }
 
-  async generateWithFluxcode(system: string, user: string, step: string, attempts: number): Promise<string> {
-    const url = joinUrl(this.env.fluxcodeBaseUrl, this.env.fluxcodeResponsesPath);
+  private buildAgentName(role: string, step: string): string {
+    const normalizedRole = role.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 24) || "agent";
+    const normalizedStep = step.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 48) || "step";
+    return `${normalizedRole}_${normalizedStep}`;
+  }
 
+  private getGenerationProvider(): "fluxcode" | "deepseek" {
+    return this.env.generationProvider;
+  }
+
+  async generateWithFluxcode(
+    system: string,
+    user: string,
+    step: string,
+    attempts: number,
+    role: "planner" | "orchestrator" | "writer" | "repair" | "judge" = "writer"
+  ): Promise<string> {
+    const generationProvider = this.getGenerationProvider();
     return withRetry(
       async (attempt) => {
-        await this.appendTrace("api_request", "info", { provider: "fluxcode", step, attempt, url });
-        this.logger.info({ event: "api_request", provider: "fluxcode", step, attempt, url }, "api request");
-        const started = Date.now();
+        const useFlux = generationProvider === "fluxcode";
+        const runner = useFlux ? this.fluxRunner : this.deepseekRunner;
+        const model = useFlux ? this.env.fluxcodeModel : this.env.deepseekModel;
+        const requestURL = useFlux ? this.fluxRequestURL : this.deepseekRequestURL;
+        if (!runner) {
+          throw new Error("FLUXCODE_API_KEY 未配置，无法使用 fluxcode 生成");
+        }
 
-        const response = await this.fetchWithTimeout(url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${this.env.fluxcodeApiKey}`
-          },
-          body: JSON.stringify({
-            model: this.env.fluxcodeModel,
-            reasoning: { effort: this.env.fluxcodeReasoningEffort },
-            temperature: this.env.fluxcodeTemperature,
-            input: [
-              { role: "system", content: [{ type: "input_text", text: system }] },
-              { role: "user", content: [{ type: "input_text", text: user }] }
-            ]
-          })
+        await this.appendTrace("api_request", "info", {
+          provider: generationProvider,
+          step,
+          attempt,
+          url: requestURL
         });
-
-        const bodyText = await response.text();
-        const payload = parseJSONSafe(bodyText);
-        const latencyMs = Date.now() - started;
-        const providerReqID = pickHeader(response, ["x-request-id", "request-id", "openai-request-id"]);
-        if (!response.ok) {
-          await this.appendTrace("api_failed", "error", {
-            provider: "fluxcode",
+        this.logger.info(
+          {
+            event: "api_request",
+            provider: generationProvider,
             step,
             attempt,
-            url,
-            status_code: response.status,
+            url: requestURL
+          },
+          "api request"
+        );
+
+        const started = Date.now();
+        const modelSettings: ModelSettings =
+          generationProvider === "fluxcode"
+            ? { temperature: this.env.fluxcodeTemperature }
+            : { temperature: this.env.deepseekTemperature };
+        if (generationProvider === "fluxcode") {
+          const effort = asReasoningEffort(this.env.fluxcodeReasoningEffort);
+          if (effort) {
+            modelSettings.reasoning = { effort };
+          }
+        }
+
+        try {
+          const agent = new Agent({
+            name: this.buildAgentName(role, step),
+            instructions: system,
+            model,
+            modelSettings
+          });
+          const text = await this.runAgentText(runner, agent, user);
+          const latencyMs = Date.now() - started;
+
+          await this.appendTrace("api_ok", "info", {
+            provider: generationProvider,
+            step,
+            attempt,
+            url: requestURL,
+            status_code: 200,
             latency_ms: latencyMs,
-            response_id: providerReqID,
-            error_body: safeSnippet(bodyText)
+            output_chars: text.length
+          });
+          this.logger.info(
+            {
+              event: "api_ok",
+              provider: generationProvider,
+              step,
+              attempt,
+              url: requestURL,
+              status_code: 200,
+              latency_ms: latencyMs,
+              output_chars: text.length
+            },
+            "api ok"
+          );
+          return text;
+        } catch (error) {
+          const latencyMs = Date.now() - started;
+          const message = error instanceof Error ? error.message : String(error);
+          await this.appendTrace("api_failed", "error", {
+            provider: generationProvider,
+            step,
+            attempt,
+            url: requestURL,
+            latency_ms: latencyMs,
+            error_body: safeSnippet(message)
           });
           this.logger.error(
             {
               event: "api_failed",
-              provider: "fluxcode",
+              provider: generationProvider,
               step,
               attempt,
-              url,
-              status_code: response.status,
+              url: requestURL,
               latency_ms: latencyMs,
-              response_id: providerReqID,
-              error_body: safeSnippet(bodyText)
+              error_body: safeSnippet(message)
             },
             "api failed"
           );
-          throw new Error(`fluxcode ${response.status}: ${JSON.stringify(payload)}`);
+          throw error;
         }
-
-        const text = parseResponsesText(payload);
-        await this.appendTrace("api_ok", "info", {
-          provider: "fluxcode",
-          step,
-          attempt,
-          url,
-          status_code: response.status,
-          latency_ms: latencyMs,
-          response_id: providerReqID,
-          output_chars: text.length
-        });
-        this.logger.info(
-          {
-            event: "api_ok",
-            provider: "fluxcode",
-            step,
-            attempt,
-            url,
-            status_code: response.status,
-            latency_ms: latencyMs,
-            response_id: providerReqID,
-            output_chars: text.length
-          },
-          "api ok"
-        );
-        return text;
       },
       {
         attempts,
@@ -225,14 +300,14 @@ export class LLMClient {
         jitter: this.env.retryJitter,
         onRetry: (attempt, error, waitMs) => {
           void this.appendTrace("api_retry", "warn", {
-            provider: "fluxcode",
+            provider: generationProvider,
             step,
             attempt,
             wait_ms: waitMs,
             error: error.message
           });
           this.logger.warn(
-            { event: "api_retry", provider: "fluxcode", step, attempt, wait_ms: waitMs, error: error.message },
+            { event: "api_retry", provider: generationProvider, step, attempt, wait_ms: waitMs, error: error.message },
             "api retry"
           );
         }
@@ -241,45 +316,72 @@ export class LLMClient {
   }
 
   async translateWithDeepseek(system: string, user: string, step: string, attempts: number): Promise<string> {
-    const url = joinUrl(this.env.deepseekBaseUrl, this.env.deepseekChatPath);
-
     return withRetry(
       async (attempt) => {
-        await this.appendTrace("api_request", "info", { provider: "deepseek", step, attempt, url });
-        this.logger.info({ event: "api_request", provider: "deepseek", step, attempt, url }, "api request");
+        await this.appendTrace("api_request", "info", {
+          provider: "deepseek",
+          step,
+          attempt,
+          url: this.deepseekRequestURL
+        });
+        this.logger.info(
+          {
+            event: "api_request",
+            provider: "deepseek",
+            step,
+            attempt,
+            url: this.deepseekRequestURL
+          },
+          "api request"
+        );
         const started = Date.now();
 
-        const response = await this.fetchWithTimeout(url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${this.env.deepseekApiKey}`
-          },
-          body: JSON.stringify({
-            model: this.env.deepseekModel,
-            temperature: this.env.deepseekTemperature,
-            stream: false,
-            messages: [
-              { role: "system", content: system },
-              { role: "user", content: user }
-            ] as ChatMessage[]
-          })
-        });
+        const modelSettings: ModelSettings = {
+          temperature: this.env.deepseekTemperature
+        };
 
-        const bodyText = await response.text();
-        const payload = parseJSONSafe(bodyText);
-        const latencyMs = Date.now() - started;
-        const providerReqID = pickHeader(response, ["x-request-id", "request-id"]);
-        if (!response.ok) {
+        try {
+          const agent = new Agent({
+            name: this.buildAgentName("translator", step),
+            instructions: system,
+            model: this.env.deepseekModel,
+            modelSettings
+          });
+          const text = await this.runAgentText(this.deepseekRunner, agent, user);
+          const latencyMs = Date.now() - started;
+          await this.appendTrace("api_ok", "info", {
+            provider: "deepseek",
+            step,
+            attempt,
+            url: this.deepseekRequestURL,
+            status_code: 200,
+            latency_ms: latencyMs,
+            output_chars: text.length
+          });
+          this.logger.info(
+            {
+              event: "api_ok",
+              provider: "deepseek",
+              step,
+              attempt,
+              url: this.deepseekRequestURL,
+              status_code: 200,
+              latency_ms: latencyMs,
+              output_chars: text.length
+            },
+            "api ok"
+          );
+          return text;
+        } catch (error) {
+          const latencyMs = Date.now() - started;
+          const message = error instanceof Error ? error.message : String(error);
           await this.appendTrace("api_failed", "error", {
             provider: "deepseek",
             step,
             attempt,
-            url,
-            status_code: response.status,
+            url: this.deepseekRequestURL,
             latency_ms: latencyMs,
-            response_id: providerReqID,
-            error_body: safeSnippet(bodyText)
+            error_body: safeSnippet(message)
           });
           this.logger.error(
             {
@@ -287,43 +389,14 @@ export class LLMClient {
               provider: "deepseek",
               step,
               attempt,
-              url,
-              status_code: response.status,
+              url: this.deepseekRequestURL,
               latency_ms: latencyMs,
-              response_id: providerReqID,
-              error_body: safeSnippet(bodyText)
+              error_body: safeSnippet(message)
             },
             "api failed"
           );
-          throw new Error(`deepseek ${response.status}: ${JSON.stringify(payload)}`);
+          throw error;
         }
-
-        const text = parseDeepseekText(payload);
-        await this.appendTrace("api_ok", "info", {
-          provider: "deepseek",
-          step,
-          attempt,
-          url,
-          status_code: response.status,
-          latency_ms: latencyMs,
-          response_id: providerReqID,
-          output_chars: text.length
-        });
-        this.logger.info(
-          {
-            event: "api_ok",
-            provider: "deepseek",
-            step,
-            attempt,
-            url,
-            status_code: response.status,
-            latency_ms: latencyMs,
-            response_id: providerReqID,
-            output_chars: text.length
-          },
-          "api ok"
-        );
-        return text;
       },
       {
         attempts,
@@ -345,5 +418,34 @@ export class LLMClient {
         }
       }
     );
+  }
+
+  async planWithPlannerAgent(system: string, user: string, step: string, attempts: number): Promise<string> {
+    return this.generateWithFluxcode(system, user, step, attempts, "planner");
+  }
+
+  async orchestrateWithOrchestratorAgent(
+    system: string,
+    user: string,
+    step: string,
+    attempts: number
+  ): Promise<string> {
+    return this.generateWithFluxcode(system, user, step, attempts, "orchestrator");
+  }
+
+  async writeWithWriterAgent(system: string, user: string, step: string, attempts: number): Promise<string> {
+    return this.generateWithFluxcode(system, user, step, attempts, "writer");
+  }
+
+  async repairWithRepairAgent(system: string, user: string, step: string, attempts: number): Promise<string> {
+    return this.generateWithFluxcode(system, user, step, attempts, "repair");
+  }
+
+  async reviewWithJudgeAgent(system: string, user: string, step: string, attempts: number): Promise<string> {
+    return this.generateWithFluxcode(system, user, step, attempts, "judge");
+  }
+
+  async translateWithTranslatorAgent(system: string, user: string, step: string, attempts: number): Promise<string> {
+    return this.translateWithDeepseek(system, user, step, attempts);
   }
 }
