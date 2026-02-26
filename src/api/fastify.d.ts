@@ -6,5 +6,6 @@ declare module "fastify" {
       tenant_id: string;
       scope: string;
     };
+    traceStartMs?: number;
   }
 }

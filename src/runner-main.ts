@@ -3,12 +3,14 @@ import { createLogger } from "./config/logger.js";
 import { createRedisConnection } from "./queue/redis.js";
 import { RulesService } from "./services/rules-service.js";
 import { RedisJobStore } from "./store/job-store.js";
+import { RedisTraceStore } from "./store/trace-store.js";
 import { createJobRunner } from "./worker/runner.js";
 
 const env = loadEnv();
 const logger = createLogger(env);
 const redis = createRedisConnection(env.redisUrl);
 const store = new RedisJobStore(redis, env.jobTtlSeconds);
+const traceStore = new RedisTraceStore(redis, env.jobTtlSeconds);
 const rulesService = new RulesService(redis, env.rulesFsDir, env.apiPublicBaseUrl);
 
 await rulesService.bootstrap({
@@ -19,7 +21,7 @@ await rulesService.bootstrap({
   signature_algo: env.bootstrapRulesSignatureAlgo
 });
 
-const runner = createJobRunner(env, redis, store, rulesService, logger);
+const runner = createJobRunner(env, redis, store, traceStore, rulesService, logger);
 logger.info({ event: "runner_started", queue: env.queueName, concurrency: env.workerConcurrency }, "runner started");
 
 async function shutdown(signal: string): Promise<void> {

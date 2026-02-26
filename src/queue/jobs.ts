@@ -20,6 +20,11 @@ export async function enqueueGenerateJob(
 ): Promise<void> {
   await queue.add("generate_listing", payload, {
     jobId: payload.job_id,
+    attempts: 3,
+    backoff: {
+      type: "exponential",
+      delay: 3_000
+    },
     removeOnComplete: 1000,
     removeOnFail: 1000
   });

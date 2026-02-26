@@ -1,4 +1,5 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { enqueueGenerateJob } from "../queue/jobs.js";
 import { randomId } from "../utils/id.js";
@@ -25,10 +26,33 @@ function withTenant<T extends object>(tenantId: string, payload: T): T & { tenan
   } as T & { tenant_id: string };
 }
 
+function keyFingerprint(raw: string): string {
+  const v = raw.trim();
+  if (!v) {
+    return "";
+  }
+  if (v.length <= 8) {
+    return `${v[0]}***${v[v.length - 1]}`;
+  }
+  return `${v.slice(0, 4)}***${v.slice(-4)}`;
+}
+
+function sha256Hex(input: string): string {
+  return createHash("sha256").update(input).digest("hex");
+}
+
 function requireAdmin(ctx: ApiContext) {
   return async (request: FastifyRequest, reply: FastifyReply) => {
     const tokenHeader = request.headers["x-admin-token"];
-    const token = Array.isArray(tokenHeader) ? tokenHeader[0] : tokenHeader;
+    const tokenFromHeader = Array.isArray(tokenHeader) ? tokenHeader[0] : tokenHeader;
+    const tokenFromBearer = (() => {
+      const parsed = bearerSchema.safeParse(request.headers.authorization || "");
+      if (!parsed.success) {
+        return "";
+      }
+      return parsed.data.replace(/^Bearer\s+/i, "").trim();
+    })();
+    const token = (tokenFromHeader || "").trim() || tokenFromBearer;
     if (!token || token !== ctx.env.adminToken) {
       return reply.code(401).send(withTenant("admin", { error: "invalid_admin_token" }));
     }
@@ -71,6 +95,40 @@ function requestBaseURL(request: FastifyRequest): string {
 }
 
 export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Promise<void> {
+  const appendApiTrace = async (
+    request: FastifyRequest,
+    tenantId: string,
+    jobId: string,
+    event: string,
+    level: "info" | "warn" | "error" = "info",
+    payload?: Record<string, unknown>
+  ): Promise<void> => {
+    try {
+      await ctx.traceStore.append({
+        ts: new Date().toISOString(),
+        source: "api",
+        event,
+        level,
+        tenant_id: tenantId,
+        job_id: jobId,
+        req_id: request.id,
+        payload
+      });
+    } catch (error) {
+      request.log.warn(
+        {
+          event: "trace_append_failed",
+          req_id: request.id,
+          trace_event: event,
+          tenant_id: tenantId,
+          job_id: jobId,
+          message: error instanceof Error ? error.message : String(error)
+        },
+        "trace append failed"
+      );
+    }
+  };
+
   app.get("/healthz", async (_request, reply) => {
     const report = await ctx.llmHealthService.check();
     if (!report.ok) {
@@ -81,6 +139,14 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
   });
 
   app.post("/v1/auth/exchange", async (request, reply) => {
+    request.log.info(
+      {
+        event: "auth_exchange_start",
+        req_id: request.id,
+        auth_present: Boolean(request.headers.authorization)
+      },
+      "auth exchange start"
+    );
     const authHeader = request.headers.authorization;
     const parsedBearer = bearerSchema.safeParse(Array.isArray(authHeader) ? authHeader[0] : authHeader || "");
     if (!parsedBearer.success) {
@@ -94,9 +160,26 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
 
     try {
       const exchanged = ctx.authService.exchangeBySylKey(sylKey);
+      request.log.info(
+        {
+          event: "auth_exchange_ok",
+          req_id: request.id,
+          tenant_id: exchanged.tenant_id,
+          key_fingerprint: keyFingerprint(sylKey)
+        },
+        "auth exchange ok"
+      );
       reply.header("x-tenant-id", exchanged.tenant_id);
       return exchanged;
     } catch {
+      request.log.warn(
+        {
+          event: "auth_exchange_failed",
+          req_id: request.id,
+          key_fingerprint: keyFingerprint(sylKey)
+        },
+        "auth exchange failed"
+      );
       return reply.code(401).send(withTenant("unknown", { error: "invalid_syl_key" }));
     }
   });
@@ -138,6 +221,41 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
       reply.header("x-tenant-id", body.tenant_id);
       return { ok: true, tenant_id: body.tenant_id, rules_version: body.rules_version };
     });
+
+    adminApp.get("/v1/admin/logs/trace/:jobId", async (request, reply) => {
+      const params = z.object({ jobId: z.string().min(1) }).parse(request.params);
+      const query = z
+        .object({
+          limit: z.coerce.number().int().positive().max(5000).optional(),
+          offset: z.coerce.number().int().min(0).optional()
+        })
+        .parse(request.query);
+      const limit = query.limit ?? 500;
+      const offset = query.offset ?? 0;
+
+      const record = await ctx.jobStore.get(params.jobId);
+      if (!record) {
+        return reply.code(404).send(withTenant("admin", { error: "job_not_found" }));
+      }
+
+      const [items, traceCount] = await Promise.all([
+        ctx.traceStore.list(params.jobId, limit, offset),
+        ctx.traceStore.count(params.jobId)
+      ]);
+
+      reply.header("x-tenant-id", record.tenant_id);
+      return {
+        ok: true,
+        tenant_id: record.tenant_id,
+        job_id: params.jobId,
+        job_status: record.status,
+        updated_at: record.updated_at,
+        trace_count: traceCount,
+        limit,
+        offset,
+        items
+      };
+    });
   });
 
   app.register(async (securedApp) => {
@@ -148,6 +266,17 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
       const tenantId = request.auth!.tenant_id;
       const resolved = await ctx.rulesService.resolve(tenantId, query.current);
       resolved.download_url = `${requestBaseURL(request)}/v1/rules/download/${encodeURIComponent(tenantId)}/${encodeURIComponent(resolved.rules_version)}`;
+      request.log.info(
+        {
+          event: "rules_resolve_ok",
+          req_id: request.id,
+          tenant_id: tenantId,
+          current: query.current || "",
+          rules_version: resolved.rules_version,
+          up_to_date: resolved.up_to_date
+        },
+        "rules resolve ok"
+      );
       return withTenant(tenantId, resolved);
     });
 
@@ -155,6 +284,15 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
       const tenantId = request.auth!.tenant_id;
       const resolved = await ctx.rulesService.resolve(tenantId, undefined);
       resolved.download_url = `${requestBaseURL(request)}/v1/rules/download/${encodeURIComponent(tenantId)}/${encodeURIComponent(resolved.rules_version)}`;
+      request.log.info(
+        {
+          event: "rules_refresh_ok",
+          req_id: request.id,
+          tenant_id: tenantId,
+          rules_version: resolved.rules_version
+        },
+        "rules refresh ok"
+      );
       return withTenant(tenantId, resolved);
     });
 
@@ -188,6 +326,24 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
         input_markdown: parsed.input_markdown,
         candidate_count: candidateCount
       });
+      await appendApiTrace(request, tenantId, jobId, "generate_queued", "info", {
+        candidate_count: candidateCount,
+        input_chars: parsed.input_markdown.length,
+        input_sha256: sha256Hex(parsed.input_markdown)
+      });
+
+      request.log.info(
+        {
+          event: "generate_queued",
+          req_id: request.id,
+          tenant_id: tenantId,
+          job_id: jobId,
+          candidate_count: candidateCount,
+          input_chars: parsed.input_markdown.length,
+          input_sha256: sha256Hex(parsed.input_markdown)
+        },
+        "generate queued"
+      );
 
       return {
         job_id: jobId,
@@ -204,6 +360,20 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
       if (!record || record.tenant_id !== tenantId) {
         return reply.code(404).send(withTenant(tenantId, { error: "job_not_found" }));
       }
+
+      request.log.info(
+        {
+          event: "job_status_read",
+          req_id: request.id,
+          tenant_id: tenantId,
+          job_id: record.id,
+          status: record.status
+        },
+        "job status read"
+      );
+      await appendApiTrace(request, tenantId, record.id, "job_status_read", "info", {
+        status: record.status
+      });
 
       return {
         job_id: record.id,
@@ -224,6 +394,9 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
       }
 
       if (record.status !== "succeeded") {
+        await appendApiTrace(request, tenantId, record.id, "job_result_not_ready", "warn", {
+          status: record.status
+        });
         return reply.code(409).send({
           error: "job_not_ready",
           status: record.status,
@@ -236,6 +409,24 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
       if (!result) {
         return reply.code(404).send(withTenant(tenantId, { error: "result_consumed_or_missing" }));
       }
+
+      request.log.info(
+        {
+          event: "job_result_read",
+          req_id: request.id,
+          tenant_id: tenantId,
+          job_id: params.jobId,
+          en_chars: result.en_markdown.length,
+          cn_chars: result.cn_markdown.length,
+          timing_ms: result.timing_ms
+        },
+        "job result read"
+      );
+      await appendApiTrace(request, tenantId, params.jobId, "job_result_read", "info", {
+        en_chars: result.en_markdown.length,
+        cn_chars: result.cn_markdown.length,
+        timing_ms: result.timing_ms
+      });
 
       return withTenant(tenantId, result);
     });
