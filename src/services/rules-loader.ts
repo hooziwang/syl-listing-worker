@@ -26,6 +26,8 @@ export interface InputRules {
   };
   keywords: {
     heading_aliases: string[];
+    min_count: number;
+    unique_required: boolean;
   };
   category: {
     heading_aliases: string[];
@@ -165,7 +167,9 @@ export async function loadTenantRules(
       heading_aliases: mustStringArray(
         (inputDoc.keywords as Record<string, unknown> | undefined)?.heading_aliases,
         "input.keywords.heading_aliases"
-      )
+      ),
+      min_count: Math.max(1, asNumber((inputDoc.keywords as Record<string, unknown> | undefined)?.min_count, 3)),
+      unique_required: (inputDoc.keywords as Record<string, unknown> | undefined)?.unique_required === true
     },
     category: {
       heading_aliases: mustStringArray(

@@ -3,7 +3,7 @@ import type { Redis } from "ioredis";
 import type { Logger } from "pino";
 import type { AppEnv } from "../config/env.js";
 import type { GenerateJobData } from "../queue/jobs.js";
-import { GenerationService } from "../services/generation-service.js";
+import { GenerationService, InputValidationError } from "../services/generation-service.js";
 import { RulesService } from "../services/rules-service.js";
 import { RedisJobStore } from "../store/job-store.js";
 import { RedisTraceStore } from "../store/trace-store.js";
@@ -167,6 +167,26 @@ export function createJobRunner(
         const cancelled = cancelController.signal.aborted || await store.isCancelRequested(jobId);
         if (cancelled) {
           await markCancelled("任务被用户取消");
+          return;
+        }
+        if (error instanceof InputValidationError) {
+          await store.markFailed(jobId, message);
+          jobLogger.error(
+            {
+              event: "job_failed",
+              duration_ms: Date.now() - started,
+              error: message,
+              final_attempt: true,
+              input_validation: true
+            },
+            "job failed"
+          );
+          await appendTrace("job_failed", "error", {
+            duration_ms: Date.now() - started,
+            error: message,
+            final_attempt: true,
+            input_validation: true
+          });
           return;
         }
         const finalAttempt = currentAttempt >= maxAttempts;

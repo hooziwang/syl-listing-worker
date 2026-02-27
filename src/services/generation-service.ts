@@ -16,6 +16,13 @@ interface GenerationInput {
   inputFilename?: string;
 }
 
+export class InputValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InputValidationError";
+  }
+}
+
 type ENSectionKey = "title" | "bullets" | "description" | "search_terms";
 
 interface JudgeIssue {
@@ -282,6 +289,24 @@ function dedupeKeepOrder(values: string[]): string[] {
     out.push(value);
   }
   return out;
+}
+
+function duplicateKeywords(values: string[]): string[] {
+  const seen = new Set<string>();
+  const dup = new Set<string>();
+  for (const raw of values) {
+    const value = normalizeLine(raw);
+    if (!value) {
+      continue;
+    }
+    const key = value.toLowerCase();
+    if (seen.has(key)) {
+      dup.add(value);
+      continue;
+    }
+    seen.add(key);
+  }
+  return [...dup];
 }
 
 function getNumber(constraints: Record<string, unknown>, key: string, fallback = 0): number {
@@ -1450,11 +1475,26 @@ export class GenerationService {
 
     if (!requirements.category) {
       await this.appendTrace("generation_invalid_input", "error", { error: "缺少分类" });
-      throw new Error("缺少分类");
+      throw new InputValidationError("缺少分类");
     }
-    if (requirements.keywords.length < 3) {
-      await this.appendTrace("generation_invalid_input", "error", { error: "关键词过少，至少 3 条" });
-      throw new Error("关键词过少，至少 3 条");
+    const minKeywordCount = Math.max(1, tenantRules.input.keywords.min_count || 3);
+    if (requirements.keywords.length < minKeywordCount) {
+      await this.appendTrace("generation_invalid_input", "error", {
+        error: `关键词数量不足：${requirements.keywords.length} < ${minKeywordCount}`,
+        keywords_count: requirements.keywords.length,
+        min_keyword_count: minKeywordCount
+      });
+      throw new InputValidationError(`关键词数量不足：${requirements.keywords.length} < ${minKeywordCount}`);
+    }
+    if (tenantRules.input.keywords.unique_required) {
+      const duplicates = duplicateKeywords(requirements.keywords);
+      if (duplicates.length > 0) {
+        await this.appendTrace("generation_invalid_input", "error", {
+          error: `关键词存在重复：${duplicates.join("；")}`,
+          duplicate_keywords: duplicates
+        });
+        throw new InputValidationError(`关键词存在重复：${duplicates.join("；")}`);
+      }
     }
 
     const titleRule = tenantRules.sections.get("title");
