@@ -31,6 +31,10 @@ interface SectionGenerateOptions {
   adaptContent?: (raw: string) => { content: string; error?: string };
 }
 
+const lineLengthErrorPattern = /^第(\d+)条长度不满足约束:\s*(\d+)（规则区间 \[(\d+),(\d+)\]，容差区间 \[(\d+),(\d+)\]）$/;
+const textLengthErrorPattern = /^长度不满足约束:\s*(\d+)（规则区间 \[(\d+),(\d+)\]，容差区间 \[(\d+),(\d+)\]）$/;
+const paragraphCountErrorPattern = /^段落数量不满足约束:\s*(\d+)（规则区间 (.+)）$/;
+
 function normalizeText(input: string): string {
   return input.replace(/\r\n/g, "\n").trim();
 }
@@ -81,9 +85,16 @@ function adaptJSONArrayContent(raw: string, field: string): { content: string; e
   if (!Array.isArray(arr)) {
     return { content: "", error: `JSON 解析失败: 缺少 ${field} 数组字段` };
   }
-  const lines = arr
-    .map((item) => (typeof item === "string" ? normalizeLine(stripBulletPrefix(item)) : ""))
-    .filter(Boolean);
+  const lines = arr.flatMap((item) => {
+    if (typeof item !== "string") {
+      return [];
+    }
+    return item
+      .replace(/\r\n/g, "\n")
+      .split("\n")
+      .map((line) => normalizeLine(stripBulletPrefix(line)))
+      .filter(Boolean);
+  });
   if (lines.length === 0) {
     return { content: "", error: `JSON 解析失败: ${field} 数组为空` };
   }
@@ -127,6 +138,19 @@ function rangeCheck(value: number, min: number, max: number): boolean {
   return true;
 }
 
+function formatRange(min: number, max: number): string {
+  if (min > 0 && max > 0) {
+    return `[${min},${max}]`;
+  }
+  if (min > 0) {
+    return `[${min},∞)`;
+  }
+  if (max > 0) {
+    return `(-∞,${max}]`;
+  }
+  return "无限制";
+}
+
 function validateSectionContent(content: string, requirements: ListingRequirements, rule: SectionRule): string[] {
   const constraints = rule.constraints;
   const tolerance = getTolerance(constraints);
@@ -138,7 +162,9 @@ function validateSectionContent(content: string, requirements: ListingRequiremen
   const maxChars = rawMaxChars > 0 ? rawMaxChars + tolerance : 0;
   const hasTextLengthConstraint = rawMinChars > 0 || rawMaxChars > 0;
   if (hasTextLengthConstraint && !rangeCheck(normalized.length, Math.max(0, minChars), maxChars)) {
-    errors.push(`长度不满足约束: ${normalized.length}`);
+    errors.push(
+      `长度不满足约束: ${normalized.length}（规则区间 ${formatRange(rawMinChars, rawMaxChars)}，容差区间 ${formatRange(Math.max(0, minChars), maxChars)}）`
+    );
   }
 
   const lines = splitLines(content);
@@ -150,14 +176,16 @@ function validateSectionContent(content: string, requirements: ListingRequiremen
   const hasLineConstraint = expectedCount > 0 || rawMinCharsPerLine > 0 || rawMaxCharsPerLine > 0;
   if (hasLineConstraint) {
     if (expectedCount > 0 && lines.length != expectedCount) {
-      errors.push(`行数不满足约束: ${lines.length} != ${expectedCount}`);
+      errors.push(`行数不满足约束: ${lines.length}（要求 ${expectedCount}）`);
       return errors;
     }
     for (let i = 0; i < lines.length; i += 1) {
       const line = normalizeLine(lines[i]);
       const ok = rangeCheck(line.length, Math.max(0, minCharsPerLine), maxCharsPerLine);
       if (!ok) {
-        errors.push(`第${i + 1}条长度不满足约束: ${line.length}`);
+        errors.push(
+          `第${i + 1}条长度不满足约束: ${line.length}（规则区间 ${formatRange(rawMinCharsPerLine, rawMaxCharsPerLine)}，容差区间 ${formatRange(Math.max(0, minCharsPerLine), maxCharsPerLine)}）`
+        );
       }
     }
   }
@@ -170,7 +198,7 @@ function validateSectionContent(content: string, requirements: ListingRequiremen
       .map((p) => p.trim())
       .filter(Boolean);
     if (!rangeCheck(paragraphs.length, minParagraphs, maxParagraphs)) {
-      errors.push(`段落数量不满足约束: ${paragraphs.length}`);
+      errors.push(`段落数量不满足约束: ${paragraphs.length}（规则区间 ${formatRange(minParagraphs, maxParagraphs)}）`);
     }
   }
 
@@ -235,6 +263,130 @@ function renderList(items: string[], itemTemplate: string, separator = "\n"): st
     })
   );
   return rendered.join(separator);
+}
+
+function compactErrorForLLM(error: string): string {
+  const text = normalizeLine(error);
+  if (!text) {
+    return "规则不满足";
+  }
+  const lineMatched = lineLengthErrorPattern.exec(text);
+  if (lineMatched) {
+    const [, lineNo, actual, , , tolMin, tolMax] = lineMatched;
+    return `第${lineNo}条长度不合规：当前${actual}，目标[${tolMin},${tolMax}]`;
+  }
+  const lengthMatched = textLengthErrorPattern.exec(text);
+  if (lengthMatched) {
+    const [, actual, , , tolMin, tolMax] = lengthMatched;
+    return `长度不合规：当前${actual}，目标[${tolMin},${tolMax}]`;
+  }
+  const paragraphMatched = paragraphCountErrorPattern.exec(text);
+  if (paragraphMatched) {
+    const [, actual, range] = paragraphMatched;
+    return `段落数量不合规：当前${actual}，目标${range}`;
+  }
+  return text;
+}
+
+function compactErrorsForLLM(errors: string[], maxItems = 6): string[] {
+  if (!Array.isArray(errors) || errors.length === 0) {
+    return [];
+  }
+  const out = errors
+    .map((error) => compactErrorForLLM(error))
+    .filter(Boolean)
+    .slice(0, Math.max(1, maxItems));
+  return out;
+}
+
+function truncateByWord(input: string, maxChars: number): string {
+  if (maxChars <= 0) {
+    return input;
+  }
+  const text = input.trim();
+  if (text.length <= maxChars) {
+    return text;
+  }
+  let out = text.slice(0, maxChars).trim();
+  const cut = out.lastIndexOf(" ");
+  if (cut >= Math.floor(maxChars * 0.6)) {
+    out = out.slice(0, cut).trim();
+  }
+  return out;
+}
+
+function compactLineToMaxChars(line: string, maxChars: number): string {
+  const text = normalizeLine(line);
+  if (maxChars <= 0 || text.length <= maxChars) {
+    return text;
+  }
+  const colonIdx = text.indexOf(":");
+  if (colonIdx > 0) {
+    const title = text.slice(0, colonIdx + 1).trim();
+    const body = text.slice(colonIdx + 1).trim();
+    if (title.length + 1 >= maxChars) {
+      return truncateByWord(text, maxChars);
+    }
+    const remain = maxChars - title.length - 1;
+    return `${title} ${truncateByWord(body, remain)}`.trim();
+  }
+  return truncateByWord(text, maxChars);
+}
+
+function compactTextToMaxChars(content: string, maxChars: number): string {
+  const text = normalizeText(content);
+  if (maxChars <= 0 || text.length <= maxChars) {
+    return text;
+  }
+  return truncateByWord(text, maxChars);
+}
+
+function maybeAutoShrinkContent(content: string, rule: SectionRule): string {
+  const enabled = rule.constraints.auto_shrink_to_tolerance_max === true;
+  if (!enabled) {
+    return content;
+  }
+  const tolerance = getTolerance(rule.constraints);
+  const rawMaxPerLine = getNumber(rule.constraints, "max_chars_per_line", 0);
+  const maxPerLine = rawMaxPerLine > 0 ? rawMaxPerLine + tolerance : 0;
+  const rawMaxChars = getNumber(rule.constraints, "max_chars", 0);
+  const maxChars = rawMaxChars > 0 ? rawMaxChars + tolerance : 0;
+
+  let out = normalizeText(content);
+  if (maxPerLine > 0) {
+    const lines = splitLines(out).map((line) => compactLineToMaxChars(line, maxPerLine));
+    out = lines.join("\n");
+  }
+  if (maxChars > 0) {
+    out = compactTextToMaxChars(out, maxChars);
+  }
+  return normalizeText(out);
+}
+
+function adaptSingleLineRepair(raw: string, rule: SectionRule, targetIndex: number): string {
+  const trimmed = normalizeText(raw);
+  if (!trimmed) {
+    return "";
+  }
+  if (rule.output.format === "json") {
+    const field = rule.output.json_array_field || "bullets";
+    const adapted = adaptJSONArrayContent(trimmed, field);
+    if (!adapted.error) {
+      const lines = splitLines(adapted.content);
+      if (targetIndex >= 0 && targetIndex < lines.length) {
+        return lines[targetIndex];
+      }
+      if (lines.length > 0) {
+        return lines[0];
+      }
+    }
+  }
+  const first = trimmed
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => normalizeLine(stripBulletPrefix(line)))
+    .find(Boolean);
+  return first ?? "";
 }
 
 async function promiseValue<T>(promise: Promise<T>, label: string): Promise<T> {
@@ -366,13 +518,17 @@ export class GenerationService {
   }
 
   private buildSectionSystemPrompt(rule: SectionRule, jsonOutput = false): string {
+    const constraintsSummary = this.constraintsSummary(rule);
+    const constraintsJSON = JSON.stringify(rule.constraints, null, 2);
     return [
       "你是专业亚马逊 Listing 文案专家。",
       jsonOutput
         ? "只输出符合要求的 JSON 对象，不要解释，不要代码块，不要额外文本。"
         : "只输出目标 section 的文本，不要输出解释、JSON、代码块、前后缀。",
       `section=${rule.section}`,
-      `规则:\n${rule.instruction}`
+      `规则:\n${rule.instruction}`,
+      `硬性约束摘要:\n${constraintsSummary}`,
+      `硬性约束(JSON):\n${constraintsJSON}`
     ].join("\n");
   }
 
@@ -391,7 +547,24 @@ export class GenerationService {
   }
 
   private supportsItemRepair(rule: SectionRule): boolean {
-    return rule.execution.repair_mode === "item" && rule.output.format === "lines";
+    return rule.execution.repair_mode === "item";
+  }
+
+  private supportsLineTargetRepair(rule: SectionRule): boolean {
+    const expectedCount = getNumber(rule.constraints, "line_count", 0);
+    const minPerLine = getNumber(rule.constraints, "min_chars_per_line", 0);
+    const maxPerLine = getNumber(rule.constraints, "max_chars_per_line", 0);
+    return expectedCount > 0 || minPerLine > 0 || maxPerLine > 0;
+  }
+
+  private shouldTryItemRepair(rule: SectionRule, errors: string[]): boolean {
+    if (!this.supportsLineTargetRepair(rule)) {
+      return false;
+    }
+    if (this.supportsItemRepair(rule)) {
+      return true;
+    }
+    return errors.some((error) => extractLineErrorIndex(error) !== null);
   }
 
   private lineCharRangeText(rule: SectionRule): string {
@@ -410,6 +583,45 @@ export class GenerationService {
     return "遵循规则";
   }
 
+  private constraintsSummary(rule: SectionRule): string {
+    const constraints = rule.constraints;
+    const tolerance = getTolerance(constraints);
+    const lines: string[] = [];
+    const lineCount = getNumber(constraints, "line_count", 0);
+    const rawMinPerLine = getNumber(constraints, "min_chars_per_line", 0);
+    const rawMaxPerLine = getNumber(constraints, "max_chars_per_line", 0);
+    const rawMinChars = getNumber(constraints, "min_chars", 0);
+    const rawMaxChars = getNumber(constraints, "max_chars", 0);
+    const minParagraphs = getNumber(constraints, "min_paragraphs", 0);
+    const maxParagraphs = getNumber(constraints, "max_paragraphs", 0);
+
+    if (lineCount > 0) {
+      lines.push(`- 行数必须=${lineCount}`);
+    }
+    if (rawMinPerLine > 0 || rawMaxPerLine > 0) {
+      const tolMin = rawMinPerLine > 0 ? Math.max(0, rawMinPerLine - tolerance) : 0;
+      const tolMax = rawMaxPerLine > 0 ? rawMaxPerLine + tolerance : 0;
+      lines.push(`- 每行长度：规则${formatRange(rawMinPerLine, rawMaxPerLine)}，容差${formatRange(tolMin, tolMax)}`);
+    }
+    if (rawMinChars > 0 || rawMaxChars > 0) {
+      const tolMin = rawMinChars > 0 ? Math.max(0, rawMinChars - tolerance) : 0;
+      const tolMax = rawMaxChars > 0 ? rawMaxChars + tolerance : 0;
+      lines.push(`- 总长度：规则${formatRange(rawMinChars, rawMaxChars)}，容差${formatRange(tolMin, tolMax)}`);
+    }
+    if (minParagraphs > 0 || maxParagraphs > 0) {
+      lines.push(`- 段落数：${formatRange(minParagraphs, maxParagraphs)}`);
+    }
+    const mustContain = constraints.must_contain;
+    if (Array.isArray(mustContain) && mustContain.length > 0) {
+      lines.push(`- 必含项：${mustContain.join(", ")}`);
+    }
+    const source = typeof constraints.source === "string" ? constraints.source : "";
+    if (source) {
+      lines.push(`- 数据来源：${source}`);
+    }
+    return lines.length > 0 ? lines.join("\n") : "- 无额外约束";
+  }
+
   private deepseekJSONModeSettings(): Partial<ModelSettings> | undefined {
     if (this.env.generationProvider !== "deepseek") {
       return undefined;
@@ -424,14 +636,17 @@ export class GenerationService {
   }
 
   private buildItemRepairSystemPrompt(rule: SectionRule, targetIndex: number): string {
+    const constraintsSummary = this.constraintsSummary(rule);
     return [
       "你是专业亚马逊 Listing 文案专家。",
       "你正在修复单条文案。",
       "只输出修复后的单行英文文本，不要编号，不要项目符号，不要解释，不要换行。",
+      "若规则中包含 JSON/数组/整段输出格式要求，在本步骤全部忽略，仅按单条文本修复。",
       `section=${rule.section}`,
       `target_line=${targetIndex + 1}`,
       `line_length=${this.lineCharRangeText(rule)}`,
-      `规则:\n${rule.instruction}`
+      `内容规则:\n${rule.instruction}`,
+      `硬性约束摘要:\n${constraintsSummary}`
     ].join("\n");
   }
 
@@ -451,7 +666,7 @@ export class GenerationService {
       `关键词库:\n${requirements.keywords.join("\n")}`,
       `当前 ${rule.section} 全部行:\n${numbered}`,
       `需要修复的行:\n${targetIndex + 1}. ${lines[targetIndex] ?? ""}`,
-      lineErrors.length > 0 ? `该行校验错误:\n${lineErrors.map((v) => `- ${v}`).join("\n")}` : "",
+      lineErrors.length > 0 ? `该行校验错误:\n${compactErrorsForLLM(lineErrors).map((v) => `- ${v}`).join("\n")}` : "",
       "只返回修复后的这一行英文文本。"
     ]
       .filter(Boolean)
@@ -513,10 +728,19 @@ export class GenerationService {
           `${step}_item_${idx + 1}_round_${round}`,
           apiAttempts
         );
-        lines[idx] = normalizeLine(stripBulletPrefix(repaired));
+        const adaptedLine = adaptSingleLineRepair(repaired, rule, idx);
+        const normalizedLine = normalizeLine(stripBulletPrefix(adaptedLine));
+        const maxChars = (() => {
+          const rawMax = getNumber(rule.constraints, "max_chars_per_line", 0);
+          if (rawMax <= 0) {
+            return 0;
+          }
+          return rawMax + getTolerance(rule.constraints);
+        })();
+        lines[idx] = maxChars > 0 ? compactLineToMaxChars(normalizedLine, maxChars) : normalizedLine;
       }
 
-      const merged = lines.join("\n");
+      const merged = maybeAutoShrinkContent(lines.join("\n"), rule);
       currentErrors = validate(merged);
       if (currentErrors.length === 0) {
         await this.appendTrace("section_item_repair_ok", "info", {
@@ -586,7 +810,7 @@ export class GenerationService {
       `分类: ${requirements.category}`,
       `关键词库:\n${requirements.keywords.join("\n")}`,
       `当前文案:\n${content}`,
-      `校验错误:\n${errors.map((v) => `- ${v}`).join("\n")}`,
+      `校验错误:\n${compactErrorsForLLM(errors).map((v) => `- ${v}`).join("\n")}`,
       `约束(JSON):\n${constraintsText}`,
       jsonOutput
         ? "请重写内容并一次性满足约束。只输出修复后的 JSON 对象。"
@@ -631,7 +855,7 @@ export class GenerationService {
       options?.repairModelSettings
     );
     const adapted = options?.adaptContent ? options.adaptContent(repaired) : { content: repaired };
-    const normalized = normalizeText(adapted.content);
+    const normalized = maybeAutoShrinkContent(normalizeText(adapted.content), rule);
     const repairedErrors = adapted.error ? [adapted.error] : validate(normalized);
     if (repairedErrors.length === 0) {
       await this.appendTrace("section_whole_repair_ok", "info", {
@@ -700,7 +924,7 @@ export class GenerationService {
       );
 
       const adapted = options?.adaptContent ? options.adaptContent(content) : { content };
-      const normalized = normalizeText(adapted.content);
+      const normalized = maybeAutoShrinkContent(normalizeText(adapted.content), rule);
       let errors = adapted.error ? [adapted.error] : validate(normalized);
       if (errors.length === 0) {
         await this.appendTrace("section_generate_ok", "info", {
@@ -724,11 +948,12 @@ export class GenerationService {
         return normalized;
       }
 
-      if (this.supportsItemRepair(rule)) {
+      const itemRepairEnabled = this.shouldTryItemRepair(rule, errors);
+      if (itemRepairEnabled) {
         await this.appendTrace("section_repair_needed", "warn", {
           step,
           section: rule.section,
-          repair_mode: "item",
+          repair_mode: this.supportsItemRepair(rule) ? "item" : "item_fallback",
           errors
         });
         this.logger.warn(
@@ -736,7 +961,7 @@ export class GenerationService {
             event: "section_repair_needed",
             step,
             section: rule.section,
-            repair_mode: "item",
+            repair_mode: this.supportsItemRepair(rule) ? "item" : "item_fallback",
             errors
           },
           "section repair needed"
@@ -791,7 +1016,7 @@ export class GenerationService {
         errors = wholeRepaired.errors;
       }
 
-      feedback = errors.map((err) => `- ${err}`).join("\n");
+      feedback = compactErrorsForLLM(errors, 8).map((err) => `- ${err}`).join("\n");
       await this.appendTrace("validate_fail", "warn", {
         step,
         section: rule.section,
