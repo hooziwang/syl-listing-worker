@@ -78,6 +78,24 @@ const danglingTailWords = new Set([
   "will",
   "shall"
 ]);
+const promptRawMaxChars = 1800;
+const promptRawCutoffMarkers = [
+  "竞品",
+  "参考文案",
+  "对标文案",
+  "示例文案",
+  "competitor",
+  "reference listing",
+  "sample listing"
+];
+
+interface PromptRawResult {
+  text: string;
+  originalChars: number;
+  finalChars: number;
+  cutByMarker: boolean;
+  truncated: boolean;
+}
 
 function normalizeText(input: string): string {
   return input.replace(/\r\n/g, "\n").trim();
@@ -96,6 +114,66 @@ function splitLines(input: string): string[] {
     .split("\n")
     .map((line) => stripBulletPrefix(line))
     .filter(Boolean);
+}
+
+function shouldCutoffPromptRawLine(line: string): boolean {
+  const normalized = line.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return promptRawCutoffMarkers.some((marker) => normalized.includes(marker));
+}
+
+function compactRequirementsRawForPrompt(raw: string): PromptRawResult {
+  const normalized = normalizeText(raw);
+  if (!normalized) {
+    return {
+      text: "",
+      originalChars: 0,
+      finalChars: 0,
+      cutByMarker: false,
+      truncated: false
+    };
+  }
+
+  const lines = normalized.split("\n");
+  const kept: string[] = [];
+  let cutByMarker = false;
+  let previousBlank = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (shouldCutoffPromptRawLine(trimmed)) {
+      cutByMarker = true;
+      break;
+    }
+    if (trimmed === "") {
+      if (!previousBlank) {
+        kept.push("");
+      }
+      previousBlank = true;
+      continue;
+    }
+    previousBlank = false;
+    kept.push(line);
+  }
+
+  const merged = normalizeText(kept.join("\n"));
+  let text = merged;
+  let truncated = false;
+  if (text.length > promptRawMaxChars) {
+    truncated = true;
+    const sliced = text.slice(0, promptRawMaxChars);
+    const cutAt = sliced.lastIndexOf("\n");
+    const base = cutAt > 0 ? sliced.slice(0, cutAt) : sliced;
+    text = `${base.trim()}\n...(需求原文已截断)`;
+  }
+  return {
+    text,
+    originalChars: normalized.length,
+    finalChars: text.length,
+    cutByMarker,
+    truncated
+  };
 }
 
 function extractJSONObjectText(input: string): string {
@@ -431,6 +509,7 @@ export class GenerationService {
   private readonly llmClient: LLMClient;
   private executionBrief = "";
   private currentRules: TenantRules | null = null;
+  private requirementsRawForPrompt = "";
 
   constructor(
     private readonly env: AppEnv,
@@ -578,6 +657,7 @@ export class GenerationService {
 
   private buildSectionUserPrompt(requirements: ListingRequirements, section: string, extra?: string): string {
     const keywords = requirements.keywords.join("\n");
+    const requirementsRaw = this.requirementsRawForPrompt || requirements.raw;
     return [
       `任务: 生成 section=${section}（英文）`,
       this.executionBrief ? `执行简报:\n${this.executionBrief}` : "",
@@ -585,7 +665,7 @@ export class GenerationService {
       `分类: ${requirements.category}`,
       `关键词库:\n${keywords}`,
       "输入需求原文:",
-      requirements.raw,
+      requirementsRaw,
       extra ? `\n修正反馈:\n${extra}` : ""
     ].join("\n");
   }
@@ -1134,11 +1214,12 @@ export class GenerationService {
     requirements: ListingRequirements,
     sections?: Partial<Record<ENSectionKey, string>>
   ): Record<string, string> {
+    const requirementsRaw = this.requirementsRawForPrompt || requirements.raw;
     return {
       brand: requirements.brand,
       category: requirements.category,
       keywords: requirements.keywords.join("\n"),
-      requirements_raw: requirements.raw,
+      requirements_raw: requirementsRaw,
       title: sections?.title ?? "",
       bullets: sections?.bullets ?? "",
       description: sections?.description ?? "",
@@ -1236,7 +1317,27 @@ export class GenerationService {
         "quality_judge",
         rules.workflow.judge.retries
       );
-      const issues = this.parseJudgeIssues(judgeOutput);
+      const allIssues = this.parseJudgeIssues(judgeOutput);
+      const skipSet = new Set(rules.workflow.judge.skip_sections.map((v) => v.toLowerCase()));
+      const dropped: JudgeIssue[] = [];
+      const issues: JudgeIssue[] = [];
+      for (const issue of allIssues) {
+        if (issue.section === "search_terms") {
+          dropped.push(issue);
+          continue;
+        }
+        if (skipSet.has(issue.section.toLowerCase())) {
+          dropped.push(issue);
+          continue;
+        }
+        issues.push(issue);
+      }
+      if (dropped.length > 0) {
+        await this.appendTrace("quality_judge_issues_skipped", "warn", {
+          skipped_count: dropped.length,
+          skipped_issues: dropped
+        });
+      }
       if (issues.length > 0) {
         await this.appendTrace("quality_judge_issues", "warn", {
           duration_ms: Date.now() - started,
@@ -1265,6 +1366,8 @@ export class GenerationService {
   async generate(input: GenerationInput): Promise<ListingResult> {
     this.throwIfAborted();
     const start = Date.now();
+    this.executionBrief = "";
+    this.requirementsRawForPrompt = "";
     await this.appendTrace("generation_start", "info", {
       tenant_id: input.tenantId,
       job_id: input.jobId,
@@ -1290,6 +1393,14 @@ export class GenerationService {
     });
 
     const requirements = parseRequirements(input.inputMarkdown, tenantRules.input);
+    const promptRaw = compactRequirementsRawForPrompt(requirements.raw);
+    this.requirementsRawForPrompt = promptRaw.text;
+    await this.appendTrace("requirements_raw_compacted", "info", {
+      original_chars: promptRaw.originalChars,
+      final_chars: promptRaw.finalChars,
+      cut_by_marker: promptRaw.cutByMarker,
+      truncated: promptRaw.truncated
+    });
 
     if (!requirements.category) {
       await this.appendTrace("generation_invalid_input", "error", { error: "缺少分类" });
@@ -1349,7 +1460,6 @@ export class GenerationService {
 
     const searchTermsEn = buildSearchTermsFromRule(requirements, searchTermsRule);
 
-    const judgeSkip = new Set(tenantRules.workflow.judge.skip_sections);
     const maxJudgeRounds = tenantRules.workflow.judge.max_rounds;
     let judgeIssues = await this.runQualityJudge(requirements, {
       title: titleEn,
@@ -1409,20 +1519,6 @@ export class GenerationService {
             maxRetries: 2
           }
         );
-      }
-
-      if (grouped.search_terms.length > 0) {
-        const searchTermsSource = typeof searchTermsRule.constraints.source === "string"
-          ? searchTermsRule.constraints.source
-          : "keywords_copy";
-        await this.appendTrace("quality_judge_repair_skip", "warn", {
-          round: judgeRound,
-          section: "search_terms",
-          reason: judgeSkip.has("search_terms")
-            ? `search_terms 使用 ${searchTermsSource}，当前不进行模型改写`
-            : "当前执行器未启用 search_terms 模型改写",
-          issues: grouped.search_terms
-        });
       }
 
       judgeIssues = await this.runQualityJudge(requirements, {
