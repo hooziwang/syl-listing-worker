@@ -2,9 +2,15 @@ import type { Redis } from "ioredis";
 import type { JobRecord, JobStatus, ListingResult } from "../domain/types.js";
 
 const JOB_KEY_PREFIX = "syl:job:";
+const JOB_CANCEL_KEY_PREFIX = "syl:job:cancel:";
+export const JOB_CANCEL_CHANNEL = "syl:job:cancel:channel";
 
 function jobKey(jobId: string): string {
   return `${JOB_KEY_PREFIX}${jobId}`;
+}
+
+function cancelKey(jobId: string): string {
+  return `${JOB_CANCEL_KEY_PREFIX}${jobId}`;
 }
 
 export class RedisJobStore {
@@ -49,6 +55,18 @@ export class RedisJobStore {
       error_message: message,
       updated_at: new Date().toISOString()
     });
+    await this.redis.del(cancelKey(jobId));
+    await this.redis.expire(key, this.ttlSeconds);
+  }
+
+  async markCancelled(jobId: string, message = "任务已取消"): Promise<void> {
+    const key = jobKey(jobId);
+    await this.redis.hset(key, {
+      status: "cancelled",
+      error_message: message,
+      updated_at: new Date().toISOString()
+    });
+    await this.redis.del(cancelKey(jobId));
     await this.redis.expire(key, this.ttlSeconds);
   }
 
@@ -59,7 +77,31 @@ export class RedisJobStore {
       result_json: JSON.stringify(result),
       updated_at: new Date().toISOString()
     });
+    await this.redis.del(cancelKey(jobId));
     await this.redis.expire(key, this.ttlSeconds);
+  }
+
+  async requestCancel(jobId: string): Promise<void> {
+    const now = new Date().toISOString();
+    await this.redis.hset(jobKey(jobId), {
+      cancel_requested_at: now,
+      updated_at: now
+    });
+    await this.redis.set(cancelKey(jobId), "1", "EX", this.ttlSeconds);
+    await this.redis.expire(jobKey(jobId), this.ttlSeconds);
+  }
+
+  async isCancelRequested(jobId: string): Promise<boolean> {
+    const exists = await this.redis.exists(cancelKey(jobId));
+    return exists > 0;
+  }
+
+  async publishCancel(jobId: string): Promise<void> {
+    await this.redis.publish(JOB_CANCEL_CHANNEL, jobId);
+  }
+
+  async clearCancelRequest(jobId: string): Promise<void> {
+    await this.redis.del(cancelKey(jobId));
   }
 
   async get(jobId: string): Promise<JobRecord | null> {
@@ -75,6 +117,7 @@ export class RedisJobStore {
       status: (data.status as JobStatus) ?? "queued",
       created_at: data.created_at,
       updated_at: data.updated_at,
+      cancel_requested_at: data.cancel_requested_at || undefined,
       error_message: data.error_message || undefined
     };
 

@@ -390,6 +390,70 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
       };
     });
 
+    securedApp.post("/v1/jobs/:jobId/cancel", async (request, reply) => {
+      const params = z.object({ jobId: z.string().min(1) }).parse(request.params);
+      const tenantId = request.auth!.tenant_id;
+      const record = await ctx.jobStore.get(params.jobId);
+      if (!record || record.tenant_id !== tenantId) {
+        return reply.code(404).send(withTenant(tenantId, { error: "job_not_found" }));
+      }
+
+      if (record.status === "succeeded" || record.status === "failed" || record.status === "cancelled") {
+        await appendApiTrace(request, tenantId, record.id, "job_cancel_ignored", "info", {
+          status: record.status,
+          reason: "already_done"
+        });
+        return {
+          ok: true,
+          tenant_id: tenantId,
+          job_id: record.id,
+          status: record.status,
+          cancelled: record.status === "cancelled",
+          reason: "already_done"
+        };
+      }
+
+      await ctx.jobStore.requestCancel(record.id);
+      await appendApiTrace(request, tenantId, record.id, "job_cancel_requested", "warn", {
+        status: record.status
+      });
+
+      let queueRemoved = false;
+      const queueJob = await ctx.queue.getJob(record.id);
+      if (queueJob) {
+        const queueState = await queueJob.getState();
+        if (queueState === "waiting" || queueState === "delayed" || queueState === "prioritized") {
+          await queueJob.remove();
+          queueRemoved = true;
+        }
+      }
+
+      if (queueRemoved || record.status === "queued") {
+        await ctx.jobStore.markCancelled(record.id, "任务已取消");
+        await appendApiTrace(request, tenantId, record.id, "job_cancelled", "warn", {
+          mode: "queue_remove"
+        });
+        return {
+          ok: true,
+          tenant_id: tenantId,
+          job_id: record.id,
+          status: "cancelled",
+          cancelled: true,
+          reason: "queue_removed"
+        };
+      }
+
+      await ctx.jobStore.publishCancel(record.id);
+      return {
+        ok: true,
+        tenant_id: tenantId,
+        job_id: record.id,
+        status: "running",
+        cancelled: false,
+        reason: "cancel_requested"
+      };
+    });
+
     securedApp.get("/v1/jobs/:jobId/trace", async (request, reply) => {
       const params = z.object({ jobId: z.string().min(1) }).parse(request.params);
       const query = z

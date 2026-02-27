@@ -8,6 +8,13 @@ import { RulesService } from "../services/rules-service.js";
 import { RedisJobStore } from "../store/job-store.js";
 import { RedisTraceStore } from "../store/trace-store.js";
 
+class JobCancelledError extends Error {
+  constructor(message = "job cancelled") {
+    super(message);
+    this.name = "JobCancelledError";
+  }
+}
+
 export function createJobRunner(
   env: AppEnv,
   redis: Redis,
@@ -44,12 +51,59 @@ export function createJobRunner(
           );
         }
       };
-      const generationService = new GenerationService(env, jobLogger, traceStore, {
-        tenantId,
-        jobId
-      });
       const started = Date.now();
       const currentAttempt = job.attemptsMade + 1;
+      const cancelController = new AbortController();
+      let stopCancelWatcher = false;
+      const cancelWatcher = (async () => {
+        while (!stopCancelWatcher && !cancelController.signal.aborted) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          if (stopCancelWatcher || cancelController.signal.aborted) {
+            break;
+          }
+          try {
+            const requested = await store.isCancelRequested(jobId);
+            if (requested) {
+              cancelController.abort(new JobCancelledError("job cancelled by user"));
+              break;
+            }
+          } catch (error) {
+            jobLogger.warn(
+              {
+                event: "cancel_watch_failed",
+                error: error instanceof Error ? error.message : String(error)
+              },
+              "cancel watch failed"
+            );
+          }
+        }
+      })();
+      const generationService = new GenerationService(
+        env,
+        jobLogger,
+        traceStore,
+        {
+          tenantId,
+          jobId
+        },
+        cancelController.signal
+      );
+
+      const markCancelled = async (reason: string): Promise<void> => {
+        await store.markCancelled(jobId, reason);
+        jobLogger.warn(
+          {
+            event: "job_cancelled",
+            duration_ms: Date.now() - started,
+            reason
+          },
+          "job cancelled"
+        );
+        await appendTrace("job_cancelled", "warn", {
+          duration_ms: Date.now() - started,
+          reason
+        });
+      };
       jobLogger.info(
         {
           event: "job_started",
@@ -70,9 +124,18 @@ export function createJobRunner(
       });
 
       try {
+        if (await store.isCancelRequested(jobId)) {
+          await markCancelled("任务在开始执行前已取消");
+          return;
+        }
         const resolved = await rulesService.resolve(tenantId, undefined);
         jobLogger.info({ event: "job_rules_resolved", rules_version: resolved.rules_version }, "job rules resolved");
         await appendTrace("job_rules_resolved", "info", { rules_version: resolved.rules_version });
+        if (await store.isCancelRequested(jobId)) {
+          cancelController.abort(new JobCancelledError("job cancelled by user"));
+          await markCancelled("任务在规则解析后被取消");
+          return;
+        }
         const result = await generationService.generate({
           jobId,
           tenantId,
@@ -98,6 +161,11 @@ export function createJobRunner(
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : "unknown_error";
+        const cancelled = cancelController.signal.aborted || await store.isCancelRequested(jobId);
+        if (cancelled) {
+          await markCancelled("任务被用户取消");
+          return;
+        }
         const finalAttempt = currentAttempt >= maxAttempts;
         if (finalAttempt) {
           await store.markFailed(jobId, message);
@@ -132,6 +200,10 @@ export function createJobRunner(
           });
         }
         throw error;
+      } finally {
+        stopCancelWatcher = true;
+        await cancelWatcher;
+        await store.clearCancelRequest(jobId);
       }
     },
     {

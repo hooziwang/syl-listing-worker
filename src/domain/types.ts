@@ -1,4 +1,4 @@
-export type JobStatus = "queued" | "running" | "succeeded" | "failed";
+export type JobStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 
 export interface ListingResult {
   en_markdown: string;
@@ -22,6 +22,7 @@ export interface JobRecord {
   status: JobStatus;
   created_at: string;
   updated_at: string;
+  cancel_requested_at?: string;
   error_message?: string;
   result?: ListingResult;
 }

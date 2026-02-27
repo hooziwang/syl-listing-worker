@@ -81,6 +81,11 @@ function outputToText(output: unknown): string {
   return String(output).trim();
 }
 
+function isAbortLikeError(error: Error): boolean {
+  const msg = error.message.toLowerCase();
+  return msg.includes("abort");
+}
+
 export class LLMClient {
   private readonly fluxRunner?: Runner;
   private readonly deepseekRunner: Runner;
@@ -91,7 +96,8 @@ export class LLMClient {
     private readonly env: AppEnv,
     private readonly logger: Logger,
     private readonly traceStore?: RedisTraceStore,
-    private readonly traceContext?: { tenantId: string; jobId: string }
+    private readonly traceContext?: { tenantId: string; jobId: string },
+    private readonly abortSignal?: AbortSignal
   ) {
     const fluxBaseURL = resolveProviderBaseURL(env.fluxcodeBaseUrl, env.fluxcodeResponsesPath, "/responses");
     const deepseekBaseURL = resolveProviderBaseURL(env.deepseekBaseUrl, env.deepseekChatPath, "/chat/completions");
@@ -155,6 +161,16 @@ export class LLMClient {
   private async runAgentText(runner: Runner, agent: Agent, input: string): Promise<string> {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const onExternalAbort = () => {
+      controller.abort(this.abortSignal?.reason ?? new Error("job cancelled"));
+    };
+    if (this.abortSignal) {
+      if (this.abortSignal.aborted) {
+        controller.abort(this.abortSignal.reason ?? new Error("job cancelled"));
+      } else {
+        this.abortSignal.addEventListener("abort", onExternalAbort, { once: true });
+      }
+    }
     const timeoutPromise = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         controller.abort();
@@ -173,6 +189,9 @@ export class LLMClient {
     } finally {
       if (timer) {
         clearTimeout(timer);
+      }
+      if (this.abortSignal) {
+        this.abortSignal.removeEventListener("abort", onExternalAbort);
       }
     }
   }
@@ -312,6 +331,7 @@ export class LLMClient {
         baseMs: this.env.retryBaseMs,
         maxMs: this.env.retryMaxMs,
         jitter: this.env.retryJitter,
+        shouldRetry: (_attempt, error) => !isAbortLikeError(error),
         onRetry: (attempt, error, waitMs) => {
           void this.appendTrace("api_retry", "warn", {
             provider: generationProvider,
@@ -417,6 +437,7 @@ export class LLMClient {
         baseMs: this.env.retryBaseMs,
         maxMs: this.env.retryMaxMs,
         jitter: this.env.retryJitter,
+        shouldRetry: (_attempt, error) => !isAbortLikeError(error),
         onRetry: (attempt, error, waitMs) => {
           void this.appendTrace("api_retry", "warn", {
             provider: "deepseek",

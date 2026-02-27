@@ -4,6 +4,7 @@ export interface RetryOptions {
   maxMs: number;
   jitter: number;
   onRetry?: (attempt: number, error: Error, waitMs: number) => void;
+  shouldRetry?: (attempt: number, error: Error) => boolean;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -27,6 +28,9 @@ export async function withRetry<T>(fn: (attempt: number) => Promise<T>, opts: Re
       const err = error instanceof Error ? error : new Error(String(error));
       lastError = err;
       if (attempt >= opts.attempts) {
+        break;
+      }
+      if (opts.shouldRetry && !opts.shouldRetry(attempt, err)) {
         break;
       }
       const waitMs = computeDelayMs(attempt, opts.baseMs, opts.maxMs, opts.jitter);
