@@ -26,7 +26,7 @@ export function createJobRunner(
   const worker = new Worker<GenerateJobData>(
     env.queueName,
     async (job) => {
-      const { job_id: jobId, tenant_id: tenantId, input_markdown: inputMarkdown } = job.data;
+      const { job_id: jobId, tenant_id: tenantId, input_markdown: inputMarkdown, input_filename: inputFilename } = job.data;
       const jobLogger = logger.child({ tenant_id: tenantId, job_id: jobId });
       const maxAttempts = typeof job.opts.attempts === "number" && job.opts.attempts > 0 ? job.opts.attempts : 1;
       const appendTrace = async (
@@ -110,7 +110,8 @@ export function createJobRunner(
           queue_job_id: job.id,
           queue_attempt: currentAttempt,
           queue_max_attempts: maxAttempts,
-          input_chars: inputMarkdown.length
+          input_chars: inputMarkdown.length,
+          input_filename: inputFilename || undefined
         },
         "job started"
       );
@@ -120,7 +121,8 @@ export function createJobRunner(
         queue_job_id: job.id ?? "",
         queue_attempt: currentAttempt,
         queue_max_attempts: maxAttempts,
-        input_chars: inputMarkdown.length
+        input_chars: inputMarkdown.length,
+        input_filename: inputFilename || undefined
       });
 
       try {
@@ -140,7 +142,8 @@ export function createJobRunner(
           jobId,
           tenantId,
           rulesVersion: resolved.rules_version,
-          inputMarkdown
+          inputMarkdown,
+          inputFilename
         });
         await store.markSucceeded(jobId, result);
         jobLogger.info(

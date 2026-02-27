@@ -29,6 +29,7 @@ export interface JobRecord {
 
 export interface GenerateRequest {
   input_markdown: string;
+  input_filename?: string;
   candidate_count?: number;
 }
 

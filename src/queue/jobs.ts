@@ -5,6 +5,7 @@ export interface GenerateJobData {
   job_id: string;
   tenant_id: string;
   input_markdown: string;
+  input_filename?: string;
   candidate_count: number;
 }
 

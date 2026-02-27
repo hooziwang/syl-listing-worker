@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { basename, extname, join } from "node:path";
 import type { ModelSettings } from "@openai/agents";
 import type { Logger } from "pino";
 import type { AppEnv } from "../config/env.js";
@@ -13,6 +13,7 @@ interface GenerationInput {
   tenantId: string;
   rulesVersion: string;
   inputMarkdown: string;
+  inputFilename?: string;
 }
 
 type ENSectionKey = "title" | "bullets" | "description" | "search_terms";
@@ -101,6 +102,26 @@ function normalizeText(input: string): string {
   return input.replace(/\r\n/g, "\n").trim();
 }
 
+function normalizeInputFilename(raw: string | undefined): string {
+  if (typeof raw !== "string") {
+    return "";
+  }
+  const cleaned = raw.replace(/\r?\n/g, "").trim();
+  if (!cleaned) {
+    return "";
+  }
+  const name = basename(cleaned).trim();
+  if (!name || name === "." || name === "..") {
+    return "";
+  }
+  const ext = extname(name);
+  const base = ext ? name.slice(0, -ext.length).trim() : name;
+  if (!base || base === "." || base === "..") {
+    return "";
+  }
+  return base;
+}
+
 function normalizeLine(input: string): string {
   return input.replace(/\s+/g, " ").trim();
 }
@@ -174,6 +195,28 @@ function compactRequirementsRawForPrompt(raw: string): PromptRawResult {
     cutByMarker,
     truncated
   };
+}
+
+function replaceTopHeading(markdown: string, filename: string): string {
+  const trimmedName = normalizeInputFilename(filename);
+  if (!trimmedName) {
+    return normalizeText(markdown);
+  }
+  const heading = `# ${trimmedName}`;
+  const normalized = markdown.replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i].trim();
+    if (!line) {
+      continue;
+    }
+    if (line.startsWith("# ")) {
+      lines[i] = heading;
+      return normalizeText(lines.join("\n"));
+    }
+    return normalizeText(`${heading}\n\n${normalized}`);
+  }
+  return heading;
 }
 
 function extractJSONObjectText(input: string): string {
@@ -1368,11 +1411,13 @@ export class GenerationService {
     const start = Date.now();
     this.executionBrief = "";
     this.requirementsRawForPrompt = "";
+    const inputFilename = normalizeInputFilename(input.inputFilename);
     await this.appendTrace("generation_start", "info", {
       tenant_id: input.tenantId,
       job_id: input.jobId,
       rules_version: input.rulesVersion,
-      input_chars: input.inputMarkdown.length
+      input_chars: input.inputMarkdown.length,
+      input_filename: inputFilename || undefined
     });
     this.logger.info(
       {
@@ -1380,7 +1425,8 @@ export class GenerationService {
         tenant_id: input.tenantId,
         job_id: input.jobId,
         rules_version: input.rulesVersion,
-        input_chars: input.inputMarkdown.length
+        input_chars: input.inputMarkdown.length,
+        input_filename: inputFilename || undefined
       },
       "generation start"
     );
@@ -1574,8 +1620,8 @@ export class GenerationService {
       search_terms_cn: normalizeText(searchTermsCn)
     };
 
-    const enMarkdown = normalizeText(renderByVars(tenantRules.templates.en, vars));
-    const cnMarkdown = normalizeText(renderByVars(tenantRules.templates.cn, vars));
+    const enMarkdown = replaceTopHeading(renderByVars(tenantRules.templates.en, vars), inputFilename);
+    const cnMarkdown = replaceTopHeading(renderByVars(tenantRules.templates.cn, vars), inputFilename);
 
     this.logger.info(
       {

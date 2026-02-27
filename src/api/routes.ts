@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { createHash } from "node:crypto";
+import { basename } from "node:path";
 import { z } from "zod";
 import { enqueueGenerateJob } from "../queue/jobs.js";
 import { randomId } from "../utils/id.js";
@@ -8,6 +9,7 @@ import type { ApiContext } from "./types.js";
 const bearerSchema = z.string().regex(/^Bearer\s+.+$/i);
 const generateSchema = z.object({
   input_markdown: z.string().min(1, "input_markdown 不能为空"),
+  input_filename: z.string().min(1).max(255).optional(),
   candidate_count: z.number().int().positive().max(20).optional()
 });
 const publishSchema = z.object({
@@ -42,6 +44,21 @@ function keyFingerprint(raw: string): string {
 
 function sha256Hex(input: string): string {
   return createHash("sha256").update(input).digest("hex");
+}
+
+function normalizeInputFilename(raw: string | undefined): string {
+  if (typeof raw !== "string") {
+    return "";
+  }
+  const cleaned = raw.replace(/\r?\n/g, "").trim();
+  if (!cleaned) {
+    return "";
+  }
+  const name = basename(cleaned).trim();
+  if (!name || name === "." || name === "..") {
+    return "";
+  }
+  return name;
 }
 
 function requireAdmin(ctx: ApiContext) {
@@ -324,18 +341,21 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
       const tenantId = request.auth!.tenant_id;
       const jobId = `job_${randomId(18)}`;
       const candidateCount = parsed.candidate_count ?? 1;
+      const inputFilename = normalizeInputFilename(parsed.input_filename);
 
       await ctx.jobStore.createQueued(jobId, tenantId);
       await enqueueGenerateJob(ctx.queue, {
         job_id: jobId,
         tenant_id: tenantId,
         input_markdown: parsed.input_markdown,
+        input_filename: inputFilename || undefined,
         candidate_count: candidateCount
       });
       await appendApiTrace(request, tenantId, jobId, "generate_queued", "info", {
         candidate_count: candidateCount,
         input_chars: parsed.input_markdown.length,
-        input_sha256: sha256Hex(parsed.input_markdown)
+        input_sha256: sha256Hex(parsed.input_markdown),
+        input_filename: inputFilename || undefined
       });
 
       request.log.info(
@@ -346,7 +366,8 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
           job_id: jobId,
           candidate_count: candidateCount,
           input_chars: parsed.input_markdown.length,
-          input_sha256: sha256Hex(parsed.input_markdown)
+          input_sha256: sha256Hex(parsed.input_markdown),
+          input_filename: inputFilename || undefined
         },
         "generate queued"
       );
