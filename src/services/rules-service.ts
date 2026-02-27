@@ -14,12 +14,18 @@ export interface PublishRulesInput {
   archive_base64: string;
   signature_base64?: string;
   signature_algo?: string;
+  signing_public_key_path_in_archive?: string;
+  signing_public_key_signature_base64?: string;
+  signing_public_key_signature_algo?: string;
 }
 
 interface RulesMeta {
   manifest_sha256: string;
   signature_base64?: string;
   signature_algo?: string;
+  signing_public_key_path_in_archive?: string;
+  signing_public_key_signature_base64?: string;
+  signing_public_key_signature_algo?: string;
 }
 
 export class RulesService {
@@ -47,6 +53,9 @@ export class RulesService {
     manifest_sha256: string;
     signature_base64?: string;
     signature_algo?: string;
+    signing_public_key_path_in_archive?: string;
+    signing_public_key_signature_base64?: string;
+    signing_public_key_signature_algo?: string;
   }): Promise<void> {
     const current = await this.redis.get(this.currentKey(input.tenant_id));
     if (current) {
@@ -55,7 +64,10 @@ export class RulesService {
     // 未提供签名时不写入 bootstrap 元数据，避免向客户端下发不可验证规则。
     const sig = (input.signature_base64 || "").trim();
     const sigAlgo = (input.signature_algo || "").trim();
-    if (!sig || !sigAlgo) {
+    const keyPath = (input.signing_public_key_path_in_archive || "").trim();
+    const keySig = (input.signing_public_key_signature_base64 || "").trim();
+    const keySigAlgo = (input.signing_public_key_signature_algo || "").trim();
+    if (!sig || !sigAlgo || !keyPath || !keySig || !keySigAlgo) {
       return;
     }
 
@@ -63,7 +75,10 @@ export class RulesService {
     await this.redis.hset(key, {
       manifest_sha256: input.manifest_sha256,
       signature_base64: sig,
-      signature_algo: sigAlgo
+      signature_algo: sigAlgo,
+      signing_public_key_path_in_archive: keyPath,
+      signing_public_key_signature_base64: keySig,
+      signing_public_key_signature_algo: keySigAlgo
     });
     await this.redis.set(this.currentKey(input.tenant_id), input.rules_version);
   }
@@ -77,12 +92,21 @@ export class RulesService {
     const meta: RulesMeta = {
       manifest_sha256: metaHash.manifest_sha256 || "",
       signature_base64: metaHash.signature_base64 || undefined,
-      signature_algo: metaHash.signature_algo || undefined
+      signature_algo: metaHash.signature_algo || undefined,
+      signing_public_key_path_in_archive: metaHash.signing_public_key_path_in_archive || undefined,
+      signing_public_key_signature_base64: metaHash.signing_public_key_signature_base64 || undefined,
+      signing_public_key_signature_algo: metaHash.signing_public_key_signature_algo || undefined
     };
     if (!meta.manifest_sha256) {
       throw new Error(`tenant(${tenantId}) rules(${activeVersion}) 缺少 manifest_sha256`);
     }
-    if (!meta.signature_base64 || !meta.signature_algo) {
+    if (
+      !meta.signature_base64
+      || !meta.signature_algo
+      || !meta.signing_public_key_path_in_archive
+      || !meta.signing_public_key_signature_base64
+      || !meta.signing_public_key_signature_algo
+    ) {
       throw new Error(`tenant(${tenantId}) rules(${activeVersion}) 缺少签名信息`);
     }
 
@@ -92,14 +116,26 @@ export class RulesService {
       manifest_sha256: meta.manifest_sha256,
       download_url: `${this.apiPublicBaseUrl}/v1/rules/download/${encodeURIComponent(tenantId)}/${encodeURIComponent(activeVersion)}`,
       signature_base64: meta.signature_base64,
-      signature_algo: meta.signature_algo
+      signature_algo: meta.signature_algo,
+      signing_public_key_path_in_archive: meta.signing_public_key_path_in_archive,
+      signing_public_key_signature_base64: meta.signing_public_key_signature_base64,
+      signing_public_key_signature_algo: meta.signing_public_key_signature_algo
     };
   }
 
   async publish(input: PublishRulesInput): Promise<void> {
     const signatureBase64 = (input.signature_base64 || "").trim();
     const signatureAlgo = (input.signature_algo || "").trim();
-    if (!signatureBase64 || !signatureAlgo) {
+    const signingPublicKeyPathInArchive = (input.signing_public_key_path_in_archive || "").trim();
+    const signingPublicKeySignatureBase64 = (input.signing_public_key_signature_base64 || "").trim();
+    const signingPublicKeySignatureAlgo = (input.signing_public_key_signature_algo || "").trim();
+    if (
+      !signatureBase64
+      || !signatureAlgo
+      || !signingPublicKeyPathInArchive
+      || !signingPublicKeySignatureBase64
+      || !signingPublicKeySignatureAlgo
+    ) {
       throw new Error("signature is required");
     }
     const raw = Buffer.from(input.archive_base64, "base64");
@@ -116,7 +152,10 @@ export class RulesService {
     await this.redis.hset(key, {
       manifest_sha256: input.manifest_sha256,
       signature_base64: signatureBase64,
-      signature_algo: signatureAlgo
+      signature_algo: signatureAlgo,
+      signing_public_key_path_in_archive: signingPublicKeyPathInArchive,
+      signing_public_key_signature_base64: signingPublicKeySignatureBase64,
+      signing_public_key_signature_algo: signingPublicKeySignatureAlgo
     });
     await this.redis.set(this.currentKey(input.tenant_id), input.rules_version);
   }

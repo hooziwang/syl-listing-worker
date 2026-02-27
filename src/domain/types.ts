@@ -34,4 +34,7 @@ export interface RulesResolveResponse {
   download_url: string;
   signature_base64: string;
   signature_algo: string;
+  signing_public_key_path_in_archive: string;
+  signing_public_key_signature_base64: string;
+  signing_public_key_signature_algo: string;
 }
