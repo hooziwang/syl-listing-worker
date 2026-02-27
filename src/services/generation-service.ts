@@ -291,22 +291,31 @@ function dedupeKeepOrder(values: string[]): string[] {
   return out;
 }
 
-function duplicateKeywords(values: string[]): string[] {
-  const seen = new Set<string>();
-  const dup = new Set<string>();
+type DuplicateKeyword = {
+  keyword: string;
+  count: number;
+};
+
+function duplicateKeywords(values: string[]): DuplicateKeyword[] {
+  const counts = new Map<string, DuplicateKeyword>();
   for (const raw of values) {
     const value = normalizeLine(raw);
     if (!value) {
       continue;
     }
     const key = value.toLowerCase();
-    if (seen.has(key)) {
-      dup.add(value);
+    const existing = counts.get(key);
+    if (existing) {
+      existing.count += 1;
       continue;
     }
-    seen.add(key);
+    counts.set(key, { keyword: value, count: 1 });
   }
-  return [...dup];
+  return [...counts.values()].filter((item) => item.count > 1);
+}
+
+function formatDuplicateKeywords(duplicates: DuplicateKeyword[]): string {
+  return duplicates.map((item) => `${item.keyword}（${item.count}次）`).join("；");
 }
 
 function getNumber(constraints: Record<string, unknown>, key: string, fallback = 0): number {
@@ -1489,11 +1498,13 @@ export class GenerationService {
     if (tenantRules.input.keywords.unique_required) {
       const duplicates = duplicateKeywords(requirements.keywords);
       if (duplicates.length > 0) {
+        const duplicateText = formatDuplicateKeywords(duplicates);
         await this.appendTrace("generation_invalid_input", "error", {
-          error: `关键词存在重复：${duplicates.join("；")}`,
-          duplicate_keywords: duplicates
+          error: `关键词存在重复：${duplicateText}`,
+          duplicate_keywords: duplicates.map((item) => item.keyword),
+          duplicate_keyword_details: duplicates
         });
-        throw new InputValidationError(`关键词存在重复：${duplicates.join("；")}`);
+        throw new InputValidationError(`关键词存在重复：${duplicateText}`);
       }
     }
 
