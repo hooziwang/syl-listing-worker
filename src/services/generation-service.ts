@@ -350,6 +350,68 @@ function formatRange(min: number, max: number): string {
   return "无限制";
 }
 
+type KeywordEmbeddingConfig = {
+  enabled: boolean;
+  minTotal: number;
+  enforceOrder: boolean;
+  exactMatch: boolean;
+  noSplit: boolean;
+  slotRetries: number;
+};
+
+function readKeywordEmbeddingConfig(constraints: Record<string, unknown>): KeywordEmbeddingConfig {
+  const node = (constraints.keyword_embedding as Record<string, unknown> | undefined) ?? {};
+  const enabled = node.enabled === true;
+  const minTotalRaw = typeof node.min_total === "number" && Number.isFinite(node.min_total) ? node.min_total : 0;
+  const slotRetriesRaw =
+    typeof node.slot_retries === "number" && Number.isFinite(node.slot_retries) ? node.slot_retries : 3;
+  return {
+    enabled,
+    minTotal: Math.max(0, Math.floor(minTotalRaw)),
+    enforceOrder: node.enforce_order !== false,
+    exactMatch: node.exact_match !== false,
+    noSplit: node.no_split !== false,
+    slotRetries: Math.max(1, Math.floor(slotRetriesRaw))
+  };
+}
+
+function escapeRegExp(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function findKeywordOccurrence(
+  text: string,
+  keyword: string,
+  start: number,
+  config: KeywordEmbeddingConfig
+): { start: number; end: number } | null {
+  const normalizedKeyword = normalizeLine(keyword);
+  if (!normalizedKeyword) {
+    return null;
+  }
+  const tokens = normalizedKeyword
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter(Boolean)
+    .map((token) => escapeRegExp(token));
+  if (tokens.length === 0) {
+    return null;
+  }
+  const body = config.noSplit ? tokens.join("\\s+") : tokens.join("[\\s\\W_]*");
+  const patternText = `${config.exactMatch ? "(?<![A-Za-z0-9])" : ""}${body}${config.exactMatch ? "(?![A-Za-z0-9])" : ""}`;
+  const pattern = new RegExp(patternText, "i");
+  const slice = text.slice(Math.max(0, start));
+  const matched = pattern.exec(slice);
+  if (!matched || matched.index < 0) {
+    return null;
+  }
+  const begin = Math.max(0, start) + matched.index;
+  return {
+    start: begin,
+    end: begin + matched[0].length
+  };
+}
+
 function stripTrailingClosers(input: string): string {
   return input.replace(trailingClosersPattern, "").trim();
 }
@@ -467,6 +529,39 @@ function validateSectionContent(content: string, requirements: ListingRequiremen
     }
   }
 
+  const keywordEmbedding = readKeywordEmbeddingConfig(constraints);
+  if (keywordEmbedding.enabled && keywordEmbedding.minTotal > 0) {
+    const keywords = requirements.keywords.map((v) => normalizeLine(v)).filter(Boolean);
+    if (keywords.length < keywordEmbedding.minTotal) {
+      errors.push(`关键词数量不足以满足埋入要求: ${keywords.length} < ${keywordEmbedding.minTotal}`);
+    } else {
+      const target = Math.min(keywordEmbedding.minTotal, keywords.length);
+      const text = content.replace(/\r\n/g, "\n");
+      if (keywordEmbedding.enforceOrder) {
+        let cursor = 0;
+        for (let i = 0; i < target; i += 1) {
+          const kw = keywords[i];
+          const found = findKeywordOccurrence(text, kw, cursor, keywordEmbedding);
+          if (!found) {
+            errors.push(`关键词顺序埋入不满足: 第${i + 1}个关键词未按顺序原样出现: ${kw}`);
+            break;
+          }
+          cursor = found.end;
+        }
+      } else {
+        let hits = 0;
+        for (let i = 0; i < keywords.length; i += 1) {
+          if (findKeywordOccurrence(text, keywords[i], 0, keywordEmbedding)) {
+            hits += 1;
+          }
+        }
+        if (hits < target) {
+          errors.push(`关键词埋入数量不足: ${hits} < ${target}`);
+        }
+      }
+    }
+  }
+
   return errors;
 }
 
@@ -565,6 +660,51 @@ function adaptSingleLineRepair(raw: string, rule: SectionRule, targetIndex: numb
       }
     }
   }
+  const first = trimmed
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => normalizeLine(stripBulletPrefix(line)))
+    .find(Boolean);
+  return first ?? "";
+}
+
+function adaptSingleSentence(raw: string): string {
+  const trimmed = normalizeText(raw);
+  if (!trimmed) {
+    return "";
+  }
+
+  const jsonText = extractJSONObjectText(trimmed);
+  if (jsonText) {
+    try {
+      const parsed = JSON.parse(jsonText) as unknown;
+      if (typeof parsed === "string") {
+        return normalizeLine(stripBulletPrefix(parsed));
+      }
+      if (Array.isArray(parsed)) {
+        const first = parsed.find((v) => typeof v === "string") as string | undefined;
+        if (first) {
+          return normalizeLine(stripBulletPrefix(first));
+        }
+      }
+      if (parsed && typeof parsed === "object") {
+        for (const value of Object.values(parsed as Record<string, unknown>)) {
+          if (typeof value === "string") {
+            return normalizeLine(stripBulletPrefix(value));
+          }
+          if (Array.isArray(value)) {
+            const first = value.find((v) => typeof v === "string") as string | undefined;
+            if (first) {
+              return normalizeLine(stripBulletPrefix(first));
+            }
+          }
+        }
+      }
+    } catch {
+      // 非 JSON，回退到文本行提取
+    }
+  }
+
   const first = trimmed
     .replace(/\r\n/g, "\n")
     .split("\n")
@@ -745,6 +885,344 @@ export class GenerationService {
       requirementsRaw,
       extra ? `\n修正反馈:\n${extra}` : ""
     ].join("\n");
+  }
+
+  private isSentenceMode(rule: SectionRule): boolean {
+    return rule.execution.generation_mode === "sentence";
+  }
+
+  private resolveSentenceModeCount(rule: SectionRule): number {
+    const configured = rule.execution.sentence_count;
+    if (typeof configured === "number" && Number.isFinite(configured) && configured > 0) {
+      return Math.floor(configured);
+    }
+    const lineCount = getNumber(rule.constraints, "line_count", 0);
+    if (lineCount > 0) {
+      return lineCount;
+    }
+    return 0;
+  }
+
+  private sentenceKeywordPlan(
+    requirements: ListingRequirements,
+    rule: SectionRule,
+    sentenceCount: number
+  ): { config: KeywordEmbeddingConfig; slots: string[][] } {
+    const config = readKeywordEmbeddingConfig(rule.constraints);
+    const slots = Array.from({ length: sentenceCount }, () => [] as string[]);
+    if (!config.enabled || config.minTotal <= 0 || sentenceCount <= 0) {
+      return { config, slots };
+    }
+    const keywords = requirements.keywords.map((v) => normalizeLine(v)).filter(Boolean);
+    const target = Math.min(config.minTotal, keywords.length);
+    if (target <= 0) {
+      return { config, slots };
+    }
+    const base = Math.floor(target / sentenceCount);
+    const remainder = target % sentenceCount;
+    let cursor = 0;
+    for (let i = 0; i < sentenceCount; i += 1) {
+      const take = base + (i < remainder ? 1 : 0);
+      for (let j = 0; j < take; j += 1) {
+        if (cursor >= target) {
+          break;
+        }
+        slots[i].push(keywords[cursor]);
+        cursor += 1;
+      }
+    }
+    return { config, slots };
+  }
+
+  private validateSentenceRequiredKeywords(
+    sentence: string,
+    requiredKeywords: string[],
+    config: KeywordEmbeddingConfig
+  ): string | null {
+    if (requiredKeywords.length === 0) {
+      return null;
+    }
+    let cursor = 0;
+    for (let i = 0; i < requiredKeywords.length; i += 1) {
+      const kw = requiredKeywords[i];
+      const found = findKeywordOccurrence(sentence, kw, cursor, config);
+      if (!found) {
+        return `第${i + 1}个要求关键词未按顺序原样出现: ${kw}`;
+      }
+      cursor = found.end;
+    }
+    return null;
+  }
+
+  private splitSentenceSlotsByParagraphs(sentences: string[], paragraphCount: number): string {
+    if (paragraphCount <= 1) {
+      return normalizeText(sentences.join(" "));
+    }
+    const safeParagraphCount = Math.max(1, Math.min(paragraphCount, sentences.length || 1));
+    const baseSize = Math.floor(sentences.length / safeParagraphCount);
+    const remainder = sentences.length % safeParagraphCount;
+    const paragraphs: string[] = [];
+    let cursor = 0;
+    for (let i = 0; i < safeParagraphCount; i += 1) {
+      const take = baseSize + (i < remainder ? 1 : 0);
+      const chunk = sentences.slice(cursor, cursor + Math.max(1, take));
+      cursor += Math.max(1, take);
+      paragraphs.push(normalizeText(chunk.join(" ")));
+    }
+    return normalizeText(paragraphs.join("\n\n"));
+  }
+
+  private sentenceTargetRange(rule: SectionRule, sentenceCount: number): { min: number; max: number } {
+    if (sentenceCount <= 0) {
+      return { min: 0, max: 0 };
+    }
+    const tolerance = getTolerance(rule.constraints);
+    const lineCount = getNumber(rule.constraints, "line_count", 0);
+    const rawMinPerLine = getNumber(rule.constraints, "min_chars_per_line", 0);
+    const rawMaxPerLine = getNumber(rule.constraints, "max_chars_per_line", 0);
+    if (lineCount > 0 && (rawMinPerLine > 0 || rawMaxPerLine > 0)) {
+      return {
+        min: rawMinPerLine > 0 ? Math.max(0, rawMinPerLine - tolerance) : 0,
+        max: rawMaxPerLine > 0 ? rawMaxPerLine + tolerance : 0
+      };
+    }
+    const rawMin = getNumber(rule.constraints, "min_chars", 0);
+    const rawMax = getNumber(rule.constraints, "max_chars", 0);
+    const minTotal = rawMin > 0 ? Math.max(0, rawMin - tolerance) : 0;
+    const maxTotal = rawMax > 0 ? rawMax + tolerance : 0;
+    const perSentenceSlack = Math.max(0, getNumber(rule.constraints, "sentence_target_slack", 30));
+    const avgMin = minTotal > 0 ? Math.max(1, Math.ceil(minTotal / sentenceCount)) : 0;
+    const avgMax = maxTotal > 0 ? Math.max(1, Math.floor(maxTotal / sentenceCount)) : 0;
+    const minWithSlack = avgMin > 0 ? Math.max(1, avgMin - perSentenceSlack) : 0;
+    const maxWithSlack = avgMax > 0 ? avgMax + perSentenceSlack : 0;
+    return {
+      min: minWithSlack,
+      max: maxWithSlack
+    };
+  }
+
+  private assembleSentenceModeContent(rule: SectionRule, sentences: string[]): string {
+    const lineCount = getNumber(rule.constraints, "line_count", 0);
+    if (lineCount > 0) {
+      return normalizeText(sentences.slice(0, lineCount).join("\n"));
+    }
+
+    const minParagraphs = getNumber(rule.constraints, "min_paragraphs", 0);
+    const maxParagraphs = getNumber(rule.constraints, "max_paragraphs", 0);
+    const fixedParagraphs =
+      minParagraphs > 0 && maxParagraphs > 0 && minParagraphs === maxParagraphs ? minParagraphs : 0;
+    const paragraphCount = rule.execution.paragraph_count ?? fixedParagraphs;
+    if (paragraphCount > 0) {
+      return this.splitSentenceSlotsByParagraphs(sentences, paragraphCount);
+    }
+    return normalizeText(sentences.join(" "));
+  }
+
+  private buildSentenceModeSystemPrompt(rule: SectionRule): string {
+    const constraintsSummary = this.constraintsSummary(rule);
+    return [
+      "你是专业亚马逊 Listing 文案专家。",
+      "你在逐句生成模式中工作。",
+      "每次只输出 1 句英文完整句子，不要编号，不要项目符号，不要解释，不要 JSON，不要代码块。",
+      "句子必须完整收尾并带句末标点，禁止半截句。",
+      `section=${rule.section}`,
+      `规则:\n${rule.instruction}`,
+      `硬性约束摘要:\n${constraintsSummary}`
+    ].join("\n");
+  }
+
+  private buildSentenceModeUserPrompt(
+    requirements: ListingRequirements,
+    rule: SectionRule,
+    sentenceIndex: number,
+    sentenceCount: number,
+    generatedSentences: string[],
+    requiredKeywords: string[],
+    sentenceTarget: { min: number; max: number },
+    extra?: string
+  ): string {
+    const requirementsRaw = this.requirementsRawForPrompt || requirements.raw;
+    const doneText = generatedSentences.length > 0 ? generatedSentences.join("\n") : "（暂无）";
+    return [
+      `任务: 生成 section=${rule.section} 的第 ${sentenceIndex + 1}/${sentenceCount} 句（英文）`,
+      this.executionBrief ? `执行简报:\n${this.executionBrief}` : "",
+      `品牌: ${requirements.brand}`,
+      `分类: ${requirements.category}`,
+      `关键词库:\n${requirements.keywords.join("\n")}`,
+      requiredKeywords.length > 0
+        ? `本句必须按顺序原样包含以下关键词（不得拆分/改写/换序）:\n${requiredKeywords.map((v, i) => `${i + 1}. ${v}`).join("\n")}`
+        : "",
+      sentenceTarget.min > 0 || sentenceTarget.max > 0
+        ? `本句目标长度（字符）: ${formatRange(sentenceTarget.min, sentenceTarget.max)}`
+        : "",
+      `已生成句子:\n${doneText}`,
+      "输入需求原文:",
+      requirementsRaw,
+      extra ? `\n修正反馈:\n${extra}` : "",
+      "只返回这一句英文正文。"
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  private async generateSectionWithSentenceMode(
+    requirements: ListingRequirements,
+    rule: SectionRule,
+    step: string,
+    validate: (content: string) => string[],
+    options?: SectionGenerateOptions
+  ): Promise<string> {
+    const retries = Math.max(1, options?.maxRetries ?? rule.execution.retries ?? 3);
+    const sentenceCount = this.resolveSentenceModeCount(rule);
+    if (sentenceCount <= 0) {
+      throw new Error(`${rule.section} 逐句模式缺少 sentence_count/line_count 配置`);
+    }
+    const apiAttempts = Math.max(2, getNumber(rule.constraints, "api_attempts", 4));
+    const keywordPlan = this.sentenceKeywordPlan(requirements, rule, sentenceCount);
+    const sentenceTarget = this.sentenceTargetRange(rule, sentenceCount);
+    let feedback = options?.initialFeedback?.trim() ?? "";
+
+    for (let attempt = 1; attempt <= retries; attempt += 1) {
+      this.throwIfAborted();
+      const started = Date.now();
+      await this.appendTrace("section_sentence_mode_start", "info", {
+        step,
+        section: rule.section,
+        attempt,
+        max_attempts: retries,
+        sentence_count: sentenceCount
+      });
+
+      const sentences: string[] = [];
+      for (let idx = 0; idx < sentenceCount; idx += 1) {
+        const requiredKeywords = keywordPlan.slots[idx] ?? [];
+        let sentenceFeedback = feedback;
+        let produced = "";
+        const slotRetries = keywordPlan.config.slotRetries;
+        for (let slotAttempt = 1; slotAttempt <= slotRetries; slotAttempt += 1) {
+          this.throwIfAborted();
+          const sentenceStarted = Date.now();
+          const raw = await this.llmClient.writeWithWriterAgent(
+            this.buildSentenceModeSystemPrompt(rule),
+            this.buildSentenceModeUserPrompt(
+              requirements,
+              rule,
+              idx,
+              sentenceCount,
+              sentences,
+              requiredKeywords,
+              sentenceTarget,
+              sentenceFeedback
+            ),
+            `${step}_sentence_${idx + 1}_attempt_${attempt}_slot_${slotAttempt}`,
+            apiAttempts,
+            options?.writerModelSettings
+          );
+          const sentence = adaptSingleSentence(raw);
+          if (!sentence) {
+            sentenceFeedback = `- 本句为空，请输出 1 句完整英文句子。`;
+            if (slotAttempt >= slotRetries) {
+              await this.appendTrace("section_sentence_step_validate_fail", "warn", {
+                step,
+                section: rule.section,
+                sentence_index: idx + 1,
+                sentence_total: sentenceCount,
+                slot_attempt: slotAttempt,
+                error: "本句为空"
+              });
+            }
+            continue;
+          }
+          const sentenceChars = normalizeLine(sentence).length;
+          if (!rangeCheck(sentenceChars, sentenceTarget.min, sentenceTarget.max)) {
+            const rangeText = formatRange(sentenceTarget.min, sentenceTarget.max);
+            const sentenceErr = `句长不满足目标: ${sentenceChars}（目标 ${rangeText}）`;
+            sentenceFeedback = `- ${sentenceErr}`;
+            if (slotAttempt >= slotRetries) {
+              await this.appendTrace("section_sentence_step_validate_fail", "warn", {
+                step,
+                section: rule.section,
+                sentence_index: idx + 1,
+                sentence_total: sentenceCount,
+                slot_attempt: slotAttempt,
+                error: sentenceErr
+              });
+            }
+            if (slotAttempt >= slotRetries) {
+              throw new Error(`${step} 第${idx + 1}句长度约束失败: ${sentenceErr}`);
+            }
+            continue;
+          }
+          const keywordError = this.validateSentenceRequiredKeywords(sentence, requiredKeywords, keywordPlan.config);
+          if (keywordError) {
+            sentenceFeedback = `- ${keywordError}`;
+            if (slotAttempt >= slotRetries) {
+              await this.appendTrace("section_sentence_step_validate_fail", "warn", {
+                step,
+                section: rule.section,
+                sentence_index: idx + 1,
+                sentence_total: sentenceCount,
+                slot_attempt: slotAttempt,
+                error: keywordError
+              });
+            }
+            if (slotAttempt >= slotRetries) {
+              throw new Error(`${step} 第${idx + 1}句关键词约束失败: ${keywordError}`);
+            }
+            continue;
+          }
+          produced = sentence;
+          await this.appendTrace("section_sentence_step_ok", "info", {
+            step,
+            section: rule.section,
+            sentence_index: idx + 1,
+            sentence_total: sentenceCount,
+            slot_attempt: slotAttempt,
+            duration_ms: Date.now() - sentenceStarted,
+            output_chars: sentenceChars
+          });
+          break;
+        }
+        if (!produced) {
+          throw new Error(`${step} 第${idx + 1}句生成失败`);
+        }
+        sentences.push(produced);
+      }
+
+      const merged = this.assembleSentenceModeContent(rule, sentences);
+      const errors = validate(merged);
+      if (errors.length === 0) {
+        await this.appendTrace("section_sentence_mode_ok", "info", {
+          step,
+          section: rule.section,
+          attempt,
+          duration_ms: Date.now() - started,
+          output_chars: merged.length,
+          sentence_count: sentenceCount
+        });
+        return merged;
+      }
+
+      feedback = compactErrorsForLLM(errors, 8).map((err) => `- ${err}`).join("\n");
+      await this.appendTrace("section_sentence_mode_validate_fail", "warn", {
+        step,
+        section: rule.section,
+        attempt,
+        errors
+      });
+
+      if (attempt >= retries) {
+        await this.appendTrace("section_generate_failed", "error", {
+          step,
+          section: rule.section,
+          attempt,
+          errors
+        });
+        throw new Error(`${step} 重试后仍失败: ${errors.join("; ")}`);
+      }
+    }
+
+    throw new Error(`${step} 未生成有效内容`);
   }
 
   private supportsItemRepair(rule: SectionRule): boolean {
@@ -1101,6 +1579,9 @@ export class GenerationService {
     validate: (content: string) => string[],
     options?: SectionGenerateOptions
   ): Promise<string> {
+    if (this.isSentenceMode(rule)) {
+      return this.generateSectionWithSentenceMode(requirements, rule, step, validate, options);
+    }
     this.throwIfAborted();
     const retries = Math.max(1, options?.maxRetries ?? rule.execution.retries ?? 3);
     const apiAttempts = Math.max(2, getNumber(rule.constraints, "api_attempts", 4));

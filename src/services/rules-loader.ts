@@ -12,6 +12,9 @@ export interface SectionRule {
   execution: {
     retries: number;
     repair_mode?: string;
+    generation_mode: "whole" | "sentence";
+    sentence_count?: number;
+    paragraph_count?: number;
   };
   output: {
     format: string;
@@ -235,6 +238,23 @@ export async function loadTenantRules(
     if (!doc || typeof doc.section !== "string" || typeof doc.instruction !== "string") {
       continue;
     }
+    const executionNode = (doc.execution as Record<string, unknown> | undefined) ?? {};
+    const sentenceModeNode = (executionNode.sentence_mode as Record<string, unknown> | undefined) ?? {};
+    const generationModeRaw = asString(
+      executionNode.generation_mode,
+      sentenceModeNode.enabled === true ? "sentence" : "whole"
+    )
+      .trim()
+      .toLowerCase();
+    const generationMode: "whole" | "sentence" = generationModeRaw === "sentence" ? "sentence" : "whole";
+    const sentenceCountValue = asNumber(executionNode.sentence_count, asNumber(sentenceModeNode.sentence_count, 0));
+    const paragraphCountValue = asNumber(executionNode.paragraph_count, asNumber(sentenceModeNode.paragraph_count, 0));
+    const sentenceCount = Number.isFinite(sentenceCountValue) && sentenceCountValue > 0
+      ? Math.floor(sentenceCountValue)
+      : undefined;
+    const paragraphCount = Number.isFinite(paragraphCountValue) && paragraphCountValue > 0
+      ? Math.floor(paragraphCountValue)
+      : undefined;
     sections.set(doc.section, {
       section: doc.section,
       language: doc.language ?? "en",
@@ -242,7 +262,10 @@ export async function loadTenantRules(
       constraints: (doc.constraints as Record<string, unknown>) ?? {},
       execution: {
         retries: asNumber((doc.execution as { retries?: unknown } | undefined)?.retries, 3),
-        repair_mode: (doc.execution as { repair_mode?: string } | undefined)?.repair_mode
+        repair_mode: (doc.execution as { repair_mode?: string } | undefined)?.repair_mode,
+        generation_mode: generationMode,
+        sentence_count: sentenceCount,
+        paragraph_count: paragraphCount
       },
       output: {
         format: (doc.output as { format?: string } | undefined)?.format ?? "text",
