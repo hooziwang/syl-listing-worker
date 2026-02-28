@@ -3,10 +3,6 @@ export type JobStatus = "queued" | "running" | "succeeded" | "failed" | "cancell
 export interface ListingResult {
   en_markdown: string;
   cn_markdown: string;
-  meta: {
-    highlight_words_en: string[];
-    highlight_words_cn: string[];
-  };
   validation_report: string[];
   timing_ms: number;
   billing_summary: {

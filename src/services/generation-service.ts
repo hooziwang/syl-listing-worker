@@ -2191,10 +2191,6 @@ export class GenerationService {
     return {
       en_markdown: enMarkdown,
       cn_markdown: cnMarkdown,
-      meta: {
-        highlight_words_en: dedupeKeepOrder(requirements.keywords),
-        highlight_words_cn: dedupeKeepOrder(keywordsCnFinal)
-      },
       validation_report: [
         `rules_version=${input.rulesVersion}`,
         `keywords_count=${requirements.keywords.length}`,
