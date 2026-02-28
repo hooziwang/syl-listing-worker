@@ -356,6 +356,7 @@ type KeywordEmbeddingConfig = {
   enforceOrder: boolean;
   exactMatch: boolean;
   noSplit: boolean;
+  boldWrapper: boolean;
   slotRetries: number;
 };
 
@@ -371,6 +372,7 @@ function readKeywordEmbeddingConfig(constraints: Record<string, unknown>): Keywo
     enforceOrder: node.enforce_order !== false,
     exactMatch: node.exact_match !== false,
     noSplit: node.no_split !== false,
+    boldWrapper: node.bold_wrapper === true,
     slotRetries: Math.max(1, Math.floor(slotRetriesRaw))
   };
 }
@@ -398,7 +400,8 @@ function findKeywordOccurrence(
     return null;
   }
   const body = config.noSplit ? tokens.join("\\s+") : tokens.join("[\\s\\W_]*");
-  const patternText = `${config.exactMatch ? "(?<![A-Za-z0-9])" : ""}${body}${config.exactMatch ? "(?![A-Za-z0-9])" : ""}`;
+  const wrapped = config.boldWrapper ? `\\*\\*\\s*${body}\\s*\\*\\*` : body;
+  const patternText = `${config.exactMatch ? "(?<![A-Za-z0-9])" : ""}${wrapped}${config.exactMatch ? "(?![A-Za-z0-9])" : ""}`;
   const pattern = new RegExp(patternText, "i");
   const slice = text.slice(Math.max(0, start));
   const matched = pattern.exec(slice);
@@ -711,6 +714,10 @@ function adaptSingleSentence(raw: string): string {
     .map((line) => normalizeLine(stripBulletPrefix(line)))
     .find(Boolean);
   return first ?? "";
+}
+
+function stripMarkdownBold(input: string): string {
+  return input.replace(/\*\*([^*]+)\*\*/g, "$1");
 }
 
 async function promiseValue<T>(promise: Promise<T>, label: string): Promise<T> {
@@ -1051,6 +1058,9 @@ export class GenerationService {
       `关键词库:\n${requirements.keywords.join("\n")}`,
       requiredKeywords.length > 0
         ? `本句必须按顺序原样包含以下关键词（不得拆分/改写/换序）:\n${requiredKeywords.map((v, i) => `${i + 1}. ${v}`).join("\n")}`
+        : "",
+      requiredKeywords.length > 0 && keywordPlanBoldWrapper(rule)
+        ? "本句中每个关键词必须使用 Markdown 粗体包裹，格式为 **关键词**。"
         : "",
       sentenceTarget.min > 0 || sentenceTarget.max > 0
         ? `本句目标长度（字符）: ${formatRange(sentenceTarget.min, sentenceTarget.max)}`
@@ -2109,8 +2119,12 @@ export class GenerationService {
     this.throwIfAborted();
 
     const titleCnPromise = this.translateText(titleEn, "translate_title", translationRetries);
-    const bulletsCnPromise = this.translateText(bulletsLinesEn.join("\n"), "translate_bullets", translationRetries);
-    const descriptionCnPromise = this.translateText(descriptionEn, "translate_description", translationRetries);
+    const bulletsCnPromise = this.translateText(bulletsLinesEn.join("\n"), "translate_bullets", translationRetries).then(
+      stripMarkdownBold
+    );
+    const descriptionCnPromise = this.translateText(descriptionEn, "translate_description", translationRetries).then(
+      stripMarkdownBold
+    );
     const searchTermsCnPromise = this.translateText(searchTermsEn, "translate_search_terms", translationRetries);
 
     const categoryCn = await promiseValue(categoryTranslationPromise, "分类翻译");
@@ -2195,4 +2209,9 @@ export class GenerationService {
       }
     };
   }
+}
+
+function keywordPlanBoldWrapper(rule: SectionRule): boolean {
+  const config = readKeywordEmbeddingConfig(rule.constraints);
+  return config.enabled && config.boldWrapper;
 }
