@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { extract } from "tar";
 import { parse as parseYAML } from "yaml";
+import type { WorkflowNode, WorkflowNodeType, WorkflowSpec } from "../workflow/types.js";
 
 export interface SectionRule {
   section: string;
@@ -23,21 +24,27 @@ export interface SectionRule {
 }
 
 export interface InputRules {
-  brand: {
-    labels: string[];
-    fallback: string;
+  file_discovery: {
+    marker: string;
   };
-  keywords: {
-    heading_aliases: string[];
-    min_count: number;
-    unique_required: boolean;
-  };
-  category: {
-    heading_aliases: string[];
-  };
+  fields: InputFieldRule[];
+}
+
+export interface InputFieldRule {
+  key: string;
+  type: "scalar" | "list";
+  capture: "inline_label" | "heading_section";
+  labels?: string[];
+  heading_aliases?: string[];
+  required?: boolean;
+  fallback?: string;
+  fallback_from_h1_first_token?: boolean;
+  min_count?: number;
+  unique_required?: boolean;
 }
 
 export interface WorkflowRules {
+  spec: WorkflowSpec;
   planning: {
     enabled: boolean;
     retries: number;
@@ -113,6 +120,83 @@ function mustStringArray(v: unknown, path: string): string[] {
   return arr;
 }
 
+function asRecord(v: unknown): Record<string, unknown> | undefined {
+  if (!v || typeof v !== "object" || Array.isArray(v)) {
+    return undefined;
+  }
+  return v as Record<string, unknown>;
+}
+
+function parseWorkflowNodeType(value: unknown, path: string): WorkflowNodeType {
+  const normalized = asString(value).trim().toLowerCase();
+  switch (normalized) {
+    case "generate":
+    case "translate":
+    case "derive":
+    case "judge":
+    case "render":
+      return normalized;
+    default:
+      throw new Error(`规则缺失字段: ${path}`);
+  }
+}
+
+function parseWorkflowNodes(v: unknown, path: string): WorkflowNode[] {
+  if (!Array.isArray(v) || v.length === 0) {
+    throw new Error(`规则缺失字段: ${path}`);
+  }
+  return v.map((item, index) => {
+    const node = asRecord(item);
+    if (!node) {
+      throw new Error(`规则缺失字段: ${path}[${index}]`);
+    }
+    const parsed: WorkflowNode = {
+      id: mustString(node.id, `${path}[${index}].id`),
+      type: parseWorkflowNodeType(node.type, `${path}[${index}].type`),
+      output_to: mustString(node.output_to, `${path}[${index}].output_to`)
+    };
+    const dependsOn = asStringArray(node.depends_on);
+    if (dependsOn.length > 0) {
+      parsed.depends_on = dependsOn;
+    }
+    const section = asString(node.section).trim();
+    if (section) {
+      parsed.section = section;
+    }
+    const inputFrom = asString(node.input_from).trim();
+    if (inputFrom) {
+      parsed.input_from = inputFrom;
+    }
+    const template = asString(node.template).trim();
+    if (template) {
+      parsed.template = template;
+    }
+    const inputsNode = asRecord(node.inputs);
+    if (inputsNode) {
+      const inputs: Record<string, string> = {};
+      for (const [key, value] of Object.entries(inputsNode)) {
+        const slot = asString(value).trim();
+        if (key.trim() && slot) {
+          inputs[key.trim()] = slot;
+        }
+      }
+      if (Object.keys(inputs).length > 0) {
+        parsed.inputs = inputs;
+      }
+    }
+    const retryNode = asRecord(node.retry_policy);
+    if (retryNode) {
+      const maxAttempts = asNumber(retryNode.max_attempts, 0);
+      if (maxAttempts > 0) {
+        parsed.retry_policy = {
+          max_attempts: Math.floor(maxAttempts)
+        };
+      }
+    }
+    return parsed;
+  });
+}
+
 async function readYAML(path: string): Promise<Record<string, unknown>> {
   const raw = await readFile(path, "utf8");
   const parsed = parseYAML(raw) as unknown;
@@ -162,32 +246,54 @@ export async function loadTenantRules(
   };
 
   const input: InputRules = {
-    brand: {
-      labels: mustStringArray((inputDoc.brand as Record<string, unknown> | undefined)?.labels, "input.brand.labels"),
-      fallback: mustString((inputDoc.brand as Record<string, unknown> | undefined)?.fallback, "input.brand.fallback")
-    },
-    keywords: {
-      heading_aliases: mustStringArray(
-        (inputDoc.keywords as Record<string, unknown> | undefined)?.heading_aliases,
-        "input.keywords.heading_aliases"
-      ),
-      min_count: Math.max(1, asNumber((inputDoc.keywords as Record<string, unknown> | undefined)?.min_count, 3)),
-      unique_required: (inputDoc.keywords as Record<string, unknown> | undefined)?.unique_required === true
-    },
-    category: {
-      heading_aliases: mustStringArray(
-        (inputDoc.category as Record<string, unknown> | undefined)?.heading_aliases,
-        "input.category.heading_aliases"
+    file_discovery: {
+      marker: mustString(
+        (inputDoc.file_discovery as Record<string, unknown> | undefined)?.marker,
+        "input.file_discovery.marker"
       )
-    }
+    },
+    fields: (() => {
+      const raw = inputDoc.fields;
+      if (!Array.isArray(raw) || raw.length === 0) {
+        throw new Error("规则缺失字段: input.fields");
+      }
+      return raw.map((item, index) => {
+        const field = asRecord(item);
+        if (!field) {
+          throw new Error(`规则缺失字段: input.fields[${index}]`);
+        }
+        const typeRaw = mustString(field.type, `input.fields[${index}].type`).trim().toLowerCase();
+        const captureRaw = mustString(field.capture, `input.fields[${index}].capture`).trim().toLowerCase();
+        const type: "scalar" | "list" = typeRaw === "list" ? "list" : "scalar";
+        const capture: "inline_label" | "heading_section" =
+          captureRaw === "heading_section" ? "heading_section" : "inline_label";
+        return {
+          key: mustString(field.key, `input.fields[${index}].key`),
+          type,
+          capture,
+          labels: asStringArray(field.labels),
+          heading_aliases: asStringArray(field.heading_aliases),
+          required: field.required !== false,
+          fallback: asString(field.fallback).trim(),
+          fallback_from_h1_first_token: field.fallback_from_h1_first_token === true,
+          min_count: Math.max(0, asNumber(field.min_count, 0)),
+          unique_required: field.unique_required === true
+        };
+      });
+    })()
   };
 
   const planningNode = (workflowDoc.planning as Record<string, unknown> | undefined) ?? {};
   const judgeNode = (workflowDoc.judge as Record<string, unknown> | undefined) ?? {};
   const translationNode = (workflowDoc.translation as Record<string, unknown> | undefined) ?? {};
   const renderNode = (workflowDoc.render as Record<string, unknown> | undefined) ?? {};
+  const workflowNodes = parseWorkflowNodes(workflowDoc.nodes, "workflow.nodes");
 
   const workflow: WorkflowRules = {
+    spec: {
+      version: Math.max(1, asNumber(workflowDoc.version, 1)),
+      nodes: workflowNodes
+    },
     planning: {
       enabled: planningNode.enabled !== false,
       retries: Math.max(1, asNumber(planningNode.retries, 2)),

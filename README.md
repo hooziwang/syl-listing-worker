@@ -83,6 +83,77 @@ syl-listing-pro-x worker diagnose --server syl-server
 - `nginx`：公网入口
 - `certbot`：证书签发与续期
 
+## 执行模型
+
+worker 现在是通用 workflow 执行引擎，不再内置固定的 `title/bullets/description` 主流程。
+
+运行时流程：
+
+1. 从规则包读取 `input.yaml`
+2. 从规则包读取 `workflow.yaml`
+3. 解析输入契约 `file_discovery + fields`
+4. 按 `workflow.nodes` 构建 DAG
+5. 通过 `WorkflowEngine + ExecutorRegistry` 执行节点
+
+当前支持的节点类型：
+
+- `generate`
+- `translate`
+- `derive`
+- `judge`
+- `render`
+
+说明：
+
+- `judge.inputs` 定义审查阶段读取哪些 slot，并用哪些 section 名回报问题
+- `render.inputs` 定义模板可使用哪些变量，以及变量从哪个 slot 取值
+- slot 之间的数据传递由 `ExecutionContext` 管理
+- section 规则、输入字段、展示标签、模板变量都来自规则包，不在 worker 中硬编码
+
+## 规则契约
+
+### `input.yaml`
+
+使用字段驱动结构：
+
+```yaml
+file_discovery:
+  marker: "===Listing Requirements==="
+
+fields:
+  - key: brand
+    type: scalar
+    capture: inline_label
+    labels: ["品牌名", "品牌"]
+
+  - key: keywords
+    type: list
+    capture: heading_section
+    heading_aliases: ["关键词"]
+```
+
+### `workflow.yaml`
+
+核心是 `nodes`：
+
+```yaml
+nodes:
+  - id: title_en
+    type: generate
+    section: title
+    output_to: title_en
+
+  - id: render_en
+    type: render
+    depends_on: [title_en]
+    inputs:
+      title_en: title_en
+    template: en
+    output_to: en_markdown
+```
+
+`render.inputs` 和 `judge.inputs` 都属于规则的一部分，worker 只负责执行。
+
 ## 关键接口
 
 - `POST /v1/auth/exchange`

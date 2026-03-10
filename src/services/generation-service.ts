@@ -7,6 +7,18 @@ import { LLMClient } from "./llm-client.js";
 import { parseRequirements, type ListingRequirements } from "./requirements-parser.js";
 import { loadTenantRules, type SectionRule, type TenantRules } from "./rules-loader.js";
 import type { RedisTraceStore } from "../store/trace-store.js";
+import { buildWorkflowGraph } from "../workflow/graph.js";
+import { ExecutionContext } from "../workflow/execution-context.js";
+import { WorkflowEngine } from "../workflow/engine.js";
+import type { NodeExecutionResult } from "../workflow/node-executor.js";
+import type { WorkflowNode } from "../workflow/types.js";
+import { ExecutorRegistry } from "../workflow/registry.js";
+import { GenerateNodeExecutor } from "../workflow/executors/generate-node.js";
+import { TranslateNodeExecutor } from "../workflow/executors/translate-node.js";
+import { JudgeNodeExecutor } from "../workflow/executors/judge-node.js";
+import { DeriveNodeExecutor } from "../workflow/executors/derive-node.js";
+import { RenderNodeExecutor } from "../workflow/executors/render-node.js";
+import { buildRenderVariables, collectNodeSectionSlots, parseJudgeIssues } from "../workflow/bindings.js";
 
 interface GenerationInput {
   jobId: string;
@@ -23,10 +35,8 @@ export class InputValidationError extends Error {
   }
 }
 
-type ENSectionKey = "title" | "bullets" | "description" | "search_terms";
-
 interface JudgeIssue {
-  section: ENSectionKey;
+  section: string;
   message: string;
 }
 
@@ -37,6 +47,13 @@ interface SectionGenerateOptions {
   writerModelSettings?: Partial<ModelSettings>;
   repairModelSettings?: Partial<ModelSettings>;
   adaptContent?: (raw: string) => { content: string; error?: string };
+}
+
+interface WorkflowExecutionOutput {
+  enMarkdown: string;
+  cnMarkdown: string;
+  bulletsCount: number;
+  judgeIssuesCount: number;
 }
 
 const lineLengthErrorPattern = /^第(\d+)条长度不满足约束:\s*(\d+)（规则区间 \[(\d+),(\d+)\]，容差区间 \[(\d+),(\d+)\]）$/;
@@ -601,16 +618,6 @@ function renderByVars(template: string, vars: Record<string, string>): string {
   return template.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_, key: string) => vars[key] ?? "");
 }
 
-function renderList(items: string[], itemTemplate: string, separator = "\n"): string {
-  const rendered = items.map((item, index) =>
-    renderByVars(itemTemplate, {
-      index: String(index + 1),
-      item
-    })
-  );
-  return rendered.join(separator);
-}
-
 function compactErrorForLLM(error: string): string {
   const text = normalizeLine(error);
   if (!text) {
@@ -718,15 +725,6 @@ function adaptSingleSentence(raw: string): string {
 
 function stripMarkdownBold(input: string): string {
   return input.replace(/\*\*([^*]+)\*\*/g, "$1");
-}
-
-async function promiseValue<T>(promise: Promise<T>, label: string): Promise<T> {
-  try {
-    return await promise;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    throw new Error(`${label}失败: ${msg}`);
-  }
 }
 
 export class GenerationService {
@@ -1737,14 +1735,12 @@ export class GenerationService {
     throw new Error(`${step} 未生成有效内容`);
   }
 
-  private groupJudgeIssuesBySection(issues: JudgeIssue[]): Record<ENSectionKey, string[]> {
-    const grouped: Record<ENSectionKey, string[]> = {
-      title: [],
-      bullets: [],
-      description: [],
-      search_terms: []
-    };
+  private groupJudgeIssuesBySection(issues: JudgeIssue[]): Record<string, string[]> {
+    const grouped: Record<string, string[]> = {};
     for (const issue of issues) {
+      if (!grouped[issue.section]) {
+        grouped[issue.section] = [];
+      }
       grouped[issue.section].push(issue.message);
     }
     return grouped;
@@ -1780,7 +1776,7 @@ export class GenerationService {
 
   private buildPromptVars(
     requirements: ListingRequirements,
-    sections?: Partial<Record<ENSectionKey, string>>
+    sections?: Record<string, string>
   ): Record<string, string> {
     const requirementsRaw = this.requirementsRawForPrompt || requirements.raw;
     return {
@@ -1788,10 +1784,15 @@ export class GenerationService {
       category: requirements.category,
       keywords: requirements.keywords.join("\n"),
       requirements_raw: requirementsRaw,
-      title: sections?.title ?? "",
-      bullets: sections?.bullets ?? "",
-      description: sections?.description ?? "",
-      search_terms: sections?.search_terms ?? ""
+      ...(requirements.values
+        ? Object.fromEntries(
+            Object.entries(requirements.values).map(([key, value]) => [
+              key,
+              Array.isArray(value) ? value.join("\n") : String(value ?? "")
+            ])
+          )
+        : {}),
+      ...(sections ?? {})
     };
   }
 
@@ -1836,40 +1837,12 @@ export class GenerationService {
 
   private parseJudgeIssues(text: string): JudgeIssue[] {
     const rules = this.mustRulesLoaded();
-    const ignored = new Set(rules.workflow.judge.ignore_messages.map((v) => normalizeText(v).toLowerCase()));
-    const allowed = new Set(
-      rules.requiredSections.filter((v) => v !== "translation") as ENSectionKey[]
-    );
-    const normalized = normalizeText(text);
-    if (normalized.toUpperCase() === "OK") {
-      return [];
-    }
-    const lines = normalized.split("\n").map((v) => v.trim()).filter(Boolean);
-    const out: JudgeIssue[] = [];
-    for (const line of lines) {
-      const m = /^-?\s*\[([a-zA-Z0-9_]+)\]\s*(.+)$/i.exec(line);
-      if (!m) {
-        continue;
-      }
-      const section = m[1].toLowerCase() as ENSectionKey;
-      if (!allowed.has(section)) {
-        continue;
-      }
-      const message = m[2].trim();
-      if (ignored.has(normalizeText(message).toLowerCase())) {
-        continue;
-      }
-      out.push({
-        section,
-        message
-      });
-    }
-    return out;
+    return parseJudgeIssues(text, rules.workflow.judge.ignore_messages, [...rules.sections.keys()]);
   }
 
   private async runQualityJudge(
     requirements: ListingRequirements,
-    sections: Record<ENSectionKey, string>
+    sections: Record<string, string>
   ): Promise<JudgeIssue[]> {
     this.throwIfAborted();
     const rules = this.mustRulesLoaded();
@@ -1931,6 +1904,224 @@ export class GenerationService {
     }
   }
 
+  private workflowSectionRule(section: string): SectionRule {
+    const rules = this.mustRulesLoaded();
+    const rule = rules.sections.get(section);
+    if (!rule) {
+      throw new Error(`规则文件缺失 section: ${section}`);
+    }
+    return rule;
+  }
+
+  private workflowTranslateStep(inputSlot: string): string {
+    const normalized = inputSlot.trim().toLowerCase();
+    switch (normalized) {
+      case "category":
+        return "translate_category";
+      case "keywords":
+        return "translate_keywords";
+      case "title_en":
+        return "translate_title";
+      case "bullets_en":
+        return "translate_bullets";
+      case "description_en":
+        return "translate_description";
+      case "search_terms_en":
+        return "translate_search_terms";
+      default:
+        return `translate_${normalized}`;
+    }
+  }
+
+  private buildInitialExecutionContext(requirements: ListingRequirements): ExecutionContext {
+    return new ExecutionContext({
+      brand: requirements.brand,
+      category: requirements.category,
+      keywords: requirements.keywords.join("\n")
+    });
+  }
+
+  private buildRenderVarsFromContext(node: WorkflowNode, ctx: ExecutionContext): Record<string, string> {
+    const rules = this.mustRulesLoaded();
+    return buildRenderVariables(node, ctx, {
+      inputFields: rules.input.fields,
+      sections: rules.sections,
+      render: rules.workflow.render
+    });
+  }
+
+  private async executeGenerateNode(requirements: ListingRequirements, node: WorkflowNode): Promise<string> {
+    const section = (node.section ?? "").trim();
+    const rule = this.workflowSectionRule(section);
+    const step = rule.section;
+    if (rule.section === "bullets") {
+      const bulletsJSONModeSettings = this.deepseekJSONModeSettings();
+      const bulletsJSONArrayField = rule.output.json_array_field || "bullets";
+      return this.generateSectionWithValidation(
+        requirements,
+        rule,
+        step,
+        (content) => validateSectionContent(content, requirements, rule),
+        {
+          jsonOutput: true,
+          writerModelSettings: bulletsJSONModeSettings,
+          repairModelSettings: bulletsJSONModeSettings,
+          adaptContent: (raw) => adaptJSONArrayContent(raw, bulletsJSONArrayField)
+        }
+      );
+    }
+    return this.generateSectionWithValidation(
+      requirements,
+      rule,
+      step,
+      (content) => validateSectionContent(content, requirements, rule)
+    );
+  }
+
+  private async executeTranslateNode(
+    ctx: ExecutionContext,
+    node: WorkflowNode,
+    translationRetries: number
+  ): Promise<string> {
+    const inputSlot = (node.input_from ?? "").trim();
+    if (!inputSlot) {
+      throw new Error(`workflow translate node 缺少 input_from: ${node.id}`);
+    }
+    const text = ctx.get(inputSlot);
+    const translated = await this.translateText(text, this.workflowTranslateStep(inputSlot), translationRetries);
+    if (node.output_to === "bullets_cn" || node.output_to === "description_cn") {
+      return stripMarkdownBold(translated);
+    }
+    return translated;
+  }
+
+  private async executeDeriveNode(requirements: ListingRequirements, node: WorkflowNode): Promise<string> {
+    const section = (node.section ?? "").trim();
+    const rule = this.workflowSectionRule(section);
+    if (section === "search_terms") {
+      return buildSearchTermsFromRule(requirements, rule);
+    }
+    throw new Error(`workflow derive 暂不支持 section: ${section}`);
+  }
+
+  private async executeJudgeNode(
+    requirements: ListingRequirements,
+    node: WorkflowNode,
+    ctx: ExecutionContext
+  ): Promise<NodeExecutionResult> {
+    const maxJudgeRounds = this.mustRulesLoaded().workflow.judge.max_rounds;
+    const boundSections = collectNodeSectionSlots(node, ctx);
+    const repairedSections: Record<string, string> = { ...boundSections };
+
+    let judgeIssues = await this.runQualityJudge(requirements, repairedSections);
+
+    for (let judgeRound = 1; judgeRound <= maxJudgeRounds && judgeIssues.length > 0; judgeRound += 1) {
+      this.throwIfAborted();
+      const grouped = this.groupJudgeIssuesBySection(judgeIssues);
+      await this.appendTrace("quality_judge_repair_round_start", "warn", {
+        step: node.id,
+        round: judgeRound,
+        issues_count: judgeIssues.length,
+        grouped
+      });
+
+      for (const [section, messages] of Object.entries(grouped)) {
+        if (!messages.length) {
+          continue;
+        }
+        const slot = node.inputs?.[section];
+        if (!slot) {
+          continue;
+        }
+        const rule = this.workflowSectionRule(section);
+        const jsonOutput = rule.output.format === "json";
+        const jsonArrayField = rule.output.json_array_field || section;
+        const modelSettings = jsonOutput ? this.deepseekJSONModeSettings() : undefined;
+        const repaired = await this.generateSectionWithValidation(
+          requirements,
+          rule,
+          `${section}_judge_repair_round_${judgeRound}`,
+          (content) => validateSectionContent(content, requirements, rule),
+          {
+            initialFeedback: this.buildJudgeFeedbackText(messages),
+            maxRetries: 2,
+            jsonOutput,
+            writerModelSettings: modelSettings,
+            repairModelSettings: modelSettings,
+            adaptContent: jsonOutput ? (raw) => adaptJSONArrayContent(raw, jsonArrayField) : undefined
+          }
+        );
+        repairedSections[section] = repaired;
+        ctx.set(slot, normalizeText(repaired));
+      }
+
+      judgeIssues = await this.runQualityJudge(requirements, repairedSections);
+    }
+
+    return {
+      outputSlot: node.output_to,
+      outputValue: String(judgeIssues.length),
+      writes: Object.fromEntries(
+        Object.entries(node.inputs ?? {})
+          .filter(([section]) => typeof repairedSections[section] === "string")
+          .map(([section, slot]) => [slot, normalizeText(repairedSections[section] ?? "")])
+      )
+    };
+  }
+
+  private async executeRenderNode(ctx: ExecutionContext, node: WorkflowNode): Promise<string> {
+    const rules = this.mustRulesLoaded();
+    const templateKey = (node.template ?? "").trim();
+    if (templateKey !== "en" && templateKey !== "cn") {
+      throw new Error(`workflow render 暂不支持 template: ${templateKey}`);
+    }
+    const vars = this.buildRenderVarsFromContext(node, ctx);
+    return normalizeText(renderByVars(rules.templates[templateKey], vars));
+  }
+
+  private createWorkflowRegistry(
+    requirements: ListingRequirements,
+    translationRetries: number
+  ): ExecutorRegistry {
+    return new ExecutorRegistry([
+      new GenerateNodeExecutor((node) => this.executeGenerateNode(requirements, node)),
+      new TranslateNodeExecutor((node, ctx) => this.executeTranslateNode(ctx, node, translationRetries)),
+      new DeriveNodeExecutor(async (node) => ({
+        outputSlot: node.output_to,
+        outputValue: await this.executeDeriveNode(requirements, node)
+      })),
+      new JudgeNodeExecutor((node, ctx) => this.executeJudgeNode(requirements, node, ctx)),
+      new RenderNodeExecutor(this.mustRulesLoaded().templates, async (node, ctx) => ({
+        outputSlot: node.output_to,
+        outputValue: await this.executeRenderNode(ctx, node)
+      }))
+    ]);
+  }
+
+  private async executeWorkflow(
+    requirements: ListingRequirements,
+    tenantRules: TenantRules,
+    inputFilename: string,
+    translationRetries: number
+  ): Promise<WorkflowExecutionOutput> {
+    const graph = buildWorkflowGraph(tenantRules.workflow.spec);
+    const ctx = this.buildInitialExecutionContext(requirements);
+    const engine = new WorkflowEngine(graph, this.createWorkflowRegistry(requirements, translationRetries));
+    await engine.run(ctx);
+
+    const enMarkdown = replaceTopHeading(normalizeText(ctx.get("en_markdown")), inputFilename);
+    const cnMarkdown = replaceTopHeading(normalizeText(ctx.get("cn_markdown")), inputFilename);
+    const bulletsCount = splitLines(ctx.get("bullets_en")).length;
+    const judgeIssuesCount = Number.parseInt(ctx.has("judge_report_round_1") ? ctx.get("judge_report_round_1") : "0", 10);
+
+    return {
+      enMarkdown,
+      cnMarkdown,
+      bulletsCount,
+      judgeIssuesCount: Number.isFinite(judgeIssuesCount) ? judgeIssuesCount : 0
+    };
+  }
+
   async generate(input: GenerationInput): Promise<ListingResult> {
     this.throwIfAborted();
     const start = Date.now();
@@ -1977,7 +2168,8 @@ export class GenerationService {
       await this.appendTrace("generation_invalid_input", "error", { error: "缺少分类" });
       throw new InputValidationError("缺少分类");
     }
-    const minKeywordCount = Math.max(1, tenantRules.input.keywords.min_count || 3);
+    const keywordsField = tenantRules.input.fields.find((field) => field.key === "keywords");
+    const minKeywordCount = Math.max(1, keywordsField?.min_count || 3);
     if (requirements.keywords.length < minKeywordCount) {
       await this.appendTrace("generation_invalid_input", "error", {
         error: `关键词数量不足：${requirements.keywords.length} < ${minKeywordCount}`,
@@ -1986,7 +2178,7 @@ export class GenerationService {
       });
       throw new InputValidationError(`关键词数量不足：${requirements.keywords.length} < ${minKeywordCount}`);
     }
-    if (tenantRules.input.keywords.unique_required) {
+    if (keywordsField?.unique_required) {
       const duplicates = duplicateKeywords(requirements.keywords);
       if (duplicates.length > 0) {
         const duplicateText = formatDuplicateKeywords(duplicates);
@@ -1999,175 +2191,22 @@ export class GenerationService {
       }
     }
 
-    const titleRule = tenantRules.sections.get("title");
-    const bulletsRule = tenantRules.sections.get("bullets");
-    const descriptionRule = tenantRules.sections.get("description");
-    const searchTermsRule = tenantRules.sections.get("search_terms");
     const translationRule = tenantRules.sections.get("translation");
 
-    if (!titleRule || !bulletsRule || !descriptionRule || !searchTermsRule || !translationRule) {
+    if (!translationRule) {
       const existsPayload: Record<string, unknown> = {};
       for (const key of tenantRules.requiredSections) {
         existsPayload[key] = tenantRules.sections.has(key);
       }
       await this.appendTrace("rules_missing_sections", "error", existsPayload);
-      throw new Error(`规则文件缺失：${tenantRules.requiredSections.join("/")} 必须齐全`);
+      throw new Error("规则文件缺失：translation 必须齐全");
     }
 
     const translationRetries = Math.max(1, translationRule.execution.retries || 2);
     this.executionBrief = await this.planExecution(requirements);
     this.throwIfAborted();
-
-    const categoryTranslationPromise = this.translateText(requirements.category, "translate_category", translationRetries);
-    const keywordsText = requirements.keywords.join("\n");
-    const keywordsTranslationPromise = this.translateText(keywordsText, "translate_keywords", translationRetries);
-
-    const titleEnPromise = this.generateSectionWithValidation(requirements, titleRule, "title", (content) =>
-      validateSectionContent(content, requirements, titleRule)
-    );
-    const bulletsJSONModeSettings = this.deepseekJSONModeSettings();
-    const bulletsJSONArrayField = bulletsRule.output.json_array_field || "bullets";
-    const bulletsRawPromise = this.generateSectionWithValidation(requirements, bulletsRule, "bullets", (content) => {
-      return validateSectionContent(content, requirements, bulletsRule);
-    }, {
-      jsonOutput: true,
-      writerModelSettings: bulletsJSONModeSettings,
-      repairModelSettings: bulletsJSONModeSettings,
-      adaptContent: (raw) => adaptJSONArrayContent(raw, bulletsJSONArrayField)
-    });
-    const descriptionEnPromise = this.generateSectionWithValidation(requirements, descriptionRule, "description", (content) =>
-      validateSectionContent(content, requirements, descriptionRule)
-    );
-
-    let titleEn = await titleEnPromise;
+    const workflowOutput = await this.executeWorkflow(requirements, tenantRules, inputFilename, translationRetries);
     this.throwIfAborted();
-    let bulletsRaw = await bulletsRawPromise;
-    let bulletsLinesEn = splitLines(bulletsRaw);
-    let descriptionEn = await descriptionEnPromise;
-    this.throwIfAborted();
-
-    const searchTermsEn = buildSearchTermsFromRule(requirements, searchTermsRule);
-
-    const maxJudgeRounds = tenantRules.workflow.judge.max_rounds;
-    let judgeIssues = await this.runQualityJudge(requirements, {
-      title: titleEn,
-      bullets: bulletsLinesEn.join("\n"),
-      description: descriptionEn,
-      search_terms: searchTermsEn
-    });
-
-    for (let judgeRound = 1; judgeRound <= maxJudgeRounds && judgeIssues.length > 0; judgeRound += 1) {
-      this.throwIfAborted();
-      const grouped = this.groupJudgeIssuesBySection(judgeIssues);
-      await this.appendTrace("quality_judge_repair_round_start", "warn", {
-        round: judgeRound,
-        issues_count: judgeIssues.length,
-        grouped
-      });
-
-      if (grouped.title.length > 0) {
-        titleEn = await this.generateSectionWithValidation(
-          requirements,
-          titleRule,
-          `title_judge_repair_round_${judgeRound}`,
-          (content) => validateSectionContent(content, requirements, titleRule),
-          {
-            initialFeedback: this.buildJudgeFeedbackText(grouped.title),
-            maxRetries: 2
-          }
-        );
-      }
-
-      if (grouped.bullets.length > 0) {
-        bulletsRaw = await this.generateSectionWithValidation(
-          requirements,
-          bulletsRule,
-          `bullets_judge_repair_round_${judgeRound}`,
-          (content) => validateSectionContent(content, requirements, bulletsRule),
-          {
-            initialFeedback: this.buildJudgeFeedbackText(grouped.bullets),
-            maxRetries: 2,
-            jsonOutput: true,
-            writerModelSettings: bulletsJSONModeSettings,
-            repairModelSettings: bulletsJSONModeSettings,
-            adaptContent: (raw) => adaptJSONArrayContent(raw, bulletsJSONArrayField)
-          }
-        );
-        bulletsLinesEn = splitLines(bulletsRaw);
-      }
-
-      if (grouped.description.length > 0) {
-        descriptionEn = await this.generateSectionWithValidation(
-          requirements,
-          descriptionRule,
-          `description_judge_repair_round_${judgeRound}`,
-          (content) => validateSectionContent(content, requirements, descriptionRule),
-          {
-            initialFeedback: this.buildJudgeFeedbackText(grouped.description),
-            maxRetries: 2
-          }
-        );
-      }
-
-      judgeIssues = await this.runQualityJudge(requirements, {
-        title: titleEn,
-        bullets: bulletsLinesEn.join("\n"),
-        description: descriptionEn,
-        search_terms: searchTermsEn
-      });
-    }
-    this.throwIfAborted();
-
-    const titleCnPromise = this.translateText(titleEn, "translate_title", translationRetries);
-    const bulletsCnPromise = this.translateText(bulletsLinesEn.join("\n"), "translate_bullets", translationRetries).then(
-      stripMarkdownBold
-    );
-    const descriptionCnPromise = this.translateText(descriptionEn, "translate_description", translationRetries).then(
-      stripMarkdownBold
-    );
-    const searchTermsCnPromise = this.translateText(searchTermsEn, "translate_search_terms", translationRetries);
-
-    const categoryCn = await promiseValue(categoryTranslationPromise, "分类翻译");
-    this.throwIfAborted();
-    const keywordsCnRaw = await promiseValue(keywordsTranslationPromise, "关键词翻译");
-    const titleCn = await promiseValue(titleCnPromise, "标题翻译");
-    const bulletsCnRaw = await promiseValue(bulletsCnPromise, "五点翻译");
-    const descriptionCn = await promiseValue(descriptionCnPromise, "描述翻译");
-    const searchTermsCn = await promiseValue(searchTermsCnPromise, "搜索词翻译");
-    this.throwIfAborted();
-
-    const keywordsCn = splitLines(keywordsCnRaw);
-    const bulletsCn = splitLines(bulletsCnRaw);
-
-    const keywordsCnFinal = keywordsCn.length > 0 ? keywordsCn : requirements.keywords;
-    const bulletsCnFinal = bulletsCn.length > 0 ? bulletsCn : bulletsLinesEn;
-
-    const vars = {
-      brand: requirements.brand,
-      category_en: requirements.category,
-      category_cn: normalizeText(categoryCn),
-      keywords_en: renderList(requirements.keywords, tenantRules.workflow.render.keywords_item_template),
-      keywords_cn: renderList(keywordsCnFinal, tenantRules.workflow.render.keywords_item_template),
-      title_en: normalizeText(titleEn),
-      title_cn: normalizeText(titleCn),
-      bullets_en: renderList(
-        bulletsLinesEn,
-        tenantRules.workflow.render.bullets_item_template,
-        tenantRules.workflow.render.bullets_separator
-      ),
-      bullets_cn: renderList(
-        bulletsCnFinal,
-        tenantRules.workflow.render.bullets_item_template,
-        tenantRules.workflow.render.bullets_separator
-      ),
-      description_en: normalizeText(descriptionEn),
-      description_cn: normalizeText(descriptionCn),
-      search_terms_en: normalizeText(searchTermsEn),
-      search_terms_cn: normalizeText(searchTermsCn)
-    };
-
-    const enMarkdown = replaceTopHeading(renderByVars(tenantRules.templates.en, vars), inputFilename);
-    const cnMarkdown = replaceTopHeading(renderByVars(tenantRules.templates.cn, vars), inputFilename);
 
     this.logger.info(
       {
@@ -2176,26 +2215,26 @@ export class GenerationService {
         job_id: input.jobId,
         rules_version: input.rulesVersion,
         timing_ms: Date.now() - start,
-        en_chars: enMarkdown.length,
-        cn_chars: cnMarkdown.length
+        en_chars: workflowOutput.enMarkdown.length,
+        cn_chars: workflowOutput.cnMarkdown.length
       },
       "generation ok"
     );
     await this.appendTrace("generation_ok", "info", {
       rules_version: input.rulesVersion,
       timing_ms: Date.now() - start,
-      en_chars: enMarkdown.length,
-      cn_chars: cnMarkdown.length
+      en_chars: workflowOutput.enMarkdown.length,
+      cn_chars: workflowOutput.cnMarkdown.length
     });
 
     return {
-      en_markdown: enMarkdown,
-      cn_markdown: cnMarkdown,
+      en_markdown: workflowOutput.enMarkdown,
+      cn_markdown: workflowOutput.cnMarkdown,
       validation_report: [
         `rules_version=${input.rulesVersion}`,
         `keywords_count=${requirements.keywords.length}`,
-        `bullets_count=${bulletsLinesEn.length}`,
-        `judge_issues_count=${judgeIssues.length}`
+        `bullets_count=${workflowOutput.bulletsCount}`,
+        `judge_issues_count=${workflowOutput.judgeIssuesCount}`
       ],
       timing_ms: Date.now() - start,
       billing_summary: {
