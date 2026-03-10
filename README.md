@@ -51,41 +51,13 @@ cp .env.example .env
 - `ADMIN_TOKEN`：规则发布鉴权口令
 - `DEEPSEEK_API_KEY`
 
-4. 启动：
+4. 远端部署统一使用 `syl-listing-pro-x`：
 
 ```bash
-bash scripts/deploy.sh
+syl-listing-pro-x worker deploy --server syl-server
 ```
 
-说明：部署脚本会自动从 `worker.config.json` 生成 `.compose.env`，并用于 `docker compose` 变量替换（`DOMAIN`、`LETSENCRYPT_EMAIL`）。
-
-从本地直接远程部署（推荐，内置主机指纹自动修复）：
-
-```bash
-bash scripts/deploy.sh \
-  --remote-host 43.135.112.167 \
-  --remote-user ubuntu \
-  --install-docker
-```
-
-部署脚本默认会等待 HTTPS 就绪（证书签发后自动切换 nginx 到 443）。
-可选：`--skip-wait-https`、`--https-timeout`、`--https-interval`。
-
-## Makefile 服务器清单
-
-`Makefile` 内置服务器别名，可直接使用：
-
-```bash
-make servers
-```
-
-默认别名：
-
-- `SERVER=syl-server`
-- `REMOTE_HOST=43.135.112.167`
-- `REMOTE_USER=ubuntu`
-- `REMOTE_PORT=22`
-- `REMOTE_DIR=/opt/syl-listing-worker`
+说明：`syl-listing-pro-x` 会自动从 `worker.config.json` 生成 `.compose.env`，并用于 `docker compose` 变量替换（`DOMAIN`、`LETSENCRYPT_EMAIL`）。
 
 ## 部署后验证
 
@@ -98,20 +70,14 @@ docker compose --env-file .compose.env ps
 服务器内诊断（推荐）：
 
 ```bash
-make diagnose
+syl-listing-pro-x worker diagnose --server syl-server
 ```
 
 外部诊断（从任意机器发起）：
 
 ```bash
-make diagnose-external BASE_URL=https://worker.aelus.tech SYL_KEY=<SYL_LISTING_KEY>
-# 可选: TIMEOUT=300 INTERVAL=2
-# 本机调试可加: RESOLVE=worker.aelus.tech:443:127.0.0.1
-# 需要额外检查生成链路时加: DIAGNOSE_EXTERNAL_OPTS="--with-generate"
+syl-listing-pro-x worker diagnose-external --key <SYL_LISTING_KEY>
 ```
-
-说明：外部诊断默认不发起 `generate`；只检查健康、鉴权、规则接口。  
-如需附加检查生成链路，增加 `--with-generate`。
 
 说明：`/healthz` 会校验 `DEEPSEEK_API_KEY` 有效性（带缓存）。  
 若切换 `generation.provider=fluxcode`，同时会校验 `FLUXCODE_API_KEY`。
@@ -157,7 +123,7 @@ curl -sS 'https://worker.aelus.tech/v1/admin/logs/trace/<job_id>' \
 
 ## 运维命令
 
-启动/重启：
+本地容器启动/重启：
 
 ```bash
 make docker-up
@@ -177,31 +143,14 @@ make docker-logs
 docker compose --env-file .compose.env logs -f --tail=200 worker-api worker-runner nginx certbot
 ```
 
-升级发布（代码更新后）：
+远端运维统一使用 `syl-listing-pro-x`：
 
 ```bash
-git pull
-bash scripts/deploy.sh
-```
-
-下发 `.env` 到远端并重启 worker（默认走 `syl-server`）：
-
-```bash
-make push-env
-```
-
-说明：`make push-env` 在下发 `.env` 后会自动重建并重启 `worker-api`、`worker-runner`，确保新环境变量生效。
-
-按别名下发：
-
-```bash
-make push-env SERVER=syl-server
-```
-
-远端完整部署（按别名）：
-
-```bash
-make deploy-remote SERVER=syl-server
+syl-listing-pro-x worker deploy --server syl-server
+syl-listing-pro-x worker push-env --server syl-server
+syl-listing-pro-x worker diagnose --server syl-server
+syl-listing-pro-x worker diagnose-external --key <SYL_LISTING_KEY>
+syl-listing-pro-x worker logs --server syl-server --service worker-api --tail 50 --since 10m
 ```
 
 ## 常见故障
@@ -214,8 +163,6 @@ make deploy-remote SERVER=syl-server
   - 检查 `443` 端口放通。
 - `docker compose` 不存在：
   - 安装 `docker-compose-v2`，使用 `docker compose` 命令。
-- 服务器重装后 SSH 指纹变化：
-  - 使用 `scripts/deploy.sh --remote-host ...`，脚本会自动修复 `known_hosts`。
 
 ## 关键接口
 
