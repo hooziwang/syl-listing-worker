@@ -5,6 +5,14 @@
 这个仓库不再提供本地容器开发/调试入口。  
 所有运行验证、部署、诊断、日志查看，统一通过 `syl-listing-pro-x` 在远端 `syl-server` 上执行。
 
+本 README 维护 `worker` 仓自身的服务边界、配置模型、运行架构与 API 接口。
+
+跨仓内容分工：
+
+- 规则契约见 `rules/README.md`
+- 远端运维与 `e2e` 验证入口见 `syl-listing-pro-x/README.md`
+- 终端 CLI 使用入口见 `cli/README.md`
+
 ## 用途边界
 
 - 本仓库负责：
@@ -165,6 +173,11 @@ nodes:
 - `GET /v1/jobs/:jobId/result`
 - `GET /v1/admin/version`
 - `GET /v1/admin/logs/trace/:jobId`
+
+工程侧验证说明：
+
+- `release-gate` 继续验证真实规则发布与生成链路。
+- `architecture-gate` 负责把私钥来源、worker 地址透传、artifact 完整性等工程治理改动纳入验收。
 
 ### `GET /v1/admin/version`
 
