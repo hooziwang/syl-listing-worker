@@ -601,16 +601,20 @@ function uniqueSorted(values: number[]): number[] {
   return [...new Set(values)].sort((a, b) => a - b);
 }
 
-function buildSearchTermsFromRule(requirements: ListingRequirements, rule: SectionRule): string {
+export function buildSearchTermsFromRule(requirements: ListingRequirements, rule: SectionRule): string {
   const source = typeof rule.constraints.source === "string" ? rule.constraints.source : "keywords_copy";
   if (source !== "keywords_copy") {
     throw new Error(`search_terms 暂不支持 source=${source}`);
   }
   const dedupe = rule.constraints.dedupe !== false;
+  const lowercase = rule.constraints.lowercase === true;
   const separator = typeof rule.constraints.separator === "string" && rule.constraints.separator !== ""
     ? rule.constraints.separator
     : " ";
-  const values = dedupe ? dedupeKeepOrder(requirements.keywords) : requirements.keywords.map((v) => normalizeLine(v)).filter(Boolean);
+  let values = dedupe ? dedupeKeepOrder(requirements.keywords) : requirements.keywords.map((v) => normalizeLine(v)).filter(Boolean);
+  if (lowercase) {
+    values = values.map((v) => v.toLowerCase());
+  }
   return values.join(separator);
 }
 
