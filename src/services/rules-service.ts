@@ -123,6 +123,30 @@ export class RulesService {
     };
   }
 
+  async listCurrentVersions(): Promise<Record<string, string>> {
+    const out: Record<string, string> = {};
+    const stream = this.redis.scanStream({
+      match: `${CURRENT_KEY_PREFIX}*`,
+      count: 100
+    });
+
+    for await (const keys of stream as AsyncIterable<string[]>) {
+      for (const key of keys) {
+        const tenantId = key.slice(CURRENT_KEY_PREFIX.length).trim();
+        if (!tenantId) {
+          continue;
+        }
+        const version = ((await this.redis.get(key)) || "").trim();
+        if (!version) {
+          continue;
+        }
+        out[tenantId] = version;
+      }
+    }
+
+    return Object.fromEntries(Object.entries(out).sort(([a], [b]) => a.localeCompare(b)));
+  }
+
   async publish(input: PublishRulesInput): Promise<void> {
     const signatureBase64 = (input.signature_base64 || "").trim();
     const signatureAlgo = (input.signature_algo || "").trim();

@@ -207,6 +207,20 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
   app.register(async (adminApp) => {
     adminApp.addHook("preHandler", requireAdmin(ctx));
 
+    adminApp.get("/v1/admin/version", async (_request, reply) => {
+      const version = await ctx.versionService.read();
+      const rulesVersions = await ctx.rulesService.listCurrentVersions();
+      reply.header("x-tenant-id", "admin");
+      return withTenant("admin", {
+        ok: true,
+        service: version.service,
+        git_commit: version.git_commit,
+        build_time: version.build_time,
+        deployed_at: version.deployed_at,
+        rules_versions: rulesVersions
+      });
+    });
+
     adminApp.post("/v1/admin/tenant-rules/publish", async (request, reply) => {
       const body = publishSchema.parse(request.body);
       try {

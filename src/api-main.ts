@@ -6,6 +6,7 @@ import { createJobQueue } from "./queue/jobs.js";
 import { createRedisConnection } from "./queue/redis.js";
 import { LLMHealthService } from "./services/llm-health.js";
 import { RulesService } from "./services/rules-service.js";
+import { VersionService } from "./services/version-service.js";
 import { RedisJobStore } from "./store/job-store.js";
 import { RedisTraceStore } from "./store/trace-store.js";
 
@@ -16,6 +17,7 @@ const redis = createRedisConnection(env.redisUrl);
 const authService = new AuthService(env.sylListingKeys, env.jwtSecret, env.jwtExpiresSeconds);
 const llmHealthService = new LLMHealthService(env, logger);
 const rulesService = new RulesService(redis, env.rulesFsDir, env.apiPublicBaseUrl);
+const versionService = new VersionService();
 const jobStore = new RedisJobStore(redis, env.jobTtlSeconds);
 const traceStore = new RedisTraceStore(redis, env.jobTtlSeconds);
 const queue = createJobQueue(env.queueName, redis);
@@ -33,6 +35,7 @@ const app = await buildApiServer({
   authService,
   llmHealthService,
   rulesService,
+  versionService,
   jobStore,
   traceStore,
   queue

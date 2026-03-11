@@ -163,4 +163,34 @@ nodes:
 - `POST /v1/generate`
 - `GET /v1/jobs/:jobId`
 - `GET /v1/jobs/:jobId/result`
+- `GET /v1/admin/version`
 - `GET /v1/admin/logs/trace/:jobId`
+
+### `GET /v1/admin/version`
+
+用途：
+
+- 仅供工程侧检查远端 worker 部署版本
+- 必须使用 `Authorization: Bearer <ADMIN_TOKEN>`
+
+返回示例：
+
+```json
+{
+  "ok": true,
+  "tenant_id": "admin",
+  "service": "syl-listing-worker",
+  "git_commit": "e4dae0b",
+  "build_time": "2026-03-11T04:59:31Z",
+  "deployed_at": "2026-03-11T04:59:31Z",
+  "rules_versions": {
+    "demo": "tenant-demo-v2-20260227-4",
+    "syl": "rules-syl-20260311-034844-nj98ic"
+  }
+}
+```
+
+说明：
+
+- `git_commit` 用于判断远端 worker 是否已部署为本地最新代码
+- `rules_versions` 返回服务器上所有租户当前激活的规则版本映射

@@ -21,6 +21,7 @@ services:
       - redis
     volumes:
       - ./data/rules:/data/syl-listing/rules
+      - ./data/runtime:/data/syl-listing/runtime
 
   worker-runner:
     image: syl-listing-worker:latest
@@ -34,6 +35,7 @@ services:
       - worker-api
     volumes:
       - ./data/rules:/data/syl-listing/rules
+      - ./data/runtime:/data/syl-listing/runtime
 
   nginx:
     image: nginx:1.27-alpine
