@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { extract } from "tar";
 import { parse as parseYAML } from "yaml";
-import type { WorkflowNode, WorkflowNodeType, WorkflowSpec } from "../workflow/types.js";
+import type { TenantRuntimePolicy } from "../agent-runtime/types.js";
 
 export interface SectionRule {
   section: string;
@@ -43,8 +43,7 @@ export interface InputFieldRule {
   unique_required?: boolean;
 }
 
-export interface WorkflowRules {
-  spec: WorkflowSpec;
+export interface GenerationConfig {
   planning: {
     enabled: boolean;
     retries: number;
@@ -79,9 +78,10 @@ export interface TemplateRules {
 export interface TenantRules {
   requiredSections: string[];
   input: InputRules;
-  workflow: WorkflowRules;
+  generationConfig: GenerationConfig;
   templates: TemplateRules;
   sections: Map<string, SectionRule>;
+  runtimePolicy?: TenantRuntimePolicy;
 }
 
 const cache = new Map<string, TenantRules>();
@@ -127,76 +127,6 @@ function asRecord(v: unknown): Record<string, unknown> | undefined {
   return v as Record<string, unknown>;
 }
 
-function parseWorkflowNodeType(value: unknown, path: string): WorkflowNodeType {
-  const normalized = asString(value).trim().toLowerCase();
-  switch (normalized) {
-    case "generate":
-    case "translate":
-    case "derive":
-    case "judge":
-    case "render":
-      return normalized;
-    default:
-      throw new Error(`规则缺失字段: ${path}`);
-  }
-}
-
-function parseWorkflowNodes(v: unknown, path: string): WorkflowNode[] {
-  if (!Array.isArray(v) || v.length === 0) {
-    throw new Error(`规则缺失字段: ${path}`);
-  }
-  return v.map((item, index) => {
-    const node = asRecord(item);
-    if (!node) {
-      throw new Error(`规则缺失字段: ${path}[${index}]`);
-    }
-    const parsed: WorkflowNode = {
-      id: mustString(node.id, `${path}[${index}].id`),
-      type: parseWorkflowNodeType(node.type, `${path}[${index}].type`),
-      output_to: mustString(node.output_to, `${path}[${index}].output_to`)
-    };
-    const dependsOn = asStringArray(node.depends_on);
-    if (dependsOn.length > 0) {
-      parsed.depends_on = dependsOn;
-    }
-    const section = asString(node.section).trim();
-    if (section) {
-      parsed.section = section;
-    }
-    const inputFrom = asString(node.input_from).trim();
-    if (inputFrom) {
-      parsed.input_from = inputFrom;
-    }
-    const template = asString(node.template).trim();
-    if (template) {
-      parsed.template = template;
-    }
-    const inputsNode = asRecord(node.inputs);
-    if (inputsNode) {
-      const inputs: Record<string, string> = {};
-      for (const [key, value] of Object.entries(inputsNode)) {
-        const slot = asString(value).trim();
-        if (key.trim() && slot) {
-          inputs[key.trim()] = slot;
-        }
-      }
-      if (Object.keys(inputs).length > 0) {
-        parsed.inputs = inputs;
-      }
-    }
-    const retryNode = asRecord(node.retry_policy);
-    if (retryNode) {
-      const maxAttempts = asNumber(retryNode.max_attempts, 0);
-      if (maxAttempts > 0) {
-        parsed.retry_policy = {
-          max_attempts: Math.floor(maxAttempts)
-        };
-      }
-    }
-    return parsed;
-  });
-}
-
 async function readYAML(path: string): Promise<Record<string, unknown>> {
   const raw = await readFile(path, "utf8");
   const parsed = parseYAML(raw) as unknown;
@@ -204,6 +134,115 @@ async function readYAML(path: string): Promise<Record<string, unknown>> {
     throw new Error(`规则文件格式错误: ${path}`);
   }
   return parsed as Record<string, unknown>;
+}
+
+async function readOptionalYAML(path: string): Promise<Record<string, unknown> | undefined> {
+  try {
+    return await readYAML(path);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.startsWith("读取配置文件失败")) {
+      return undefined;
+    }
+    if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
+      return undefined;
+    }
+    if (message.includes("ENOENT")) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+function parseRuntimePolicy(doc: Record<string, unknown> | undefined): TenantRuntimePolicy | undefined {
+  if (!doc) {
+    return undefined;
+  }
+  const engine = asString(doc.engine).trim().toLowerCase();
+  if (engine && engine !== "runtime") {
+    throw new Error("runtime_policy.engine 只支持 runtime");
+  }
+  const intentNode = asRecord(doc.intent);
+  const parallelismNode = asRecord(doc.parallelism);
+  const qualityNode = asRecord(doc.quality);
+  const specialists = Array.isArray(doc.specialists)
+    ? doc.specialists
+        .map((item) => asRecord(item))
+        .filter((item): item is Record<string, unknown> => !!item)
+        .map((item) => ({
+          blueprint: mustString(item.blueprint, "runtime_policy.specialists[].blueprint"),
+          model_profile: asString(item.model_profile).trim() || undefined
+        }))
+    : undefined;
+  const handoffs = Array.isArray(doc.handoffs)
+    ? doc.handoffs
+        .map((item) => asRecord(item))
+        .filter((item): item is Record<string, unknown> => !!item)
+        .map((item) => ({
+          from: mustString(item.from, "runtime_policy.handoffs[].from"),
+          to: mustString(item.to, "runtime_policy.handoffs[].to")
+        }))
+    : undefined;
+  const teamTemplates = Array.isArray(doc.team_templates)
+    ? doc.team_templates
+        .map((item) => asRecord(item))
+        .filter((item): item is Record<string, unknown> => !!item)
+        .map((item) => ({
+          name: mustString(item.name, "runtime_policy.team_templates[].name"),
+          reviewer_required:
+            typeof item.reviewer_required === "boolean" ? item.reviewer_required : undefined,
+          candidate_count:
+            typeof item.candidate_count === "number" && Number.isFinite(item.candidate_count)
+              ? Math.max(1, item.candidate_count)
+              : undefined,
+          writer_model_profile: asString(item.writer_model_profile).trim() || undefined,
+          reviewer_model_profile: asString(item.reviewer_model_profile).trim() || undefined,
+          repairer_model_profile: asString(item.repairer_model_profile).trim() || undefined
+        }))
+    : undefined;
+  return {
+    intent: intentNode
+      ? {
+          primary: mustString(intentNode.primary, "runtime_policy.intent.primary")
+        }
+      : undefined,
+    parallelism: parallelismNode
+      ? {
+          section_concurrency: Math.max(1, asNumber(parallelismNode.section_concurrency, 1))
+        }
+      : undefined,
+    specialists,
+    handoffs,
+    team_templates: teamTemplates,
+    quality: qualityNode
+      ? {
+          reviewer_required:
+            typeof qualityNode.reviewer_required === "boolean" ? qualityNode.reviewer_required : undefined,
+          max_review_rounds:
+            typeof qualityNode.max_review_rounds === "number" && Number.isFinite(qualityNode.max_review_rounds)
+              ? Math.max(0, qualityNode.max_review_rounds)
+              : undefined
+        }
+      : undefined,
+    section_overrides: Array.isArray(doc.section_overrides)
+      ? doc.section_overrides
+          .map((item) => asRecord(item))
+          .filter((item): item is Record<string, unknown> => !!item)
+          .map((item) => ({
+            section: mustString(item.section, "runtime_policy.section_overrides[].section"),
+            team_template: asString(item.team_template).trim() || undefined,
+            reviewer_required:
+              typeof item.reviewer_required === "boolean" ? item.reviewer_required : undefined,
+            candidate_count:
+              typeof item.candidate_count === "number" && Number.isFinite(item.candidate_count)
+                ? Math.max(1, item.candidate_count)
+                : undefined,
+            writer_model_profile: asString(item.writer_model_profile).trim() || undefined,
+            reviewer_model_profile: asString(item.reviewer_model_profile).trim() || undefined,
+            repairer_model_profile: asString(item.repairer_model_profile).trim() || undefined
+          }))
+      : undefined
+  };
 }
 
 export async function loadTenantRules(
@@ -224,10 +263,11 @@ export async function loadTenantRules(
     gzip: true
   });
 
+  const runtimePolicyDoc = await readOptionalYAML(join(workdir, "tenant", "runtime-policy.yaml"));
   const rulesDir = join(workdir, "tenant", "rules");
   const packageDoc = await readYAML(join(rulesDir, "package.yaml"));
   const inputDoc = await readYAML(join(rulesDir, "input.yaml"));
-  const workflowDoc = await readYAML(join(rulesDir, "workflow.yaml"));
+  const generationConfigDoc = await readYAML(join(rulesDir, "generation-config.yaml"));
 
   const requiredSections = asStringArray(packageDoc.required_sections, [
     "title",
@@ -283,42 +323,42 @@ export async function loadTenantRules(
     })()
   };
 
-  const planningNode = (workflowDoc.planning as Record<string, unknown> | undefined) ?? {};
-  const judgeNode = (workflowDoc.judge as Record<string, unknown> | undefined) ?? {};
-  const translationNode = (workflowDoc.translation as Record<string, unknown> | undefined) ?? {};
-  const renderNode = (workflowDoc.render as Record<string, unknown> | undefined) ?? {};
-  const workflowNodes = parseWorkflowNodes(workflowDoc.nodes, "workflow.nodes");
-
-  const workflow: WorkflowRules = {
-    spec: {
-      version: Math.max(1, asNumber(workflowDoc.version, 1)),
-      nodes: workflowNodes
-    },
+  const planningNode = (generationConfigDoc.planning as Record<string, unknown> | undefined) ?? {};
+  const judgeNode = (generationConfigDoc.judge as Record<string, unknown> | undefined) ?? {};
+  const translationNode = (generationConfigDoc.translation as Record<string, unknown> | undefined) ?? {};
+  const renderNode = (generationConfigDoc.render as Record<string, unknown> | undefined) ?? {};
+  const generationConfig: GenerationConfig = {
     planning: {
       enabled: planningNode.enabled !== false,
       retries: Math.max(1, asNumber(planningNode.retries, 2)),
-      system_prompt: mustString(planningNode.system_prompt, "workflow.planning.system_prompt"),
-      user_prompt: mustString(planningNode.user_prompt, "workflow.planning.user_prompt")
+      system_prompt: mustString(planningNode.system_prompt, "generation_config.planning.system_prompt"),
+      user_prompt: mustString(planningNode.user_prompt, "generation_config.planning.user_prompt")
     },
     judge: {
       enabled: judgeNode.enabled !== false,
       max_rounds: Math.max(0, asNumber(judgeNode.max_rounds, 2)),
       retries: Math.max(1, asNumber(judgeNode.retries, 2)),
-      system_prompt: mustString(judgeNode.system_prompt, "workflow.judge.system_prompt"),
-      user_prompt: mustString(judgeNode.user_prompt, "workflow.judge.user_prompt"),
-      ignore_messages: mustStringArray(judgeNode.ignore_messages, "workflow.judge.ignore_messages"),
-      skip_sections: mustStringArray(judgeNode.skip_sections, "workflow.judge.skip_sections")
+      system_prompt: mustString(judgeNode.system_prompt, "generation_config.judge.system_prompt"),
+      user_prompt: mustString(judgeNode.user_prompt, "generation_config.judge.user_prompt"),
+      ignore_messages: mustStringArray(judgeNode.ignore_messages, "generation_config.judge.ignore_messages"),
+      skip_sections: mustStringArray(judgeNode.skip_sections, "generation_config.judge.skip_sections")
     },
     translation: {
-      system_prompt: mustString(translationNode.system_prompt, "workflow.translation.system_prompt")
+      system_prompt: mustString(translationNode.system_prompt, "generation_config.translation.system_prompt")
     },
     render: {
-      keywords_item_template: mustString(renderNode.keywords_item_template, "workflow.render.keywords_item_template"),
-      bullets_item_template: mustString(renderNode.bullets_item_template, "workflow.render.bullets_item_template"),
+      keywords_item_template: mustString(
+        renderNode.keywords_item_template,
+        "generation_config.render.keywords_item_template"
+      ),
+      bullets_item_template: mustString(
+        renderNode.bullets_item_template,
+        "generation_config.render.bullets_item_template"
+      ),
       bullets_separator: asString(renderNode.bullets_separator, "\n")
     },
     display_labels: (() => {
-      const node = (workflowDoc.display_labels as Record<string, unknown> | undefined) ?? {};
+      const node = (generationConfigDoc.display_labels as Record<string, unknown> | undefined) ?? {};
       const out: Record<string, string> = {};
       for (const [k, v] of Object.entries(node)) {
         const key = String(k).trim();
@@ -389,9 +429,10 @@ export async function loadTenantRules(
   const parsed: TenantRules = {
     requiredSections,
     input,
-    workflow,
+    generationConfig,
     templates,
-    sections
+    sections,
+    runtimePolicy: parseRuntimePolicy(runtimePolicyDoc)
   };
   cache.set(key, parsed);
   return parsed;

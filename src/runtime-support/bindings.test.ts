@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { ExecutionContext } from "./execution-context.js";
 import { buildRenderVariables, collectNodeSectionSlots, parseJudgeIssues } from "./bindings.js";
 import type { InputFieldRule, SectionRule } from "../services/rules-loader.js";
-import type { WorkflowNode } from "./types.js";
+import type { GenerationNode } from "./types.js";
 
 function makeSectionRule(
   section: string,
@@ -29,8 +29,8 @@ test("collectNodeSectionSlots prefers node.inputs bindings", () => {
     title_en: "Title A",
     bullets_en: "Line 1\nLine 2"
   });
-  const node: WorkflowNode = {
-    id: "quality_judge_round_1",
+  const node: GenerationNode = {
+    id: "review_round_1",
     type: "judge",
     output_to: "judge_report_round_1",
     inputs: {
@@ -54,7 +54,7 @@ test("buildRenderVariables formats list fields and line-based sections from bind
     bullets_en: "用途广泛：A。\n材质耐用：B。",
     title_en: "Paper Lanterns"
   });
-  const node: WorkflowNode = {
+  const node: GenerationNode = {
     id: "render_en",
     type: "render",
     template: "en",

@@ -10,7 +10,6 @@ const secretSchema = z.object({
   JWT_SECRET: z.string().min(16, "JWT_SECRET 太短，至少 16 位"),
   SYL_LISTING_KEYS: z.string().min(1, "SYL_LISTING_KEYS 不能为空"),
   ADMIN_TOKEN: z.string().min(8, "ADMIN_TOKEN 太短"),
-  FLUXCODE_API_KEY: z.string().optional(),
   DEEPSEEK_API_KEY: z.string().min(1, "DEEPSEEK_API_KEY 不能为空"),
 });
 
@@ -46,22 +45,12 @@ const fileSchema = z.object({
     })
   }),
   providers: z.object({
-    fluxcode: z.object({
-      base_url: z.string().url().default("https://flux-code.cc"),
-      responses_path: z.string().default("/v1/responses"),
-      model: z.string().default("gpt-5.3-codex"),
-      reasoning_effort: z.string().default("high"),
-      temperature: z.number().min(0).max(2).default(1.2)
-    }),
     deepseek: z.object({
       base_url: z.string().url().default("https://api.deepseek.com"),
       chat_path: z.string().default("/chat/completions"),
       model: z.string().default("deepseek-chat"),
       temperature: z.number().min(0).max(2).default(1.3)
     })
-  }),
-  generation: z.object({
-    provider: z.enum(["fluxcode", "deepseek"]).default("deepseek")
   }),
   healthcheck: z.object({
     llm: z.object({
@@ -96,18 +85,11 @@ export interface AppEnv {
   bootstrapRulesManifestSha256: string;
   bootstrapRulesSignatureBase64: string;
   bootstrapRulesSignatureAlgo: string;
-  fluxcodeBaseUrl: string;
-  fluxcodeResponsesPath: string;
-  fluxcodeApiKey?: string;
-  fluxcodeModel: string;
-  fluxcodeReasoningEffort: string;
-  fluxcodeTemperature: number;
   deepseekBaseUrl: string;
   deepseekChatPath: string;
   deepseekApiKey: string;
   deepseekModel: string;
   deepseekTemperature: number;
-  generationProvider: "fluxcode" | "deepseek";
   healthcheckLlmCacheSeconds: number;
   healthcheckLlmTimeoutSeconds: number;
   healthcheckLlmRetries: number;
@@ -196,18 +178,11 @@ export function loadEnv(): AppEnv {
     bootstrapRulesManifestSha256: config.rules.bootstrap.manifest_sha256,
     bootstrapRulesSignatureBase64: config.rules.bootstrap.signature_base64,
     bootstrapRulesSignatureAlgo: config.rules.bootstrap.signature_algo,
-    fluxcodeBaseUrl: config.providers.fluxcode.base_url,
-    fluxcodeResponsesPath: config.providers.fluxcode.responses_path,
-    fluxcodeApiKey: secrets.FLUXCODE_API_KEY?.trim() || undefined,
-    fluxcodeModel: config.providers.fluxcode.model,
-    fluxcodeReasoningEffort: config.providers.fluxcode.reasoning_effort,
-    fluxcodeTemperature: config.providers.fluxcode.temperature,
     deepseekBaseUrl: config.providers.deepseek.base_url,
     deepseekChatPath: config.providers.deepseek.chat_path,
     deepseekApiKey: secrets.DEEPSEEK_API_KEY,
     deepseekModel: config.providers.deepseek.model,
     deepseekTemperature: config.providers.deepseek.temperature,
-    generationProvider: config.generation.provider,
     healthcheckLlmCacheSeconds: config.healthcheck.llm.cache_seconds,
     healthcheckLlmTimeoutSeconds: config.healthcheck.llm.timeout_seconds,
     healthcheckLlmRetries: config.healthcheck.llm.retries,

@@ -1,7 +1,11 @@
-import { Agent, OpenAIProvider, Runner, type ModelSettings } from "@openai/agents";
+import { Agent, MemorySession, OpenAIProvider, Runner, tool, type ModelSettings } from "@openai/agents";
 import type { Logger } from "pino";
+import { z } from "zod";
+import { buildSectionAgentTeam } from "../agent-runtime/section-team.js";
+import type { ModelProfile } from "../agent-runtime/types.js";
 import type { AppEnv } from "../config/env.js";
 import type { RedisTraceStore } from "../store/trace-store.js";
+import { resolveLLMRuntime } from "./llm-runtime.js";
 import { withRetry } from "../utils/retry.js";
 
 const llmRequestTimeoutMs = 90_000;
@@ -17,60 +21,6 @@ function safeSnippet(input: string, max = 600): string {
   return `${s.slice(0, max)}...<truncated>`;
 }
 
-function joinUrl(baseUrl: string, path: string): string {
-  const b = baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
-  const p = path.startsWith("/") ? path : `/${path}`;
-  return `${b}${p}`;
-}
-
-function normalizePath(path: string): string {
-  const trimmed = path.trim();
-  if (trimmed === "") {
-    return "";
-  }
-  const withSlash = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
-  return withSlash.replace(/\/+$/g, "");
-}
-
-function resolveProviderBaseURL(baseUrl: string, endpointPath: string, endpointSuffix: string): string {
-  const base = baseUrl.replace(/\/+$/g, "");
-  const endpoint = normalizePath(endpointPath);
-  const suffix = normalizePath(endpointSuffix);
-
-  if (!endpoint || endpoint === suffix) {
-    return base;
-  }
-  if (!endpoint.endsWith(suffix)) {
-    return base;
-  }
-
-  const prefix = endpoint.slice(0, endpoint.length - suffix.length);
-  if (!prefix || prefix === "/") {
-    return base;
-  }
-  return `${base}${prefix}`;
-}
-
-type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
-
-function asReasoningEffort(v: string): ReasoningEffort | undefined {
-  const value = v.trim().toLowerCase();
-  if (value === "") {
-    return undefined;
-  }
-  switch (value) {
-    case "none":
-    case "minimal":
-    case "low":
-    case "medium":
-    case "high":
-    case "xhigh":
-      return value;
-    default:
-      return undefined;
-  }
-}
-
 function outputToText(output: unknown): string {
   if (typeof output === "string") {
     return output.trim();
@@ -81,16 +31,46 @@ function outputToText(output: unknown): string {
   return String(output).trim();
 }
 
+function buildFailedCandidatePayload(section: string, normalizedContent: string): Record<string, unknown> {
+  if (section !== "bullets") {
+    return {};
+  }
+  const lines = normalizedContent
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(0, 8)
+    .map((line) => safeSnippet(line, 220));
+  return lines.length > 0 ? { candidate_lines: lines } : {};
+}
+
 function isAbortLikeError(error: Error): boolean {
   const msg = error.message.toLowerCase();
   return msg.includes("abort");
 }
 
+function buildRetryUserPrompt(basePrompt: string, errors: string[], repairGuidance?: string): string {
+  const normalizedErrors = errors
+    .map((error) => error.replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .slice(0, 6)
+    .map((error) => `- ${error}`);
+  const normalizedGuidance = typeof repairGuidance === "string" ? repairGuidance.trim() : "";
+  if (normalizedErrors.length === 0 && !normalizedGuidance) {
+    return basePrompt;
+  }
+  return [
+    basePrompt,
+    "",
+    "上轮校验失败，必须先修复以下问题，再提交最终内容：",
+    normalizedErrors.join("\n"),
+    normalizedGuidance ? `\n优先执行这份修复指导：\n${normalizedGuidance}` : ""
+  ].join("\n");
+}
+
 export class LLMClient {
-  private readonly fluxRunner?: Runner;
-  private readonly deepseekRunner: Runner;
-  private readonly fluxRequestURL: string;
-  private readonly deepseekRequestURL: string;
+  private readonly generationRunner: Runner;
+  private readonly generationRequestURL: string;
 
   constructor(
     private readonly env: AppEnv,
@@ -99,33 +79,19 @@ export class LLMClient {
     private readonly traceContext?: { tenantId: string; jobId: string },
     private readonly abortSignal?: AbortSignal
   ) {
-    const fluxBaseURL = resolveProviderBaseURL(env.fluxcodeBaseUrl, env.fluxcodeResponsesPath, "/responses");
-    const deepseekBaseURL = resolveProviderBaseURL(env.deepseekBaseUrl, env.deepseekChatPath, "/chat/completions");
-
-    if (env.fluxcodeApiKey) {
-      const fluxProvider = new OpenAIProvider({
-        apiKey: env.fluxcodeApiKey,
-        baseURL: fluxBaseURL,
-        useResponses: true
-      });
-      this.fluxRunner = new Runner({
-        modelProvider: fluxProvider,
-        tracingDisabled: true
-      });
-    }
-    const deepseekProvider = new OpenAIProvider({
+    const generationRuntime = resolveLLMRuntime(env);
+    const generationModelProvider = new OpenAIProvider({
       apiKey: env.deepseekApiKey,
-      baseURL: deepseekBaseURL,
+      baseURL: generationRuntime.baseURL,
       useResponses: false
     });
 
-    this.deepseekRunner = new Runner({
-      modelProvider: deepseekProvider,
+    this.generationRunner = new Runner({
+      modelProvider: generationModelProvider,
       tracingDisabled: true
     });
 
-    this.fluxRequestURL = joinUrl(env.fluxcodeBaseUrl, env.fluxcodeResponsesPath);
-    this.deepseekRequestURL = joinUrl(env.deepseekBaseUrl, env.deepseekChatPath);
+    this.generationRequestURL = generationRuntime.requestURL;
   }
 
   private async appendTrace(
@@ -202,28 +168,38 @@ export class LLMClient {
     return `${normalizedRole}_${normalizedStep}`;
   }
 
-  private getGenerationProvider(): "fluxcode" | "deepseek" {
-    return this.env.generationProvider;
+  private resolveGenerationRuntime(
+    runtimeProfile?: ModelProfile,
+    modelSettingsOverride?: Partial<ModelSettings>
+  ): {
+    generationProvider: "deepseek";
+    runner: Runner;
+    model: string;
+    requestURL: string;
+    modelSettings: ModelSettings;
+  } {
+    const runtime = resolveLLMRuntime(this.env, runtimeProfile, modelSettingsOverride);
+    return {
+      generationProvider: "deepseek",
+      runner: this.generationRunner,
+      model: runtime.model,
+      requestURL: runtime.requestURL || this.generationRequestURL,
+      modelSettings: runtime.modelSettings
+    };
   }
 
-  async generateWithFluxcode(
+  async generateText(
     system: string,
     user: string,
     step: string,
     attempts: number,
-    role: "planner" | "orchestrator" | "writer" | "repair" | "judge" = "writer",
+    role: "planner" | "writer" | "repair" | "judge" = "writer",
     modelSettingsOverride?: Partial<ModelSettings>
   ): Promise<string> {
-    const generationProvider = this.getGenerationProvider();
+    const generationProvider = "deepseek";
     return withRetry(
       async (attempt) => {
-        const useFlux = generationProvider === "fluxcode";
-        const runner = useFlux ? this.fluxRunner : this.deepseekRunner;
-        const model = useFlux ? this.env.fluxcodeModel : this.env.deepseekModel;
-        const requestURL = useFlux ? this.fluxRequestURL : this.deepseekRequestURL;
-        if (!runner) {
-          throw new Error("FLUXCODE_API_KEY 未配置，无法使用 fluxcode 生成");
-        }
+        const { runner, model, requestURL, modelSettings } = this.resolveGenerationRuntime(undefined, modelSettingsOverride);
 
         await this.appendTrace("api_request", "info", {
           provider: generationProvider,
@@ -243,30 +219,6 @@ export class LLMClient {
         );
 
         const started = Date.now();
-        const baseModelSettings: ModelSettings =
-          generationProvider === "fluxcode"
-            ? { temperature: this.env.fluxcodeTemperature }
-            : { temperature: this.env.deepseekTemperature };
-        if (generationProvider === "fluxcode") {
-          const effort = asReasoningEffort(this.env.fluxcodeReasoningEffort);
-          if (effort) {
-            baseModelSettings.reasoning = { effort };
-          }
-        }
-        let modelSettings: ModelSettings = baseModelSettings;
-        if (modelSettingsOverride) {
-          modelSettings = {
-            ...baseModelSettings,
-            ...modelSettingsOverride
-          };
-          if (baseModelSettings.providerData || modelSettingsOverride.providerData) {
-            modelSettings.providerData = {
-              ...(baseModelSettings.providerData ?? {}),
-              ...(modelSettingsOverride.providerData ?? {})
-            };
-          }
-        }
-
         try {
           const agent = new Agent({
             name: this.buildAgentName(role, step),
@@ -349,45 +301,218 @@ export class LLMClient {
     );
   }
 
-  async translateWithDeepseek(system: string, user: string, step: string, attempts: number): Promise<string> {
+  async generateSectionWithAgentTeam(input: {
+    section: string;
+    step: string;
+    userPrompt: string;
+    writerInstructions: string;
+    reviewerInstructions?: string;
+    repairInstructions?: string;
+    attempts: number;
+    maxTurns?: number;
+    plannerRuntimeProfile?: ModelProfile;
+    runtimeProfile?: ModelProfile;
+    reviewerRuntimeProfile?: ModelProfile;
+    repairerRuntimeProfile?: ModelProfile;
+    modelSettingsOverride?: Partial<ModelSettings>;
+    reviewerModelSettingsOverride?: Partial<ModelSettings>;
+    repairerModelSettingsOverride?: Partial<ModelSettings>;
+    shouldRetry?: (attempt: number, error: Error) => boolean;
+    validateContent: (content: string) => {
+      ok: boolean;
+      normalizedContent: string;
+      finalOutput?: string;
+      errors: string[];
+      repairGuidance?: string;
+    };
+  }): Promise<string> {
+    const sectionValidationToolName = "check_section_candidate";
+    let retryValidationErrors: string[] = [];
+    let retryRepairGuidance = "";
+    const writerRuntime = this.resolveGenerationRuntime(input.runtimeProfile, input.modelSettingsOverride);
+    const plannerRuntime = input.plannerRuntimeProfile
+      ? this.resolveGenerationRuntime(input.plannerRuntimeProfile)
+      : writerRuntime;
+    const reviewerRuntime = input.reviewerRuntimeProfile
+      ? this.resolveGenerationRuntime(input.reviewerRuntimeProfile, input.reviewerModelSettingsOverride)
+      : undefined;
+    const repairerRuntime = input.repairerRuntimeProfile
+      ? this.resolveGenerationRuntime(input.repairerRuntimeProfile, input.repairerModelSettingsOverride)
+      : undefined;
+    const {
+      generationProvider,
+      runner,
+      model,
+      requestURL,
+      modelSettings
+    } = writerRuntime;
+    return withRetry(
+      async (attempt) => {
+        let failedCandidatePayload: Record<string, unknown> = {};
+        await this.appendTrace("agent_team_request", "info", {
+          provider: generationProvider,
+          section: input.section,
+          step: input.step,
+          attempt,
+          url: requestURL
+        });
+        const started = Date.now();
+        const validateCandidate = tool({
+          name: sectionValidationToolName,
+          description: "校验当前 section 草稿并返回规范化结果与错误列表。",
+          parameters: z.object({
+            content: z.string()
+          }),
+          execute: async ({ content }) => {
+            const validation = input.validateContent(content);
+            return JSON.stringify({
+              ok: validation.ok,
+              normalized_content: validation.normalizedContent,
+              final_output: validation.finalOutput ?? validation.normalizedContent,
+              errors: validation.errors,
+              repair_guidance: validation.repairGuidance ?? ""
+            });
+          }
+        });
+
+        const team = buildSectionAgentTeam({
+          section: input.section,
+          step: input.step,
+          validateToolName: sectionValidationToolName,
+          plannerRuntime: {
+            model: plannerRuntime.model,
+            modelSettings: plannerRuntime.modelSettings
+          },
+          writerRuntime: {
+            model,
+            modelSettings
+          },
+          reviewerRuntime: reviewerRuntime
+            ? {
+                model: reviewerRuntime.model,
+                modelSettings: reviewerRuntime.modelSettings
+              }
+            : undefined,
+          repairerRuntime: repairerRuntime
+            ? {
+                model: repairerRuntime.model,
+                modelSettings: repairerRuntime.modelSettings
+              }
+            : undefined,
+          validateTool: validateCandidate,
+          writerInstructions: input.writerInstructions,
+          reviewerInstructions: input.reviewerInstructions,
+          repairInstructions: input.repairInstructions
+        });
+
+        const session = new MemorySession();
+        try {
+          const prompt = retryValidationErrors.length > 0
+            ? buildRetryUserPrompt(input.userPrompt, retryValidationErrors, retryRepairGuidance)
+            : input.userPrompt;
+          const entryAgent = input.reviewerInstructions ? team.plannerAgent : team.writerAgent;
+          const result = await runner.run(entryAgent, prompt, {
+            maxTurns: input.maxTurns ?? 8,
+            session,
+            signal: this.abortSignal
+          });
+          const text = outputToText(result.finalOutput);
+          if (!text) {
+            throw new Error("section agent team output empty");
+          }
+          const validation = input.validateContent(text);
+          if (!validation.ok) {
+            retryValidationErrors = validation.errors;
+            retryRepairGuidance = validation.repairGuidance ?? "";
+            failedCandidatePayload = buildFailedCandidatePayload(input.section, validation.normalizedContent);
+            throw new Error(`section agent team validation failed: ${validation.errors.join("; ")}`);
+          }
+          retryValidationErrors = [];
+          retryRepairGuidance = "";
+          await this.appendTrace("agent_team_ok", "info", {
+            provider: generationProvider,
+            section: input.section,
+            step: input.step,
+            attempt,
+            url: requestURL,
+            latency_ms: Date.now() - started,
+            output_chars: validation.normalizedContent.length
+          });
+          return validation.normalizedContent;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const failurePayload = {
+            provider: generationProvider,
+            section: input.section,
+            step: input.step,
+            attempt,
+            url: requestURL,
+            latency_ms: Date.now() - started,
+            error_body: safeSnippet(message),
+            ...failedCandidatePayload
+          };
+          await this.appendTrace("agent_team_candidate_failed", "warn", failurePayload);
+          this.logger.warn(
+            { event: "agent_team_candidate_failed", ...failurePayload },
+            "agent team candidate failed"
+          );
+          throw error;
+        }
+      },
+      {
+        attempts: input.attempts,
+        baseMs: this.env.retryBaseMs,
+        maxMs: this.env.retryMaxMs,
+        jitter: this.env.retryJitter,
+        shouldRetry: (attempt, error) =>
+          !isAbortLikeError(error) &&
+          (input.shouldRetry ? input.shouldRetry(attempt, error) : true)
+      }
+    );
+  }
+
+  async translateText(
+    system: string,
+    user: string,
+    step: string,
+    attempts: number,
+    runtimeProfile?: ModelProfile
+  ): Promise<string> {
+    const { generationProvider, runner, model, requestURL, modelSettings } = this.resolveGenerationRuntime(runtimeProfile);
     return withRetry(
       async (attempt) => {
         await this.appendTrace("api_request", "info", {
-          provider: "deepseek",
+          provider: generationProvider,
           step,
           attempt,
-          url: this.deepseekRequestURL
+          url: requestURL
         });
         this.logger.info(
           {
             event: "api_request",
-            provider: "deepseek",
+            provider: generationProvider,
             step,
             attempt,
-            url: this.deepseekRequestURL
+            url: requestURL
           },
           "api request"
         );
         const started = Date.now();
 
-        const modelSettings: ModelSettings = {
-          temperature: this.env.deepseekTemperature
-        };
-
         try {
           const agent = new Agent({
             name: this.buildAgentName("translator", step),
             instructions: system,
-            model: this.env.deepseekModel,
+            model,
             modelSettings
           });
-          const text = await this.runAgentText(this.deepseekRunner, agent, user);
+          const text = await this.runAgentText(runner, agent, user);
           const latencyMs = Date.now() - started;
           await this.appendTrace("api_ok", "info", {
-            provider: "deepseek",
+            provider: generationProvider,
             step,
             attempt,
-            url: this.deepseekRequestURL,
+            url: requestURL,
             status_code: 200,
             latency_ms: latencyMs,
             output_chars: text.length
@@ -395,10 +520,10 @@ export class LLMClient {
           this.logger.info(
             {
               event: "api_ok",
-              provider: "deepseek",
+              provider: generationProvider,
               step,
               attempt,
-              url: this.deepseekRequestURL,
+              url: requestURL,
               status_code: 200,
               latency_ms: latencyMs,
               output_chars: text.length
@@ -410,20 +535,20 @@ export class LLMClient {
           const latencyMs = Date.now() - started;
           const message = error instanceof Error ? error.message : String(error);
           await this.appendTrace("api_failed", "error", {
-            provider: "deepseek",
+            provider: generationProvider,
             step,
             attempt,
-            url: this.deepseekRequestURL,
+            url: requestURL,
             latency_ms: latencyMs,
             error_body: safeSnippet(message)
           });
           this.logger.error(
             {
               event: "api_failed",
-              provider: "deepseek",
+              provider: generationProvider,
               step,
               attempt,
-              url: this.deepseekRequestURL,
+              url: requestURL,
               latency_ms: latencyMs,
               error_body: safeSnippet(message)
             },
@@ -440,14 +565,14 @@ export class LLMClient {
         shouldRetry: (_attempt, error) => !isAbortLikeError(error),
         onRetry: (attempt, error, waitMs) => {
           void this.appendTrace("api_retry", "warn", {
-            provider: "deepseek",
+            provider: generationProvider,
             step,
             attempt,
             wait_ms: waitMs,
             error: error.message
           });
           this.logger.warn(
-            { event: "api_retry", provider: "deepseek", step, attempt, wait_ms: waitMs, error: error.message },
+            { event: "api_retry", provider: generationProvider, step, attempt, wait_ms: waitMs, error: error.message },
             "api retry"
           );
         }
@@ -462,17 +587,17 @@ export class LLMClient {
     attempts: number,
     modelSettingsOverride?: Partial<ModelSettings>
   ): Promise<string> {
-    return this.generateWithFluxcode(system, user, step, attempts, "planner", modelSettingsOverride);
+    return this.generateText(system, user, step, attempts, "planner", modelSettingsOverride);
   }
 
-  async orchestrateWithOrchestratorAgent(
+  async runtimePlanWithPlannerAgent(
     system: string,
     user: string,
     step: string,
     attempts: number,
     modelSettingsOverride?: Partial<ModelSettings>
   ): Promise<string> {
-    return this.generateWithFluxcode(system, user, step, attempts, "orchestrator", modelSettingsOverride);
+    return this.generateText(system, user, step, attempts, "planner", modelSettingsOverride);
   }
 
   async writeWithWriterAgent(
@@ -482,7 +607,7 @@ export class LLMClient {
     attempts: number,
     modelSettingsOverride?: Partial<ModelSettings>
   ): Promise<string> {
-    return this.generateWithFluxcode(system, user, step, attempts, "writer", modelSettingsOverride);
+    return this.generateText(system, user, step, attempts, "writer", modelSettingsOverride);
   }
 
   async repairWithRepairAgent(
@@ -492,7 +617,7 @@ export class LLMClient {
     attempts: number,
     modelSettingsOverride?: Partial<ModelSettings>
   ): Promise<string> {
-    return this.generateWithFluxcode(system, user, step, attempts, "repair", modelSettingsOverride);
+    return this.generateText(system, user, step, attempts, "repair", modelSettingsOverride);
   }
 
   async reviewWithJudgeAgent(
@@ -502,10 +627,16 @@ export class LLMClient {
     attempts: number,
     modelSettingsOverride?: Partial<ModelSettings>
   ): Promise<string> {
-    return this.generateWithFluxcode(system, user, step, attempts, "judge", modelSettingsOverride);
+    return this.generateText(system, user, step, attempts, "judge", modelSettingsOverride);
   }
 
-  async translateWithTranslatorAgent(system: string, user: string, step: string, attempts: number): Promise<string> {
-    return this.translateWithDeepseek(system, user, step, attempts);
+  async translateWithTranslatorAgent(
+    system: string,
+    user: string,
+    step: string,
+    attempts: number,
+    runtimeProfile?: ModelProfile
+  ): Promise<string> {
+    return this.translateText(system, user, step, attempts, runtimeProfile);
   }
 }

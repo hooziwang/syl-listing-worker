@@ -15,7 +15,7 @@ function createContext() {
     },
     llmHealthService: {
       async check() {
-        return { ok: true, llm: { fluxcode: { ok: true }, deepseek: { ok: true } } };
+        return { ok: true, llm: { deepseek: { ok: true } } };
       }
     },
     rulesService: {

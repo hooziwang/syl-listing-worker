@@ -1,6 +1,6 @@
 import type { InputFieldRule, SectionRule } from "../services/rules-loader.js";
 import type { ExecutionContext } from "./execution-context.js";
-import type { WorkflowNode } from "./types.js";
+import type { GenerationNode } from "./types.js";
 
 type RenderConfig = {
   keywords_item_template: string;
@@ -77,7 +77,7 @@ function formatSlotValue(slot: string, raw: string, options: RenderVariablesOpti
   return raw;
 }
 
-export function collectNodeSectionSlots(node: WorkflowNode, ctx: ExecutionContext): Record<string, string> {
+export function collectNodeSectionSlots(node: GenerationNode, ctx: ExecutionContext): Record<string, string> {
   const bindings = node.inputs ?? {};
   const out: Record<string, string> = {};
   for (const [section, slot] of Object.entries(bindings)) {
@@ -118,7 +118,7 @@ export function parseJudgeIssues(text: string, ignoreMessages: string[], allowed
 }
 
 export function buildRenderVariables(
-  node: WorkflowNode,
+  node: GenerationNode,
   ctx: ExecutionContext,
   options: RenderVariablesOptions
 ): Record<string, string> {

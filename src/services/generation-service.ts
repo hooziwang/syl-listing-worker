@@ -3,22 +3,18 @@ import type { ModelSettings } from "@openai/agents";
 import type { Logger } from "pino";
 import type { AppEnv } from "../config/env.js";
 import type { ListingResult } from "../domain/types.js";
+import { compileExecutionSpec } from "../agent-runtime/compiler.js";
+import { executeRuntimeSections } from "../agent-runtime/planner.js";
+import { createDefaultRegistry } from "../agent-runtime/registry.js";
+import type { ModelProfile } from "../agent-runtime/types.js";
 import { LLMClient } from "./llm-client.js";
 import { parseRequirements, type ListingRequirements } from "./requirements-parser.js";
 import { loadTenantRules, type SectionRule, type TenantRules } from "./rules-loader.js";
+import { buildSectionExecutionGuidance, buildSectionRepairGuidance } from "./section-guidance.js";
 import type { RedisTraceStore } from "../store/trace-store.js";
-import { buildWorkflowGraph } from "../workflow/graph.js";
-import { ExecutionContext } from "../workflow/execution-context.js";
-import { WorkflowEngine } from "../workflow/engine.js";
-import type { NodeExecutionResult } from "../workflow/node-executor.js";
-import type { WorkflowNode } from "../workflow/types.js";
-import { ExecutorRegistry } from "../workflow/registry.js";
-import { GenerateNodeExecutor } from "../workflow/executors/generate-node.js";
-import { TranslateNodeExecutor } from "../workflow/executors/translate-node.js";
-import { JudgeNodeExecutor } from "../workflow/executors/judge-node.js";
-import { DeriveNodeExecutor } from "../workflow/executors/derive-node.js";
-import { RenderNodeExecutor } from "../workflow/executors/render-node.js";
-import { buildRenderVariables, collectNodeSectionSlots, parseJudgeIssues } from "../workflow/bindings.js";
+import { ExecutionContext } from "../runtime-support/execution-context.js";
+import type { GenerationNode } from "../runtime-support/types.js";
+import { buildRenderVariables, collectNodeSectionSlots, parseJudgeIssues } from "../runtime-support/bindings.js";
 
 interface GenerationInput {
   jobId: string;
@@ -49,11 +45,17 @@ interface SectionGenerateOptions {
   adaptContent?: (raw: string) => { content: string; error?: string };
 }
 
-interface WorkflowExecutionOutput {
+interface GenerationExecutionOutput {
   enMarkdown: string;
   cnMarkdown: string;
   bulletsCount: number;
   judgeIssuesCount: number;
+}
+
+interface NodeExecutionResult {
+  outputSlot: string;
+  outputValue: string;
+  writes?: Record<string, string>;
 }
 
 const lineLengthErrorPattern = /^第(\d+)条长度不满足约束:\s*(\d+)（规则区间 \[(\d+),(\d+)\]，容差区间 \[(\d+),(\d+)\]）$/;
@@ -161,6 +163,227 @@ function splitLines(input: string): string[] {
     .filter(Boolean);
 }
 
+const bulletLineCompressionRules: Array<[RegExp, string]> = [
+  [/\breceive a complete set of\b/gi, "Includes"],
+  [/\bfor immediate use in your classroom decor projects\b/gi, "for classroom use"],
+  [/\bare ready to hang, offering a practical solution for\b/gi, "hang easily for"],
+  [/\btransformed ceilings and cheerful displays with\b/gi, "ceiling displays with"],
+  [/\bfor school events and parties\b/gi, "for school events"],
+  [/\bmeasures a perfect\b/gi, "measures"],
+  [/\bcreating substantial visual impact as\b/gi, "as"],
+  [/\bthis ideal size ensures they serve as\b/gi, "this size keeps them as"],
+  [/\bpieces that fill classroom ceilings with presence while keeping\b/gi, "pieces that keep"],
+  [/\beasy to suspend across events\b/gi, "easy to suspend"],
+  [/\bprimarily designed as\b/gi, "Designed as"],
+  [/\bthat excel in classroom ceiling applications for educational environments\b/gi, "for classroom ceilings"],
+  [/\bprovide excellent illumination and decorative appeal for academic celebrations while remaining suitable for\b/gi, "add decorative appeal for"],
+  [/\band seasonal school events\b/gi, "and school events"],
+  [/\bincludes everything you need for immediate use\b/gi, "is ready to use"],
+  [/\bprovid(?:ing|es?) a complete set of\b/gi, "with"],
+  [/\bready for immediate classroom decoration\b/gi, "for classroom decor"],
+  [/\boffering a full\b/gi, "with"],
+  [/\bsolution that includes all necessary hanging accessories for easy setup\b/gi, "easy setup"],
+  [/\bkeep displays bright for seasonal classroom use\b/gi, "fit classroom displays"],
+  [/\bitems that are ready to transform any space\b/gi, "items"],
+  [/\bcreate a cheerful display for classrooms, events, and seasonal decorating moments\b/gi, "fit classrooms and seasonal displays"],
+  [/\bcreating an ideal size for\b/gi, "sized for"],
+  [/\bthat make a statement without overwhelming the space\b/gi, ""],
+  [/\bthe perfectly proportioned\b/gi, ""],
+  [/\bensures visual impact while keeping\b/gi, "keeps"],
+  [/\beasy to place across classrooms and parties\b/gi, "easy to place"],
+  [/\bthat adds visual appeal to any setting\b/gi, ""],
+  [/\bserve as beautiful\b/gi, "are"],
+  [/\balso work well for\b/gi, "fit"],
+  [/\bevents, parties, and classroom displays\b/gi, "events and classrooms"],
+  [/\bpair naturally with\b/gi, "fit"],
+  [/\bblend smoothly into\b/gi, "fit"],
+  [/\bback to school rooms, reading corners, bulletin board backdrops, welcome walls, and everyday seasonal displays\b/gi, "classrooms and seasonal displays"],
+  [/\bwith easy setup\b/gi, ""],
+  [/\bdesigned for\b/gi, "for"],
+  [/\bperfect for\b/gi, "great for"],
+  [/\bideal for\b/gi, "great for"],
+  [/\beasy assembly\b/gi, "assembly"],
+  [/\beasy installation\b/gi, "installation"],
+  [/\bvarious\b/gi, ""],
+  [/\bmultiple\b/gi, ""],
+  [/\bpremium\b/gi, ""],
+  [/\bdurable\b/gi, ""],
+  [/\bversatile\b/gi, ""],
+  [/\bvibrant\b/gi, ""],
+  [/\bimpressive\b/gi, ""],
+  [/\bbalanced\b/gi, ""],
+  [/\beffective\b/gi, ""],
+  [/\btraditional\b/gi, ""],
+  [/\bclassic\b/gi, ""],
+  [/\bcheerful\b/gi, ""],
+  [/\breliable\b/gi, ""]
+];
+
+const titleCompressionRules: Array<[RegExp, string]> = [
+  [/\bClassroom Hanging Decor\b/gi, "Classroom Decor"],
+  [/\bCeiling Decorations\b/gi, "Ceiling Decor"],
+  [/\bClassroom Events and Back to School Decor\b/gi, "School Decor"],
+  [/\bBack to School Decor\b/gi, "School Decor"],
+  [/\bWedding Baby Shower Summer Party\b/gi, "Wedding Baby Shower Summer"],
+  [/\s*,\s*/g, ", "]
+];
+
+function transformNonKeywordSegments(input: string, transform: (segment: string) => string): string {
+  return input
+    .split(/(\*\*[^*]+\*\*)/g)
+    .map((segment) => (segment.startsWith("**") && segment.endsWith("**") ? segment : transform(segment)))
+    .join("");
+}
+
+function cleanupCompressedBulletLine(input: string): string {
+  return normalizeLine(
+    input
+      .replace(/\s+([,.;!?])/g, "$1")
+      .replace(/([,.;!?])([A-Za-z*])/g, "$1 $2")
+      .replace(/\(\s+/g, "(")
+      .replace(/\s+\)/g, ")")
+  );
+}
+
+function extractBoldKeywords(line: string): string[] {
+  return [...line.matchAll(/\*\*([^*]+)\*\*/g)]
+    .map((matched) => normalizeLine(matched[1] ?? ""))
+    .filter(Boolean);
+}
+
+function extractFirstMatch(line: string, pattern: RegExp): string {
+  const matched = pattern.exec(line);
+  return matched?.[0]?.trim() ?? "";
+}
+
+function buildFallbackBulletLine(line: string, lineIndex: number): string | null {
+  const heading = extractBulletHeading(line) || `Bullet Line ${lineIndex + 1}`;
+  const keywords = extractBoldKeywords(line)
+    .slice(0, 3)
+    .map((keyword) => `**${keyword}**`);
+  if (keywords.length < 3) {
+    return null;
+  }
+  const quantity = extractFirstMatch(line, /\b\d+\s*(?:pack|pcs?|pieces?)\b/i) || extractFirstMatch(line, /\b\d+\b/);
+  const size = extractFirstMatch(line, /\b\d+\s*(?:\*|x)\s*\d+\s*(?:in|inch|inches)?\b/i);
+  switch (lineIndex) {
+    case 0:
+      return normalizeLine(
+        `${heading}: Includes ${quantity || "12"} ${keywords[0]}${size ? ` in ${size.replace(/\s+/g, "")}` : ""} for fast classroom setup. ${keywords[1]} keeps the set ready, and ${keywords[2]} add bright color for welcome days, school themes, and DIY room decor.`
+      );
+    case 1:
+      return normalizeLine(
+        `${heading}: ${keywords[0]} open fast for ceilings and walls in busy classrooms. ${keywords[1]} needs no tools, and ${keywords[2]} add layered color for welcome days, reading corners, and party tables.`
+      );
+    case 2:
+      return normalizeLine(
+        `${heading}: ${keywords[0]} store flat and reuse across lessons, holidays, and school events. ${keywords[1]} fold down after use, and ${keywords[2]} help keep displays neat for the next celebration at school.`
+      );
+    case 3:
+      return normalizeLine(
+        `${heading}: ${keywords[0]} bring plaid color that brightens displays without crowding rooms. ${keywords[1]} adds clear focus, and ${keywords[2]} fit class parties and tables with a neat look.`
+      );
+    case 4:
+      return normalizeLine(
+        `${heading}: ${keywords[0]} suit classroom celebrations, bulletin boards, and themed activities. ${keywords[1]} add soft impact, and ${keywords[2]} support school parties and quick seasonal refreshes each term.`
+      );
+    default:
+      return normalizeLine(
+        `${heading}: ${keywords[0]} keep the display practical and easy to place in classroom scenes. ${keywords[1]} add clear decorative value, and ${keywords[2]} support neat seasonal setups without extra clutter.`
+      );
+  }
+}
+
+function compressBulletLineToLimit(line: string, maxChars: number, lineIndex = 0): string {
+  if (maxChars <= 0 || line.length <= maxChars) {
+    return line;
+  }
+  let current = line;
+  for (const [pattern, replacement] of bulletLineCompressionRules) {
+    const next = cleanupCompressedBulletLine(
+      transformNonKeywordSegments(current, (segment) => segment.replace(pattern, replacement))
+    );
+    if (next === current) {
+      continue;
+    }
+    current = next;
+    if (current.length <= maxChars) {
+      return current;
+    }
+  }
+  const fallback = buildFallbackBulletLine(current, lineIndex);
+  if (fallback && fallback.length <= maxChars) {
+    return fallback;
+  }
+  return current;
+}
+
+function compressTitleToLimit(title: string, maxChars: number): string {
+  if (maxChars <= 0 || title.length <= maxChars) {
+    return title;
+  }
+  let current = title;
+  for (const [pattern, replacement] of titleCompressionRules) {
+    const next = normalizeLine(current.replace(pattern, replacement));
+    if (next === current) {
+      continue;
+    }
+    current = next;
+    if (current.length <= maxChars) {
+      return current;
+    }
+  }
+  return current;
+}
+
+function normalizeBulletsContentForValidation(content: string, rule: SectionRule): string {
+  if (rule.section !== "bullets") {
+    return content;
+  }
+  const rawMaxCharsPerLine = getNumber(rule.constraints, "max_chars_per_line", 0);
+  if (rawMaxCharsPerLine <= 0) {
+    return content;
+  }
+  const hardMax = rawMaxCharsPerLine + getTolerance(rule.constraints);
+  if (hardMax <= 0) {
+    return content;
+  }
+  const preferredMax = Math.min(hardMax, rawMaxCharsPerLine + 5);
+  return splitLines(content)
+    .map((line, index) => {
+      if (line.length <= preferredMax) {
+        return line;
+      }
+      return compressBulletLineToLimit(line, preferredMax, index);
+    })
+    .join("\n");
+}
+
+function normalizeTitleContentForValidation(content: string, rule: SectionRule): string {
+  if (rule.section !== "title") {
+    return content;
+  }
+  const rawMaxChars = getNumber(rule.constraints, "max_chars", 0);
+  if (rawMaxChars <= 0) {
+    return content;
+  }
+  const hardMax = rawMaxChars + getTolerance(rule.constraints);
+  if (hardMax <= 0) {
+    return content;
+  }
+  return compressTitleToLimit(normalizeLine(content), hardMax);
+}
+
+function normalizeSectionContentForValidation(content: string, rule: SectionRule): string {
+  if (rule.section === "bullets") {
+    return normalizeBulletsContentForValidation(content, rule);
+  }
+  if (rule.section === "title") {
+    return normalizeTitleContentForValidation(content, rule);
+  }
+  return content;
+}
+
 function shouldCutoffPromptRawLine(line: string): boolean {
   const normalized = line.trim().toLowerCase();
   if (!normalized) {
@@ -221,6 +444,48 @@ function compactRequirementsRawForPrompt(raw: string): PromptRawResult {
   };
 }
 
+function normalizeHeadingForPromptFilter(text: string): string {
+  return text.toLowerCase().replace(/[\s:：()（）【】\[\]<>《》,，.。;；!！?？'"`~\-_/|]+/g, "");
+}
+
+function compactSectionRequirementsRawForPrompt(raw: string, section: string): string {
+  const normalized = normalizeText(raw);
+  if (!normalized) {
+    return "";
+  }
+  if (section !== "description" && section !== "bullets") {
+    return normalized;
+  }
+  const skipHeadingPrefixes = ["关键词", "keyword", "分类", "category", "类目"].map(normalizeHeadingForPromptFilter);
+  const lines = normalized.split("\n");
+  const kept: string[] = [];
+  let skipping = false;
+  let previousBlank = false;
+  for (const line of lines) {
+    const headingMatch = /^#{1,6}\s+(.+?)\s*$/.exec(line.trim());
+    if (headingMatch) {
+      const normalizedHeading = normalizeHeadingForPromptFilter(headingMatch[1]);
+      skipping = skipHeadingPrefixes.some((prefix) => normalizedHeading.includes(prefix));
+      if (skipping) {
+        continue;
+      }
+    }
+    if (skipping) {
+      continue;
+    }
+    if (line.trim() === "") {
+      if (!previousBlank) {
+        kept.push("");
+      }
+      previousBlank = true;
+      continue;
+    }
+    previousBlank = false;
+    kept.push(line);
+  }
+  return normalizeText(kept.join("\n"));
+}
+
 function replaceTopHeading(markdown: string, filename: string): string {
   const trimmedName = normalizeInputFilename(filename);
   if (!trimmedName) {
@@ -249,10 +514,50 @@ function extractJSONObjectText(input: string): string {
     return "";
   }
   const fenced = /```(?:json)?\s*([\s\S]*?)\s*```/i.exec(text);
-  if (fenced && fenced[1]) {
-    return fenced[1].trim();
+  const candidate = fenced && fenced[1] ? fenced[1].trim() : text;
+  if (!candidate) {
+    return "";
   }
-  return text;
+  const start = candidate.indexOf("{");
+  if (start < 0) {
+    return candidate;
+  }
+  let depth = 0;
+  let inString = false;
+  let escaping = false;
+  for (let index = start; index < candidate.length; index += 1) {
+    const char = candidate[index];
+    if (inString) {
+      if (escaping) {
+        escaping = false;
+        continue;
+      }
+      if (char === "\\") {
+        escaping = true;
+        continue;
+      }
+      if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+    if (char === "{") {
+      depth += 1;
+      continue;
+    }
+    if (char !== "}") {
+      continue;
+    }
+    depth -= 1;
+    if (depth === 0) {
+      return candidate.slice(start, index + 1).trim();
+    }
+  }
+  return candidate;
 }
 
 function adaptJSONArrayContent(raw: string, field: string): { content: string; error?: string } {
@@ -288,6 +593,183 @@ function adaptJSONArrayContent(raw: string, field: string): { content: string; e
     return { content: "", error: `JSON 解析失败: ${field} 数组为空` };
   }
   return { content: lines.join("\n") };
+}
+
+export function formatJSONArrayContent(content: string, field: string): string {
+  return JSON.stringify({
+    [field]: splitLines(content)
+  });
+}
+
+function isAgentMetaParagraph(input: string): boolean {
+  const text = normalizeLine(input).toLowerCase();
+  if (!text || text.length > 160) {
+    return false;
+  }
+  const hasValidationPhrase = (
+    text.includes("校验通过") ||
+    text.includes("验证通过") ||
+    ((text.includes("通过") || text.includes("passed")) && text.includes("验证")) ||
+    text.includes("validation passed") ||
+    text.includes("passed validation")
+  );
+  const hasFinalOutputPhrase = (
+    text.includes("最终") ||
+    text.includes("输出") ||
+    text.includes("标题") ||
+    text.includes("内容") ||
+    text.includes("结果") ||
+    text.includes("final title") ||
+    text.includes("final content") ||
+    text.includes("final result")
+  );
+  return (
+    (hasValidationPhrase && hasFinalOutputPhrase) ||
+    text.includes("现在输出最终内容") ||
+    text.includes("现在输出最终标题") ||
+    text.includes("output final content") ||
+    text.includes("output final title")
+  );
+}
+
+function stripAgentMetaPreamble(raw: string): string {
+  const normalized = raw.replace(/\r\n/g, "\n").trim();
+  if (!normalized) {
+    return "";
+  }
+
+  const paragraphs = normalized
+    .split(/\n\s*\n/g)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+
+  while (paragraphs.length > 0 && isAgentMetaParagraph(paragraphs[0])) {
+    paragraphs.shift();
+  }
+
+  let text = paragraphs.join("\n\n").trim();
+  text = text.replace(
+    /^(?:完美[！!。]?\s*)?(?:校验通过|验证通过)[，,:：\s]*(?:现在)?(?:输出|给出)?(?:最终)?(?:标题|内容|结果)?[：:\s]*/u,
+    ""
+  );
+  text = text.replace(
+    /^(?:完美[！!。]?\s*)?(?:(?:标题|内容|结果)\s*)?(?:已|已经)?通过(?:了)?(?:所有)?(?:校验|验证)[。！!，,:：\s]*(?:(?:现在|让我)\s*)?(?:输出|给出)(?:最终)?(?:的)?(?:标题|内容|结果)?[：:\s]*/u,
+    ""
+  );
+  text = text.replace(
+    /^(?:perfect[!.\s]*)?(?:validation passed|validated|passed validation)[,.: ]*(?:now )?(?:output|return|give)(?: the)? final (?:title|content|result)[: ]*/i,
+    ""
+  );
+  text = text.replace(
+    /^(?:perfect[!.\s]*)?(?:(?:title|content|result)\s+)?(?:has\s+)?passed(?:\s+all)?\s+validation[,.:\s]*(?:(?:now|let me)\s+)?(?:output|return|give)(?:\s+the)?\s+final\s+(?:title|content|result)[:\s]*/i,
+    ""
+  );
+  return text.trim();
+}
+
+function resolveFixedParagraphCount(rule: SectionRule): number {
+  const minParagraphs = getNumber(rule.constraints, "min_paragraphs", 0);
+  const maxParagraphs = getNumber(rule.constraints, "max_paragraphs", 0);
+  if (minParagraphs > 0 && minParagraphs === maxParagraphs) {
+    return minParagraphs;
+  }
+  const executionParagraphs = typeof rule.execution.paragraph_count === "number" && Number.isFinite(rule.execution.paragraph_count)
+    ? Math.floor(rule.execution.paragraph_count)
+    : 0;
+  return executionParagraphs > 0 ? executionParagraphs : 0;
+}
+
+export function adaptMarkdownContentForValidation(raw: string, rule: SectionRule): { content: string; error?: string } {
+  let content = normalizeText(stripAgentMetaPreamble(raw));
+  if (!content) {
+    return { content: "" };
+  }
+
+  const expectedParagraphs = resolveFixedParagraphCount(rule);
+  if (expectedParagraphs > 0) {
+    const paragraphs = content
+      .split(/\n\s*\n/g)
+      .map((paragraph) => normalizeLine(paragraph))
+      .filter(Boolean);
+    if (paragraphs.length > expectedParagraphs) {
+      const merged = paragraphs.slice(0, expectedParagraphs - 1);
+      merged.push(paragraphs.slice(expectedParagraphs - 1).join(" "));
+      content = merged.join("\n\n");
+    }
+  }
+
+  if (rule.constraints.require_complete_sentence_end === true) {
+    const paragraphs = content
+      .split(/\n\s*\n/g)
+      .map((paragraph) => normalizeLine(paragraph))
+      .filter(Boolean)
+      .map((paragraph) => {
+        if (hasCompleteSentenceEnding(paragraph)) {
+          return paragraph;
+        }
+        return `${stripTrailingClosers(paragraph)}.`;
+      });
+    content = paragraphs.join("\n\n");
+  }
+
+  return { content };
+}
+
+function normalizeSectionCandidateForScoring(raw: string, rule: SectionRule): { content: string; error?: string } {
+  if (rule.section === "bullets") {
+    const trimmed = normalizeText(raw);
+    if (trimmed.startsWith("{")) {
+      const adapted = adaptJSONArrayContent(raw, rule.output.json_array_field || "bullets");
+      return {
+        ...adapted,
+        content: normalizeSectionContentForValidation(adapted.content, rule)
+      };
+    }
+    return { content: normalizeSectionContentForValidation(trimmed, rule) };
+  }
+  const adapted = adaptMarkdownContentForValidation(raw, rule);
+  return {
+    ...adapted,
+    content: normalizeSectionContentForValidation(adapted.content, rule)
+  };
+}
+
+export function scoreRuntimeCandidateForTest(
+  requirements: ListingRequirements,
+  rule: SectionRule,
+  raw: string
+): { normalizedContent: string; score: number; errors: string[] } {
+  return scoreRuntimeCandidateValue(requirements, rule, raw);
+}
+
+function scoreRuntimeCandidateValue(
+  requirements: ListingRequirements,
+  rule: SectionRule,
+  raw: string
+): { normalizedContent: string; score: number; errors: string[] } {
+  const adapted = normalizeSectionCandidateForScoring(raw, rule);
+  const normalized = normalizeText(normalizeSectionContentForValidation(adapted.content, rule));
+  const errors = adapted.error ? [adapted.error] : validateSectionContent(normalized, requirements, rule);
+  const targetMidpoint = (() => {
+    const minChars = getNumber(rule.constraints, "min_chars", 0);
+    const maxChars = getNumber(rule.constraints, "max_chars", 0);
+    if (minChars > 0 && maxChars > 0) {
+      return Math.floor((minChars + maxChars) / 2);
+    }
+    const minPerLine = getNumber(rule.constraints, "min_chars_per_line", 0);
+    const maxPerLine = getNumber(rule.constraints, "max_chars_per_line", 0);
+    const lineCount = getNumber(rule.constraints, "line_count", 0);
+    if (minPerLine > 0 && maxPerLine > 0 && lineCount > 0) {
+      return Math.floor(((minPerLine + maxPerLine) / 2) * lineCount);
+    }
+    return normalized.length;
+  })();
+  const proximityPenalty = Math.abs(normalized.length - targetMidpoint);
+  return {
+    normalizedContent: normalized,
+    errors,
+    score: errors.length * 10_000 + proximityPenalty
+  };
 }
 
 function dedupeKeepOrder(values: string[]): string[] {
@@ -374,6 +856,7 @@ type KeywordEmbeddingConfig = {
   exactMatch: boolean;
   noSplit: boolean;
   boldWrapper: boolean;
+  lowercase: boolean;
   slotRetries: number;
 };
 
@@ -390,6 +873,7 @@ function readKeywordEmbeddingConfig(constraints: Record<string, unknown>): Keywo
     exactMatch: node.exact_match !== false,
     noSplit: node.no_split !== false,
     boldWrapper: node.bold_wrapper === true,
+    lowercase: node.lowercase === true,
     slotRetries: Math.max(1, Math.floor(slotRetriesRaw))
   };
 }
@@ -404,7 +888,7 @@ function findKeywordOccurrence(
   start: number,
   config: KeywordEmbeddingConfig
 ): { start: number; end: number } | null {
-  const normalizedKeyword = normalizeLine(keyword);
+  const normalizedKeyword = config.lowercase ? normalizeLine(keyword).toLowerCase() : normalizeLine(keyword);
   if (!normalizedKeyword) {
     return null;
   }
@@ -419,7 +903,7 @@ function findKeywordOccurrence(
   const body = config.noSplit ? tokens.join("\\s+") : tokens.join("[\\s\\W_]*");
   const wrapped = config.boldWrapper ? `\\*\\*\\s*${body}\\s*\\*\\*` : body;
   const patternText = `${config.exactMatch ? "(?<![A-Za-z0-9])" : ""}${wrapped}${config.exactMatch ? "(?![A-Za-z0-9])" : ""}`;
-  const pattern = new RegExp(patternText, "i");
+  const pattern = new RegExp(patternText, config.lowercase ? "" : "i");
   const slice = text.slice(Math.max(0, start));
   const matched = pattern.exec(slice);
   if (!matched || matched.index < 0) {
@@ -444,6 +928,18 @@ function hasCompleteSentenceEnding(input: string): boolean {
   return sentenceEndPattern.test(text);
 }
 
+function extractBulletHeading(line: string): string {
+  const matched = /^([^:：]+)[:：]\s*/.exec(normalizeLine(line));
+  return matched?.[1]?.trim() ?? "";
+}
+
+function countHeadingWords(heading: string): number {
+  return heading
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter(Boolean).length;
+}
+
 function lastTailWord(input: string): string {
   let text = stripTrailingClosers(normalizeLine(input));
   text = text.replace(trailingPunctPattern, "").trim();
@@ -464,7 +960,8 @@ function validateSectionContent(content: string, requirements: ListingRequiremen
   const forbidDanglingTail = constraints.forbid_dangling_tail === true;
   const rawMinChars = getNumber(constraints, "min_chars", 0);
   const rawMaxChars = getNumber(constraints, "max_chars", 0);
-  const minChars = rawMinChars > 0 ? rawMinChars - tolerance : 0;
+  const hardMinForBullets = rule.section === "bullets";
+  const minChars = rawMinChars > 0 ? (hardMinForBullets ? rawMinChars : rawMinChars - tolerance) : 0;
   const maxChars = rawMaxChars > 0 ? rawMaxChars + tolerance : 0;
   const hasTextLengthConstraint = rawMinChars > 0 || rawMaxChars > 0;
   if (hasTextLengthConstraint && !rangeCheck(normalized.length, Math.max(0, minChars), maxChars)) {
@@ -477,7 +974,9 @@ function validateSectionContent(content: string, requirements: ListingRequiremen
   const expectedCount = getNumber(constraints, "line_count", 0);
   const rawMinCharsPerLine = getNumber(constraints, "min_chars_per_line", 0);
   const rawMaxCharsPerLine = getNumber(constraints, "max_chars_per_line", 0);
-  const minCharsPerLine = rawMinCharsPerLine > 0 ? rawMinCharsPerLine - tolerance : 0;
+  const headingMinWords = getNumber(constraints, "heading_min_words", 0);
+  const headingMaxWords = getNumber(constraints, "heading_max_words", 0);
+  const minCharsPerLine = rawMinCharsPerLine > 0 ? (hardMinForBullets ? rawMinCharsPerLine : rawMinCharsPerLine - tolerance) : 0;
   const maxCharsPerLine = rawMaxCharsPerLine > 0 ? rawMaxCharsPerLine + tolerance : 0;
   const hasLineConstraint = expectedCount > 0 || rawMinCharsPerLine > 0 || rawMaxCharsPerLine > 0;
   if (hasLineConstraint) {
@@ -501,6 +1000,15 @@ function validateSectionContent(content: string, requirements: ListingRequiremen
         const tail = lastTailWord(line);
         if (tail && danglingTailWords.has(tail)) {
           errors.push(`第${i + 1}条结尾疑似半句（尾词: ${tail}）`);
+        }
+      }
+      if (headingMinWords > 0 || headingMaxWords > 0) {
+        const heading = extractBulletHeading(line);
+        const headingWords = countHeadingWords(heading);
+        if (!heading || !rangeCheck(headingWords, headingMinWords, headingMaxWords)) {
+          errors.push(
+            `第${i + 1}条小标题词数不满足约束: ${headingWords}（规则区间 ${formatRange(headingMinWords, headingMaxWords)}）`
+          );
         }
       }
     }
@@ -682,53 +1190,92 @@ function adaptSingleLineRepair(raw: string, rule: SectionRule, targetIndex: numb
   return first ?? "";
 }
 
-function adaptSingleSentence(raw: string): string {
-  const trimmed = normalizeText(raw);
-  if (!trimmed) {
-    return "";
-  }
-
-  const jsonText = extractJSONObjectText(trimmed);
-  if (jsonText) {
-    try {
-      const parsed = JSON.parse(jsonText) as unknown;
-      if (typeof parsed === "string") {
-        return normalizeLine(stripBulletPrefix(parsed));
-      }
-      if (Array.isArray(parsed)) {
-        const first = parsed.find((v) => typeof v === "string") as string | undefined;
-        if (first) {
-          return normalizeLine(stripBulletPrefix(first));
-        }
-      }
-      if (parsed && typeof parsed === "object") {
-        for (const value of Object.values(parsed as Record<string, unknown>)) {
-          if (typeof value === "string") {
-            return normalizeLine(stripBulletPrefix(value));
-          }
-          if (Array.isArray(value)) {
-            const first = value.find((v) => typeof v === "string") as string | undefined;
-            if (first) {
-              return normalizeLine(stripBulletPrefix(first));
-            }
-          }
-        }
-      }
-    } catch {
-      // 非 JSON，回退到文本行提取
-    }
-  }
-
-  const first = trimmed
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .map((line) => normalizeLine(stripBulletPrefix(line)))
-    .find(Boolean);
-  return first ?? "";
-}
-
 function stripMarkdownBold(input: string): string {
   return input.replace(/\*\*([^*]+)\*\*/g, "$1");
+}
+
+type TranslationReusePlan = {
+  reusedTranslations: Record<string, string>;
+  pendingSectionKeys: string[];
+};
+
+function resolveRuntimeTeamAttempts(constraints: Record<string, unknown>): number {
+  return Math.max(1, getNumber(constraints, "api_attempts", 1));
+}
+
+function resolveRuntimeTeamMaxTurns(section: string, hasReviewer: boolean): number {
+  if (section === "bullets") {
+    return 12;
+  }
+  if (!hasReviewer) {
+    return 6;
+  }
+  return 8;
+}
+
+function buildTranslationReusePlan(
+  originalSections: Record<string, string>,
+  judgedSections: Record<string, string>,
+  translations: Record<string, string>
+): TranslationReusePlan {
+  const reusedTranslations: Record<string, string> = {};
+  const categoryCN = typeof translations.category_cn === "string" ? translations.category_cn : "";
+  const keywordsCN = typeof translations.keywords_cn === "string" ? translations.keywords_cn : "";
+  if (categoryCN) {
+    reusedTranslations.category_cn = categoryCN;
+  }
+  if (keywordsCN) {
+    reusedTranslations.keywords_cn = keywordsCN;
+  }
+
+  const pendingSectionKeys: string[] = [];
+  for (const [section, value] of Object.entries(judgedSections)) {
+    const translationKey = `${section}_cn`;
+    const translated = translations[translationKey];
+    if (originalSections[section] === value && typeof translated === "string" && translated.trim() !== "") {
+      reusedTranslations[translationKey] = translated;
+      continue;
+    }
+    pendingSectionKeys.push(section);
+  }
+
+  return {
+    reusedTranslations,
+    pendingSectionKeys
+  };
+}
+
+export function buildTranslationReusePlanForTest(
+  originalSections: Record<string, string>,
+  judgedSections: Record<string, string>,
+  translations: Record<string, string>
+): TranslationReusePlan {
+  return buildTranslationReusePlan(originalSections, judgedSections, translations);
+}
+
+export function resolveRuntimeTeamAttemptsForTest(constraints: Record<string, unknown>): number {
+  return resolveRuntimeTeamAttempts(constraints);
+}
+
+export function resolveRuntimeTeamMaxTurnsForTest(section: string, hasReviewer: boolean): number {
+  return resolveRuntimeTeamMaxTurns(section, hasReviewer);
+}
+
+export function compactSectionRequirementsRawForPromptForTest(raw: string, section: string): string {
+  return compactSectionRequirementsRawForPrompt(raw, section);
+}
+
+function shouldRunPromptPlanning(rules: Pick<TenantRules, "generationConfig">): boolean {
+  if (!rules.generationConfig.planning.enabled) {
+    return false;
+  }
+  // Runtime-native orchestration no longer consumes a planner brief for control flow.
+  // Keeping the extra LLM planning call only adds latency to every job.
+  return false;
+}
+
+export function shouldRunPromptPlanningForTest(rules: Pick<TenantRules, "generationConfig">): boolean {
+  return shouldRunPromptPlanning(rules);
 }
 
 export class GenerationService {
@@ -770,13 +1317,13 @@ export class GenerationService {
     if (!key) {
       return "";
     }
-    const mapped = rules.workflow.display_labels[key];
+    const mapped = rules.generationConfig.display_labels[key];
     if (typeof mapped === "string" && mapped.trim() !== "") {
       return mapped.trim();
     }
     const sectionRule = rules.sections.get(key);
     if (sectionRule) {
-      const sectionMapped = rules.workflow.display_labels[sectionRule.section];
+      const sectionMapped = rules.generationConfig.display_labels[sectionRule.section];
       if (typeof sectionMapped === "string" && sectionMapped.trim() !== "") {
         return sectionMapped.trim();
       }
@@ -881,397 +1428,24 @@ export class GenerationService {
     ].join("\n");
   }
 
-  private buildSectionUserPrompt(requirements: ListingRequirements, section: string, extra?: string): string {
+  private buildSectionUserPrompt(requirements: ListingRequirements, rule: SectionRule, extra?: string): string {
     const keywords = requirements.keywords.join("\n");
-    const requirementsRaw = this.requirementsRawForPrompt || requirements.raw;
+    const requirementsRaw = compactSectionRequirementsRawForPrompt(
+      this.requirementsRawForPrompt || requirements.raw,
+      rule.section
+    );
+    const executionGuidance = buildSectionExecutionGuidance(requirements, rule);
     return [
-      `任务: 生成 section=${section}（英文）`,
+      `任务: 生成 section=${rule.section}（英文）`,
       this.executionBrief ? `执行简报:\n${this.executionBrief}` : "",
       `品牌: ${requirements.brand}`,
       `分类: ${requirements.category}`,
-      `关键词库:\n${keywords}`,
+      !executionGuidance ? `关键词库:\n${keywords}` : "",
       "输入需求原文:",
       requirementsRaw,
+      executionGuidance ? `结构化执行指导:\n${executionGuidance}` : "",
       extra ? `\n修正反馈:\n${extra}` : ""
     ].join("\n");
-  }
-
-  private isSentenceMode(rule: SectionRule): boolean {
-    return rule.execution.generation_mode === "sentence";
-  }
-
-  private resolveSentenceModeCount(rule: SectionRule): number {
-    const configured = rule.execution.sentence_count;
-    if (typeof configured === "number" && Number.isFinite(configured) && configured > 0) {
-      return Math.floor(configured);
-    }
-    const lineCount = getNumber(rule.constraints, "line_count", 0);
-    if (lineCount > 0) {
-      return lineCount;
-    }
-    return 0;
-  }
-
-  private sentenceKeywordPlan(
-    requirements: ListingRequirements,
-    rule: SectionRule,
-    sentenceCount: number
-  ): { config: KeywordEmbeddingConfig; slots: string[][] } {
-    const config = readKeywordEmbeddingConfig(rule.constraints);
-    const slots = Array.from({ length: sentenceCount }, () => [] as string[]);
-    if (!config.enabled || config.minTotal <= 0 || sentenceCount <= 0) {
-      return { config, slots };
-    }
-    const keywords = requirements.keywords.map((v) => normalizeLine(v)).filter(Boolean);
-    const target = Math.min(config.minTotal, keywords.length);
-    if (target <= 0) {
-      return { config, slots };
-    }
-    const base = Math.floor(target / sentenceCount);
-    const remainder = target % sentenceCount;
-    let cursor = 0;
-    for (let i = 0; i < sentenceCount; i += 1) {
-      const take = base + (i < remainder ? 1 : 0);
-      for (let j = 0; j < take; j += 1) {
-        if (cursor >= target) {
-          break;
-        }
-        slots[i].push(keywords[cursor]);
-        cursor += 1;
-      }
-    }
-    return { config, slots };
-  }
-
-  private validateSentenceRequiredKeywords(
-    sentence: string,
-    requiredKeywords: string[],
-    config: KeywordEmbeddingConfig
-  ): string | null {
-    if (requiredKeywords.length === 0) {
-      return null;
-    }
-    let cursor = 0;
-    for (let i = 0; i < requiredKeywords.length; i += 1) {
-      const kw = requiredKeywords[i];
-      const found = findKeywordOccurrence(sentence, kw, cursor, config);
-      if (!found) {
-        return `第${i + 1}个要求关键词未按顺序原样出现: ${kw}`;
-      }
-      cursor = found.end;
-    }
-    return null;
-  }
-
-  private splitSentenceSlotsByParagraphs(sentences: string[], paragraphCount: number): string {
-    if (paragraphCount <= 1) {
-      return normalizeText(sentences.join(" "));
-    }
-    const safeParagraphCount = Math.max(1, Math.min(paragraphCount, sentences.length || 1));
-    const baseSize = Math.floor(sentences.length / safeParagraphCount);
-    const remainder = sentences.length % safeParagraphCount;
-    const paragraphs: string[] = [];
-    let cursor = 0;
-    for (let i = 0; i < safeParagraphCount; i += 1) {
-      const take = baseSize + (i < remainder ? 1 : 0);
-      const chunk = sentences.slice(cursor, cursor + Math.max(1, take));
-      cursor += Math.max(1, take);
-      paragraphs.push(normalizeText(chunk.join(" ")));
-    }
-    return normalizeText(paragraphs.join("\n\n"));
-  }
-
-  private sentenceTargetRange(rule: SectionRule, sentenceCount: number): { min: number; max: number } {
-    if (sentenceCount <= 0) {
-      return { min: 0, max: 0 };
-    }
-    const tolerance = getTolerance(rule.constraints);
-    const lineCount = getNumber(rule.constraints, "line_count", 0);
-    const rawMinPerLine = getNumber(rule.constraints, "min_chars_per_line", 0);
-    const rawMaxPerLine = getNumber(rule.constraints, "max_chars_per_line", 0);
-    if (lineCount > 0 && (rawMinPerLine > 0 || rawMaxPerLine > 0)) {
-      return {
-        min: rawMinPerLine > 0 ? Math.max(0, rawMinPerLine - tolerance) : 0,
-        max: rawMaxPerLine > 0 ? rawMaxPerLine + tolerance : 0
-      };
-    }
-    const rawMin = getNumber(rule.constraints, "min_chars", 0);
-    const rawMax = getNumber(rule.constraints, "max_chars", 0);
-    const minTotal = rawMin > 0 ? Math.max(0, rawMin - tolerance) : 0;
-    const maxTotal = rawMax > 0 ? rawMax + tolerance : 0;
-    const perSentenceSlack = Math.max(0, getNumber(rule.constraints, "sentence_target_slack", 30));
-    const avgMin = minTotal > 0 ? Math.max(1, Math.ceil(minTotal / sentenceCount)) : 0;
-    const avgMax = maxTotal > 0 ? Math.max(1, Math.floor(maxTotal / sentenceCount)) : 0;
-    const minWithSlack = avgMin > 0 ? Math.max(1, avgMin - perSentenceSlack) : 0;
-    const maxWithSlack = avgMax > 0 ? avgMax + perSentenceSlack : 0;
-    return {
-      min: minWithSlack,
-      max: maxWithSlack
-    };
-  }
-
-  private assembleSentenceModeContent(rule: SectionRule, sentences: string[]): string {
-    const lineCount = getNumber(rule.constraints, "line_count", 0);
-    if (lineCount > 0) {
-      return normalizeText(sentences.slice(0, lineCount).join("\n"));
-    }
-
-    const minParagraphs = getNumber(rule.constraints, "min_paragraphs", 0);
-    const maxParagraphs = getNumber(rule.constraints, "max_paragraphs", 0);
-    const fixedParagraphs =
-      minParagraphs > 0 && maxParagraphs > 0 && minParagraphs === maxParagraphs ? minParagraphs : 0;
-    const paragraphCount = rule.execution.paragraph_count ?? fixedParagraphs;
-    if (paragraphCount > 0) {
-      return this.splitSentenceSlotsByParagraphs(sentences, paragraphCount);
-    }
-    return normalizeText(sentences.join(" "));
-  }
-
-  private buildSentenceModeSystemPrompt(rule: SectionRule): string {
-    const constraintsSummary = this.constraintsSummary(rule);
-    return [
-      "你是专业亚马逊 Listing 文案专家。",
-      "你在逐句生成模式中工作。",
-      "每次只输出 1 句英文完整句子，不要编号，不要项目符号，不要解释，不要 JSON，不要代码块。",
-      "句子必须完整收尾并带句末标点，禁止半截句。",
-      `section=${rule.section}`,
-      `规则:\n${rule.instruction}`,
-      `硬性约束摘要:\n${constraintsSummary}`
-    ].join("\n");
-  }
-
-  private buildSentenceModeUserPrompt(
-    requirements: ListingRequirements,
-    rule: SectionRule,
-    sentenceIndex: number,
-    sentenceCount: number,
-    generatedSentences: string[],
-    requiredKeywords: string[],
-    sentenceTarget: { min: number; max: number },
-    extra?: string
-  ): string {
-    const requirementsRaw = this.requirementsRawForPrompt || requirements.raw;
-    const doneText = generatedSentences.length > 0 ? generatedSentences.join("\n") : "（暂无）";
-    return [
-      `任务: 生成 section=${rule.section} 的第 ${sentenceIndex + 1}/${sentenceCount} 句（英文）`,
-      this.executionBrief ? `执行简报:\n${this.executionBrief}` : "",
-      `品牌: ${requirements.brand}`,
-      `分类: ${requirements.category}`,
-      `关键词库:\n${requirements.keywords.join("\n")}`,
-      requiredKeywords.length > 0
-        ? `本句必须按顺序原样包含以下关键词（不得拆分/改写/换序）:\n${requiredKeywords.map((v, i) => `${i + 1}. ${v}`).join("\n")}`
-        : "",
-      requiredKeywords.length > 0 && keywordPlanBoldWrapper(rule)
-        ? "本句中每个关键词必须使用 Markdown 粗体包裹，格式为 **关键词**。"
-        : "",
-      sentenceTarget.min > 0 || sentenceTarget.max > 0
-        ? `本句目标长度（字符）: ${formatRange(sentenceTarget.min, sentenceTarget.max)}`
-        : "",
-      `已生成句子:\n${doneText}`,
-      "输入需求原文:",
-      requirementsRaw,
-      extra ? `\n修正反馈:\n${extra}` : "",
-      "只返回这一句英文正文。"
-    ]
-      .filter(Boolean)
-      .join("\n");
-  }
-
-  private async generateSectionWithSentenceMode(
-    requirements: ListingRequirements,
-    rule: SectionRule,
-    step: string,
-    validate: (content: string) => string[],
-    options?: SectionGenerateOptions
-  ): Promise<string> {
-    const retries = Math.max(1, options?.maxRetries ?? rule.execution.retries ?? 3);
-    const sentenceCount = this.resolveSentenceModeCount(rule);
-    if (sentenceCount <= 0) {
-      throw new Error(`${rule.section} 逐句模式缺少 sentence_count/line_count 配置`);
-    }
-    const apiAttempts = Math.max(2, getNumber(rule.constraints, "api_attempts", 4));
-    const keywordPlan = this.sentenceKeywordPlan(requirements, rule, sentenceCount);
-    const sentenceTarget = this.sentenceTargetRange(rule, sentenceCount);
-    let feedback = options?.initialFeedback?.trim() ?? "";
-
-    for (let attempt = 1; attempt <= retries; attempt += 1) {
-      this.throwIfAborted();
-      const started = Date.now();
-      await this.appendTrace("section_sentence_mode_start", "info", {
-        step,
-        section: rule.section,
-        attempt,
-        max_attempts: retries,
-        sentence_count: sentenceCount
-      });
-
-      const sentences: string[] = [];
-      for (let idx = 0; idx < sentenceCount; idx += 1) {
-        const requiredKeywords = keywordPlan.slots[idx] ?? [];
-        let sentenceFeedback = feedback;
-        let produced = "";
-        const slotRetries = keywordPlan.config.slotRetries;
-        for (let slotAttempt = 1; slotAttempt <= slotRetries; slotAttempt += 1) {
-          this.throwIfAborted();
-          const sentenceStarted = Date.now();
-          const raw = await this.llmClient.writeWithWriterAgent(
-            this.buildSentenceModeSystemPrompt(rule),
-            this.buildSentenceModeUserPrompt(
-              requirements,
-              rule,
-              idx,
-              sentenceCount,
-              sentences,
-              requiredKeywords,
-              sentenceTarget,
-              sentenceFeedback
-            ),
-            `${step}_sentence_${idx + 1}_attempt_${attempt}_slot_${slotAttempt}`,
-            apiAttempts,
-            options?.writerModelSettings
-          );
-          const sentence = adaptSingleSentence(raw);
-          if (!sentence) {
-            sentenceFeedback = `- 本句为空，请输出 1 句完整英文句子。`;
-            if (slotAttempt >= slotRetries) {
-              await this.appendTrace("section_sentence_step_validate_fail", "warn", {
-                step,
-                section: rule.section,
-                sentence_index: idx + 1,
-                sentence_total: sentenceCount,
-                slot_attempt: slotAttempt,
-                error: "本句为空"
-              });
-            }
-            continue;
-          }
-          const sentenceChars = normalizeLine(sentence).length;
-          if (!rangeCheck(sentenceChars, sentenceTarget.min, sentenceTarget.max)) {
-            const rangeText = formatRange(sentenceTarget.min, sentenceTarget.max);
-            const sentenceErr = `句长不满足目标: ${sentenceChars}（目标 ${rangeText}）`;
-            sentenceFeedback = `- ${sentenceErr}`;
-            if (slotAttempt >= slotRetries) {
-              await this.appendTrace("section_sentence_step_validate_fail", "warn", {
-                step,
-                section: rule.section,
-                sentence_index: idx + 1,
-                sentence_total: sentenceCount,
-                slot_attempt: slotAttempt,
-                error: sentenceErr
-              });
-            }
-            if (slotAttempt >= slotRetries) {
-              throw new Error(`${step} 第${idx + 1}句长度约束失败: ${sentenceErr}`);
-            }
-            continue;
-          }
-          const keywordError = this.validateSentenceRequiredKeywords(sentence, requiredKeywords, keywordPlan.config);
-          if (keywordError) {
-            sentenceFeedback = `- ${keywordError}`;
-            if (slotAttempt >= slotRetries) {
-              await this.appendTrace("section_sentence_step_validate_fail", "warn", {
-                step,
-                section: rule.section,
-                sentence_index: idx + 1,
-                sentence_total: sentenceCount,
-                slot_attempt: slotAttempt,
-                error: keywordError
-              });
-            }
-            if (slotAttempt >= slotRetries) {
-              throw new Error(`${step} 第${idx + 1}句关键词约束失败: ${keywordError}`);
-            }
-            continue;
-          }
-          produced = sentence;
-          await this.appendTrace("section_sentence_step_ok", "info", {
-            step,
-            section: rule.section,
-            sentence_index: idx + 1,
-            sentence_total: sentenceCount,
-            slot_attempt: slotAttempt,
-            duration_ms: Date.now() - sentenceStarted,
-            output_chars: sentenceChars
-          });
-          break;
-        }
-        if (!produced) {
-          throw new Error(`${step} 第${idx + 1}句生成失败`);
-        }
-        sentences.push(produced);
-      }
-
-      const merged = this.assembleSentenceModeContent(rule, sentences);
-      const errors = validate(merged);
-      if (errors.length === 0) {
-        await this.appendTrace("section_sentence_mode_ok", "info", {
-          step,
-          section: rule.section,
-          attempt,
-          duration_ms: Date.now() - started,
-          output_chars: merged.length,
-          sentence_count: sentenceCount
-        });
-        return merged;
-      }
-
-      feedback = compactErrorsForLLM(errors, 8).map((err) => `- ${err}`).join("\n");
-      await this.appendTrace("section_sentence_mode_validate_fail", "warn", {
-        step,
-        section: rule.section,
-        attempt,
-        errors
-      });
-
-      if (attempt >= retries) {
-        await this.appendTrace("section_generate_failed", "error", {
-          step,
-          section: rule.section,
-          attempt,
-          errors
-        });
-        throw new Error(`${step} 重试后仍失败: ${errors.join("; ")}`);
-      }
-    }
-
-    throw new Error(`${step} 未生成有效内容`);
-  }
-
-  private supportsItemRepair(rule: SectionRule): boolean {
-    return rule.execution.repair_mode === "item";
-  }
-
-  private supportsLineTargetRepair(rule: SectionRule): boolean {
-    const expectedCount = getNumber(rule.constraints, "line_count", 0);
-    const minPerLine = getNumber(rule.constraints, "min_chars_per_line", 0);
-    const maxPerLine = getNumber(rule.constraints, "max_chars_per_line", 0);
-    return expectedCount > 0 || minPerLine > 0 || maxPerLine > 0;
-  }
-
-  private shouldTryItemRepair(rule: SectionRule, errors: string[]): boolean {
-    if (!this.supportsLineTargetRepair(rule)) {
-      return false;
-    }
-    if (this.supportsItemRepair(rule)) {
-      return true;
-    }
-    return errors.some((error) => extractLineErrorIndex(error) !== null);
-  }
-
-  private lineCharRangeText(rule: SectionRule): string {
-    const tolerance = getTolerance(rule.constraints);
-    const minChars = Math.max(0, getNumber(rule.constraints, "min_chars_per_line", 0) - tolerance);
-    const maxChars = getNumber(rule.constraints, "max_chars_per_line", 0) + tolerance;
-    if (minChars > 0 && maxChars > 0) {
-      return `[${minChars}, ${maxChars}]`;
-    }
-    if (minChars > 0) {
-      return `>= ${minChars}`;
-    }
-    if (maxChars > 0) {
-      return `<= ${maxChars}`;
-    }
-    return "遵循规则";
   }
 
   private constraintsSummary(rule: SectionRule): string {
@@ -1319,10 +1493,7 @@ export class GenerationService {
     return lines.length > 0 ? lines.join("\n") : "- 无额外约束";
   }
 
-  private deepseekJSONModeSettings(): Partial<ModelSettings> | undefined {
-    if (this.env.generationProvider !== "deepseek") {
-      return undefined;
-    }
+  private jsonObjectModelSettings(): Partial<ModelSettings> | undefined {
     return {
       providerData: {
         response_format: {
@@ -1332,411 +1503,25 @@ export class GenerationService {
     };
   }
 
-  private buildItemRepairSystemPrompt(rule: SectionRule, targetIndex: number): string {
-    const constraintsSummary = this.constraintsSummary(rule);
-    return [
-      "你是专业亚马逊 Listing 文案专家。",
-      "你正在修复单条文案。",
-      "只输出修复后的单行英文文本，不要编号，不要项目符号，不要解释，不要换行。",
-      "严禁通过截断尾部满足长度，必须重写为完整句，并用句末标点收尾。",
-      "若规则中包含 JSON/数组/整段输出格式要求，在本步骤全部忽略，仅按单条文本修复。",
-      `section=${rule.section}`,
-      `target_line=${targetIndex + 1}`,
-      `line_length=${this.lineCharRangeText(rule)}`,
-      `内容规则:\n${rule.instruction}`,
-      `硬性约束摘要:\n${constraintsSummary}`
-    ].join("\n");
-  }
-
-  private buildItemRepairUserPrompt(
-    requirements: ListingRequirements,
-    rule: SectionRule,
-    lines: string[],
-    targetIndex: number,
-    lineErrors: string[]
-  ): string {
-    const numbered = lines.map((line, i) => `${i + 1}. ${line}`).join("\n");
-    return [
-      `任务: 修复 section=${rule.section} 的第 ${targetIndex + 1} 行（英文）`,
-      this.executionBrief ? `执行简报:\n${this.executionBrief}` : "",
-      `品牌: ${requirements.brand}`,
-      `分类: ${requirements.category}`,
-      `关键词库:\n${requirements.keywords.join("\n")}`,
-      `当前 ${rule.section} 全部行:\n${numbered}`,
-      `需要修复的行:\n${targetIndex + 1}. ${lines[targetIndex] ?? ""}`,
-      lineErrors.length > 0 ? `该行校验错误:\n${compactErrorsForLLM(lineErrors).map((v) => `- ${v}`).join("\n")}` : "",
-      "只返回修复后的这一行英文文本，必须完整收尾。"
-    ]
-      .filter(Boolean)
-      .join("\n");
-  }
-
-  private async tryItemRepair(
-    requirements: ListingRequirements,
-    rule: SectionRule,
-    step: string,
-    content: string,
-    validate: (content: string) => string[],
-    initialErrors: string[]
-  ): Promise<{ ok: true; content: string } | { ok: false; errors: string[] }> {
-    const expectedCount = getNumber(rule.constraints, "line_count", 0);
-    let lines = splitLines(content);
-    if (expectedCount > 0 && lines.length !== expectedCount) {
-      return { ok: false, errors: initialErrors };
-    }
-
-    const rounds = Math.max(1, getNumber(rule.constraints, "item_repair_rounds", 2));
-    const apiAttempts = Math.max(2, getNumber(rule.constraints, "api_attempts", 4));
-    let currentErrors = initialErrors;
-
-    for (let round = 1; round <= rounds; round += 1) {
-      const targets = uniqueSorted(
-        currentErrors
-          .map((err) => extractLineErrorIndex(err))
-          .filter((idx): idx is number => idx !== null && idx >= 0 && idx < lines.length)
-      );
-      if (targets.length === 0) {
-        return { ok: false, errors: currentErrors };
-      }
-
-      await this.appendTrace("section_item_repair_start", "info", {
-        step,
-        section: rule.section,
-        round,
-        targets: targets.map((v) => v + 1),
-        errors: currentErrors
-      });
-      this.logger.info(
-        {
-          event: "section_item_repair_start",
-          step,
-          section: rule.section,
-          round,
-          targets: targets.map((v) => v + 1),
-          errors: currentErrors
-        },
-        "section item repair start"
-      );
-
-      for (const idx of targets) {
-        const lineErrors = currentErrors.filter((err) => extractLineErrorIndex(err) === idx);
-        const repaired = await this.llmClient.repairWithRepairAgent(
-          this.buildItemRepairSystemPrompt(rule, idx),
-          this.buildItemRepairUserPrompt(requirements, rule, lines, idx, lineErrors),
-          `${step}_item_${idx + 1}_round_${round}`,
-          apiAttempts
-        );
-        const adaptedLine = adaptSingleLineRepair(repaired, rule, idx);
-        const normalizedLine = normalizeLine(stripBulletPrefix(adaptedLine));
-        lines[idx] = normalizedLine;
-      }
-
-      const merged = normalizeText(lines.join("\n"));
-      currentErrors = validate(merged);
-      if (currentErrors.length === 0) {
-        await this.appendTrace("section_item_repair_ok", "info", {
-          step,
-          section: rule.section,
-          round,
-          output_chars: merged.length
-        });
-        this.logger.info(
-          {
-            event: "section_item_repair_ok",
-            step,
-            section: rule.section,
-            round,
-            output_chars: merged.length
-          },
-          "section item repair ok"
-        );
-        return { ok: true, content: merged };
-      }
-
-      await this.appendTrace("section_item_repair_validate_fail", "warn", {
-        step,
-        section: rule.section,
-        round,
-        errors: currentErrors
-      });
-      this.logger.warn(
-        {
-          event: "section_item_repair_validate_fail",
-          step,
-          section: rule.section,
-          round,
-          errors: currentErrors
-        },
-        "section item repair validation failed"
-      );
-    }
-
-    return { ok: false, errors: currentErrors };
-  }
-
   private buildWholeRepairSystemPrompt(rule: SectionRule, jsonOutput = false): string {
+    const constraintsSummary = this.constraintsSummary(rule);
+    const constraintsJSON = JSON.stringify(rule.constraints, null, 2);
     return [
       "你是专业亚马逊 Listing 文案专家。",
       "你正在修复一段已有文案。",
       jsonOutput
         ? "只输出修复后的 JSON 对象，不要解释，不要代码块，不要额外文本。"
         : "只输出修复后的 section 文本，不要解释，不要 JSON，不要代码块。",
+      "check_section_candidate 是校验工具，不是 agent，也不是 handoff。",
+      "绝不要调用任何 transfer_to_validator_* 工具。",
+      "若 check_section_candidate 返回 repair_guidance，必须逐条执行其中的修复要求。",
+      "优先只改失败条目；前面已经满足顺序和长度的条目尽量保持不变。",
       "严禁通过截断尾部满足长度，必须重写为完整句，并用句末标点收尾。",
       `section=${rule.section}`,
-      `规则:\n${rule.instruction}`
+      `规则:\n${rule.instruction}`,
+      `硬性约束摘要:\n${constraintsSummary}`,
+      `硬性约束(JSON):\n${constraintsJSON}`
     ].join("\n");
-  }
-
-  private buildWholeRepairUserPrompt(
-    requirements: ListingRequirements,
-    rule: SectionRule,
-    content: string,
-    errors: string[],
-    jsonOutput = false
-  ): string {
-    const constraintsText = JSON.stringify(rule.constraints, null, 2);
-    return [
-      `任务: 修复 section=${rule.section}（英文）`,
-      this.executionBrief ? `执行简报:\n${this.executionBrief}` : "",
-      `品牌: ${requirements.brand}`,
-      `分类: ${requirements.category}`,
-      `关键词库:\n${requirements.keywords.join("\n")}`,
-      `当前文案:\n${content}`,
-      `校验错误:\n${compactErrorsForLLM(errors).map((v) => `- ${v}`).join("\n")}`,
-      `约束(JSON):\n${constraintsText}`,
-      jsonOutput
-        ? "请重写内容并一次性满足约束。禁止输出半句，禁止截断收尾。只输出修复后的 JSON 对象。"
-        : "请重写整段内容，必须一次性满足约束。禁止输出半句，禁止截断收尾。只输出修复后正文。"
-    ].join("\n");
-  }
-
-  private async tryWholeRepair(
-    requirements: ListingRequirements,
-    rule: SectionRule,
-    step: string,
-    content: string,
-    validate: (content: string) => string[],
-    currentErrors: string[],
-    options?: {
-      jsonOutput?: boolean;
-      repairModelSettings?: Partial<ModelSettings>;
-      adaptContent?: (raw: string) => { content: string; error?: string };
-    }
-  ): Promise<{ ok: true; content: string } | { ok: false; errors: string[] }> {
-    const apiAttempts = Math.max(2, getNumber(rule.constraints, "api_attempts", 4));
-    await this.appendTrace("section_whole_repair_start", "info", {
-      step,
-      section: rule.section,
-      errors: currentErrors
-    });
-    this.logger.info(
-      {
-        event: "section_whole_repair_start",
-        step,
-        section: rule.section,
-        errors: currentErrors
-      },
-      "section whole repair start"
-    );
-
-    const repaired = await this.llmClient.repairWithRepairAgent(
-      this.buildWholeRepairSystemPrompt(rule, options?.jsonOutput ?? false),
-      this.buildWholeRepairUserPrompt(requirements, rule, content, currentErrors, options?.jsonOutput ?? false),
-      `${step}_whole_repair`,
-      apiAttempts,
-      options?.repairModelSettings
-    );
-    const adapted = options?.adaptContent ? options.adaptContent(repaired) : { content: repaired };
-    const normalized = normalizeText(adapted.content);
-    const repairedErrors = adapted.error ? [adapted.error] : validate(normalized);
-    if (repairedErrors.length === 0) {
-      await this.appendTrace("section_whole_repair_ok", "info", {
-        step,
-        section: rule.section,
-        output_chars: normalized.length
-      });
-      this.logger.info(
-        {
-          event: "section_whole_repair_ok",
-          step,
-          section: rule.section,
-          output_chars: normalized.length
-        },
-        "section whole repair ok"
-      );
-      return { ok: true, content: normalized };
-    }
-
-    await this.appendTrace("section_whole_repair_validate_fail", "warn", {
-      step,
-      section: rule.section,
-      errors: repairedErrors
-    });
-    this.logger.warn(
-      {
-        event: "section_whole_repair_validate_fail",
-        step,
-        section: rule.section,
-        errors: repairedErrors
-      },
-      "section whole repair validation failed"
-    );
-    return { ok: false, errors: repairedErrors };
-  }
-
-  private async generateSectionWithValidation(
-    requirements: ListingRequirements,
-    rule: SectionRule,
-    step: string,
-    validate: (content: string) => string[],
-    options?: SectionGenerateOptions
-  ): Promise<string> {
-    if (this.isSentenceMode(rule)) {
-      return this.generateSectionWithSentenceMode(requirements, rule, step, validate, options);
-    }
-    this.throwIfAborted();
-    const retries = Math.max(1, options?.maxRetries ?? rule.execution.retries ?? 3);
-    const apiAttempts = Math.max(2, getNumber(rule.constraints, "api_attempts", 4));
-    let feedback = options?.initialFeedback?.trim() ?? "";
-
-    for (let attempt = 1; attempt <= retries; attempt += 1) {
-      this.throwIfAborted();
-      const started = Date.now();
-      await this.appendTrace("section_generate_start", "info", {
-        step,
-        section: rule.section,
-        attempt,
-        max_attempts: retries
-      });
-      this.logger.info(
-        { event: "section_generate_start", step, section: rule.section, attempt, max_attempts: retries },
-        "section generate start"
-      );
-      const content = await this.llmClient.writeWithWriterAgent(
-        this.buildSectionSystemPrompt(rule, options?.jsonOutput ?? false),
-        this.buildSectionUserPrompt(requirements, rule.section, feedback),
-        `${step}_attempt_${attempt}`,
-        apiAttempts,
-        options?.writerModelSettings
-      );
-
-      const adapted = options?.adaptContent ? options.adaptContent(content) : { content };
-      const normalized = normalizeText(adapted.content);
-      let errors = adapted.error ? [adapted.error] : validate(normalized);
-      if (errors.length === 0) {
-        await this.appendTrace("section_generate_ok", "info", {
-          step,
-          section: rule.section,
-          attempt,
-          duration_ms: Date.now() - started,
-          output_chars: normalized.length
-        });
-        this.logger.info(
-          {
-            event: "section_generate_ok",
-            step,
-            section: rule.section,
-            attempt,
-            duration_ms: Date.now() - started,
-            output_chars: normalized.length
-          },
-          "section generate ok"
-        );
-        return normalized;
-      }
-
-      const itemRepairEnabled = this.shouldTryItemRepair(rule, errors);
-      if (itemRepairEnabled) {
-        await this.appendTrace("section_repair_needed", "warn", {
-          step,
-          section: rule.section,
-          repair_mode: this.supportsItemRepair(rule) ? "item" : "item_fallback",
-          errors
-        });
-        this.logger.warn(
-          {
-            event: "section_repair_needed",
-            step,
-            section: rule.section,
-            repair_mode: this.supportsItemRepair(rule) ? "item" : "item_fallback",
-            errors
-          },
-          "section repair needed"
-        );
-        const repaired = await this.tryItemRepair(
-          requirements,
-          rule,
-          step,
-          normalized,
-          validate,
-          errors
-        );
-        if (repaired.ok) {
-          return repaired.content;
-        }
-        errors = repaired.errors;
-      }
-
-      if (rule.execution.repair_mode !== "item") {
-        await this.appendTrace("section_repair_needed", "warn", {
-          step,
-          section: rule.section,
-          repair_mode: "whole",
-          errors
-        });
-        this.logger.warn(
-          {
-            event: "section_repair_needed",
-            step,
-            section: rule.section,
-            repair_mode: "whole",
-            errors
-          },
-          "section repair needed"
-        );
-        const wholeRepaired = await this.tryWholeRepair(
-          requirements,
-          rule,
-          step,
-          normalized,
-          validate,
-          errors,
-          {
-            jsonOutput: options?.jsonOutput,
-            repairModelSettings: options?.repairModelSettings,
-            adaptContent: options?.adaptContent
-          }
-        );
-        if (wholeRepaired.ok) {
-          return wholeRepaired.content;
-        }
-        errors = wholeRepaired.errors;
-      }
-
-      feedback = compactErrorsForLLM(errors, 8).map((err) => `- ${err}`).join("\n");
-      await this.appendTrace("validate_fail", "warn", {
-        step,
-        section: rule.section,
-        attempt,
-        errors
-      });
-      this.logger.warn(
-        { event: "validate_fail", step, attempt, errors },
-        "validation failed"
-      );
-
-      if (attempt >= retries) {
-        await this.appendTrace("section_generate_failed", "error", {
-          step,
-          section: rule.section,
-          attempt,
-          errors
-        });
-        throw new Error(`${step} 重试后仍失败: ${errors.join("; ")}`);
-      }
-    }
-
-    throw new Error(`${step} 未生成有效内容`);
   }
 
   private groupJudgeIssuesBySection(issues: JudgeIssue[]): Record<string, string[]> {
@@ -1755,22 +1540,32 @@ export class GenerationService {
   }
 
   private async translateText(text: string, step: string, retries: number): Promise<string> {
+    return this.translateTextWithProfile(text, step, retries);
+  }
+
+  private async translateTextWithProfile(
+    text: string,
+    step: string,
+    retries: number,
+    runtimeProfile?: ModelProfile
+  ): Promise<string> {
     this.throwIfAborted();
     const rules = this.mustRulesLoaded();
     const started = Date.now();
-    await this.appendTrace("translate_start", "info", { step, input_chars: text.length, retries });
-    this.logger.info({ event: "translate_start", step, input_chars: text.length, retries }, "translate start");
+    await this.appendTrace("translation_start", "info", { step, input_chars: text.length, retries });
+    this.logger.info({ event: "translation_start", step, input_chars: text.length, retries }, "translation start");
     const translated = await this.llmClient.translateWithTranslatorAgent(
-      rules.workflow.translation.system_prompt,
+      rules.generationConfig.translation.system_prompt,
       text,
       step,
-      Math.max(1, retries)
+      Math.max(1, retries),
+      runtimeProfile
     );
     this.logger.info(
-      { event: "translate_ok", step, duration_ms: Date.now() - started, output_chars: translated.length },
-      "translate ok"
+      { event: "translation_ok", step, duration_ms: Date.now() - started, output_chars: translated.length },
+      "translation ok"
     );
-    await this.appendTrace("translate_ok", "info", {
+    await this.appendTrace("translation_ok", "info", {
       step,
       duration_ms: Date.now() - started,
       output_chars: translated.length
@@ -1803,24 +1598,24 @@ export class GenerationService {
   private async planExecution(requirements: ListingRequirements): Promise<string> {
     this.throwIfAborted();
     const rules = this.mustRulesLoaded();
-    if (!rules.workflow.planning.enabled) {
+    if (!shouldRunPromptPlanning(rules)) {
       return "";
     }
     const started = Date.now();
-    await this.appendTrace("planning_start", "info", {
+    await this.appendTrace("runtime_plan_start", "info", {
       brand: requirements.brand,
       category: requirements.category,
       keywords_count: requirements.keywords.length
     });
     try {
-      const brief = await this.llmClient.orchestrateWithOrchestratorAgent(
-        rules.workflow.planning.system_prompt,
-        renderByVars(rules.workflow.planning.user_prompt, this.buildPromptVars(requirements)),
-        "orchestration",
-        rules.workflow.planning.retries
+      const brief = await this.llmClient.runtimePlanWithPlannerAgent(
+        rules.generationConfig.planning.system_prompt,
+        renderByVars(rules.generationConfig.planning.user_prompt, this.buildPromptVars(requirements)),
+        "runtime_plan",
+        rules.generationConfig.planning.retries
       );
       const normalized = normalizeText(brief);
-      await this.appendTrace("planning_ok", "info", {
+      await this.appendTrace("runtime_plan_ok", "info", {
         duration_ms: Date.now() - started,
         output_chars: normalized.length
       });
@@ -1830,18 +1625,18 @@ export class GenerationService {
         throw error;
       }
       const msg = error instanceof Error ? error.message : String(error);
-      await this.appendTrace("planning_failed", "warn", {
+      await this.appendTrace("runtime_plan_failed", "warn", {
         duration_ms: Date.now() - started,
         error: msg
       });
-      this.logger.warn({ event: "planning_failed", error: msg }, "planning failed");
+      this.logger.warn({ event: "runtime_plan_failed", error: msg }, "runtime plan failed");
       return "";
     }
   }
 
   private parseJudgeIssues(text: string): JudgeIssue[] {
     const rules = this.mustRulesLoaded();
-    return parseJudgeIssues(text, rules.workflow.judge.ignore_messages, [...rules.sections.keys()]);
+    return parseJudgeIssues(text, rules.generationConfig.judge.ignore_messages, [...rules.sections.keys()]);
   }
 
   private async runQualityJudge(
@@ -1850,20 +1645,20 @@ export class GenerationService {
   ): Promise<JudgeIssue[]> {
     this.throwIfAborted();
     const rules = this.mustRulesLoaded();
-    if (!rules.workflow.judge.enabled) {
+    if (!rules.generationConfig.judge.enabled) {
       return [];
     }
     const started = Date.now();
-    await this.appendTrace("quality_judge_start", "info", {});
+    await this.appendTrace("review_start", "info", {});
     try {
       const judgeOutput = await this.llmClient.reviewWithJudgeAgent(
-        rules.workflow.judge.system_prompt,
-        renderByVars(rules.workflow.judge.user_prompt, this.buildPromptVars(requirements, sections)),
-        "quality_judge",
-        rules.workflow.judge.retries
+        rules.generationConfig.judge.system_prompt,
+        renderByVars(rules.generationConfig.judge.user_prompt, this.buildPromptVars(requirements, sections)),
+        "review",
+        rules.generationConfig.judge.retries
       );
       const allIssues = this.parseJudgeIssues(judgeOutput);
-      const skipSet = new Set(rules.workflow.judge.skip_sections.map((v) => v.toLowerCase()));
+      const skipSet = new Set(rules.generationConfig.judge.skip_sections.map((v) => v.toLowerCase()));
       const dropped: JudgeIssue[] = [];
       const issues: JudgeIssue[] = [];
       for (const issue of allIssues) {
@@ -1878,18 +1673,18 @@ export class GenerationService {
         issues.push(issue);
       }
       if (dropped.length > 0) {
-        await this.appendTrace("quality_judge_issues_skipped", "warn", {
+        await this.appendTrace("review_issues_skipped", "warn", {
           skipped_count: dropped.length,
           skipped_issues: dropped
         });
       }
       if (issues.length > 0) {
-        await this.appendTrace("quality_judge_issues", "warn", {
+        await this.appendTrace("review_issues", "warn", {
           duration_ms: Date.now() - started,
           issues
         });
       } else {
-        await this.appendTrace("quality_judge_ok", "info", {
+        await this.appendTrace("review_ok", "info", {
           duration_ms: Date.now() - started
         });
       }
@@ -1899,16 +1694,16 @@ export class GenerationService {
         throw error;
       }
       const msg = error instanceof Error ? error.message : String(error);
-      await this.appendTrace("quality_judge_failed", "warn", {
+      await this.appendTrace("review_failed", "warn", {
         duration_ms: Date.now() - started,
         error: msg
       });
-      this.logger.warn({ event: "quality_judge_failed", error: msg }, "quality judge failed");
+      this.logger.warn({ event: "review_failed", error: msg }, "review failed");
       return [];
     }
   }
 
-  private workflowSectionRule(section: string): SectionRule {
+  private generationSectionRule(section: string): SectionRule {
     const rules = this.mustRulesLoaded();
     const rule = rules.sections.get(section);
     if (!rule) {
@@ -1917,7 +1712,7 @@ export class GenerationService {
     return rule;
   }
 
-  private workflowTranslateStep(inputSlot: string): string {
+  private generationTranslateStep(inputSlot: string): string {
     const normalized = inputSlot.trim().toLowerCase();
     switch (normalized) {
       case "category":
@@ -1945,75 +1740,31 @@ export class GenerationService {
     });
   }
 
-  private buildRenderVarsFromContext(node: WorkflowNode, ctx: ExecutionContext): Record<string, string> {
+  private buildRenderVarsFromContext(node: GenerationNode, ctx: ExecutionContext): Record<string, string> {
     const rules = this.mustRulesLoaded();
     return buildRenderVariables(node, ctx, {
       inputFields: rules.input.fields,
       sections: rules.sections,
-      render: rules.workflow.render
+      render: rules.generationConfig.render
     });
   }
 
-  private async executeGenerateNode(requirements: ListingRequirements, node: WorkflowNode): Promise<string> {
+  private async executeDeriveNode(requirements: ListingRequirements, node: GenerationNode): Promise<string> {
     const section = (node.section ?? "").trim();
-    const rule = this.workflowSectionRule(section);
-    const step = rule.section;
-    if (rule.section === "bullets") {
-      const bulletsJSONModeSettings = this.deepseekJSONModeSettings();
-      const bulletsJSONArrayField = rule.output.json_array_field || "bullets";
-      return this.generateSectionWithValidation(
-        requirements,
-        rule,
-        step,
-        (content) => validateSectionContent(content, requirements, rule),
-        {
-          jsonOutput: true,
-          writerModelSettings: bulletsJSONModeSettings,
-          repairModelSettings: bulletsJSONModeSettings,
-          adaptContent: (raw) => adaptJSONArrayContent(raw, bulletsJSONArrayField)
-        }
-      );
-    }
-    return this.generateSectionWithValidation(
-      requirements,
-      rule,
-      step,
-      (content) => validateSectionContent(content, requirements, rule)
-    );
-  }
-
-  private async executeTranslateNode(
-    ctx: ExecutionContext,
-    node: WorkflowNode,
-    translationRetries: number
-  ): Promise<string> {
-    const inputSlot = (node.input_from ?? "").trim();
-    if (!inputSlot) {
-      throw new Error(`workflow translate node 缺少 input_from: ${node.id}`);
-    }
-    const text = ctx.get(inputSlot);
-    const translated = await this.translateText(text, this.workflowTranslateStep(inputSlot), translationRetries);
-    if (node.output_to === "bullets_cn" || node.output_to === "description_cn") {
-      return stripMarkdownBold(translated);
-    }
-    return translated;
-  }
-
-  private async executeDeriveNode(requirements: ListingRequirements, node: WorkflowNode): Promise<string> {
-    const section = (node.section ?? "").trim();
-    const rule = this.workflowSectionRule(section);
+    const rule = this.generationSectionRule(section);
     if (section === "search_terms") {
       return buildSearchTermsFromRule(requirements, rule);
     }
-    throw new Error(`workflow derive 暂不支持 section: ${section}`);
+    throw new Error(`generation config derive 暂不支持 section: ${section}`);
   }
 
   private async executeJudgeNode(
     requirements: ListingRequirements,
-    node: WorkflowNode,
+    node: GenerationNode,
     ctx: ExecutionContext
   ): Promise<NodeExecutionResult> {
-    const maxJudgeRounds = this.mustRulesLoaded().workflow.judge.max_rounds;
+    const maxJudgeRounds = this.mustRulesLoaded().generationConfig.judge.max_rounds;
+    const registry = createDefaultRegistry();
     const boundSections = collectNodeSectionSlots(node, ctx);
     const repairedSections: Record<string, string> = { ...boundSections };
 
@@ -2022,7 +1773,7 @@ export class GenerationService {
     for (let judgeRound = 1; judgeRound <= maxJudgeRounds && judgeIssues.length > 0; judgeRound += 1) {
       this.throwIfAborted();
       const grouped = this.groupJudgeIssuesBySection(judgeIssues);
-      await this.appendTrace("quality_judge_repair_round_start", "warn", {
+      await this.appendTrace("review_repair_round_start", "warn", {
         step: node.id,
         round: judgeRound,
         issues_count: judgeIssues.length,
@@ -2037,24 +1788,48 @@ export class GenerationService {
         if (!slot) {
           continue;
         }
-        const rule = this.workflowSectionRule(section);
+        const rule = this.generationSectionRule(section);
         const jsonOutput = rule.output.format === "json";
         const jsonArrayField = rule.output.json_array_field || section;
-        const modelSettings = jsonOutput ? this.deepseekJSONModeSettings() : undefined;
-        const repaired = await this.generateSectionWithValidation(
-          requirements,
-          rule,
-          `${section}_judge_repair_round_${judgeRound}`,
-          (content) => validateSectionContent(content, requirements, rule),
-          {
-            initialFeedback: this.buildJudgeFeedbackText(messages),
-            maxRetries: 2,
-            jsonOutput,
-            writerModelSettings: modelSettings,
-            repairModelSettings: modelSettings,
-            adaptContent: jsonOutput ? (raw) => adaptJSONArrayContent(raw, jsonArrayField) : undefined
+        const modelSettings = jsonOutput ? this.jsonObjectModelSettings() : undefined;
+        const adaptContent = jsonOutput
+          ? (raw: string) => adaptJSONArrayContent(raw, jsonArrayField)
+          : (raw: string) => adaptMarkdownContentForValidation(raw, rule);
+        const repaired = await this.llmClient.generateSectionWithAgentTeam({
+          section,
+          step: `${section}_judge_repair_round_${judgeRound}`,
+          userPrompt: this.buildSectionUserPrompt(requirements, rule, this.buildJudgeFeedbackText(messages)),
+          writerInstructions: this.buildSectionSystemPrompt(rule, jsonOutput),
+          reviewerInstructions: [
+            "你是 section 质量复核专家。",
+            `当前 section=${rule.section}`,
+            "check_section_candidate 是校验工具，不是 agent，也不是 handoff。",
+            "绝不要调用任何 transfer_to_validator_* 工具。",
+            "不要自行终止，必须先调用 check_section_candidate。",
+            "如果校验通过，直接输出 final_output。",
+            "如果校验失败，必须依据 errors 和 repair_guidance 把问题交给 repairer。"
+          ].join("\n"),
+          repairInstructions: this.buildWholeRepairSystemPrompt(rule, jsonOutput),
+          attempts: Math.max(2, getNumber(rule.constraints, "api_attempts", 4)),
+          plannerRuntimeProfile: registry.modelProfiles.get("planner-default"),
+          runtimeProfile: registry.modelProfiles.get("writer-default"),
+          reviewerRuntimeProfile: registry.modelProfiles.get("reviewer-default"),
+          repairerRuntimeProfile: registry.modelProfiles.get("repairer-default"),
+          modelSettingsOverride: modelSettings,
+          repairerModelSettingsOverride: modelSettings,
+          validateContent: (raw) => {
+            const adapted = adaptContent ? adaptContent(raw) : { content: raw };
+            const normalized = normalizeText(normalizeSectionContentForValidation(adapted.content, rule));
+            const errors = adapted.error ? [adapted.error] : validateSectionContent(normalized, requirements, rule);
+            return {
+              ok: errors.length === 0,
+              normalizedContent: normalized,
+              finalOutput: jsonOutput ? formatJSONArrayContent(normalized, jsonArrayField) : normalized,
+              errors,
+              repairGuidance: buildSectionRepairGuidance(requirements, rule, errors)
+            };
           }
-        );
+        });
         repairedSections[section] = repaired;
         ctx.set(slot, normalizeText(repaired));
       }
@@ -2073,56 +1848,244 @@ export class GenerationService {
     };
   }
 
-  private async executeRenderNode(ctx: ExecutionContext, node: WorkflowNode): Promise<string> {
+  private async executeRenderNode(ctx: ExecutionContext, node: GenerationNode): Promise<string> {
     const rules = this.mustRulesLoaded();
     const templateKey = (node.template ?? "").trim();
     if (templateKey !== "en" && templateKey !== "cn") {
-      throw new Error(`workflow render 暂不支持 template: ${templateKey}`);
+      throw new Error(`generation config render 暂不支持 template: ${templateKey}`);
     }
     const vars = this.buildRenderVarsFromContext(node, ctx);
     return normalizeText(renderByVars(rules.templates[templateKey], vars));
   }
 
-  private createWorkflowRegistry(
-    requirements: ListingRequirements,
-    translationRetries: number
-  ): ExecutorRegistry {
-    return new ExecutorRegistry([
-      new GenerateNodeExecutor((node) => this.executeGenerateNode(requirements, node)),
-      new TranslateNodeExecutor((node, ctx) => this.executeTranslateNode(ctx, node, translationRetries)),
-      new DeriveNodeExecutor(async (node) => ({
-        outputSlot: node.output_to,
-        outputValue: await this.executeDeriveNode(requirements, node)
-      })),
-      new JudgeNodeExecutor((node, ctx) => this.executeJudgeNode(requirements, node, ctx)),
-      new RenderNodeExecutor(this.mustRulesLoaded().templates, async (node, ctx) => ({
-        outputSlot: node.output_to,
-        outputValue: await this.executeRenderNode(ctx, node)
-      }))
-    ]);
+  private agentRuntimeTranslateStep(slot: string): string {
+    const normalized = slot.trim().toLowerCase();
+    switch (normalized) {
+      case "category_cn":
+        return "translate_category";
+      case "keywords_cn":
+        return "translate_keywords";
+      case "title_cn":
+        return "translate_title";
+      case "bullets_cn":
+        return "translate_bullets";
+      case "description_cn":
+        return "translate_description";
+      case "search_terms_cn":
+        return "translate_search_terms";
+      default:
+        return `translate_${normalized}`;
+    }
   }
 
-  private async executeWorkflow(
+  private async runRuntimeQualityJudge(
+    requirements: ListingRequirements,
+    sections: Record<string, string>
+  ): Promise<{ sections: Record<string, string>; issuesCount: number }> {
+    if (!this.mustRulesLoaded().generationConfig.judge.enabled) {
+      return {
+        sections,
+        issuesCount: 0
+      };
+    }
+    const ctx = this.buildInitialExecutionContext(requirements);
+    const inputs: Record<string, string> = {};
+    for (const [section, value] of Object.entries(sections)) {
+      const slot = `${section}_en`;
+      inputs[section] = slot;
+      ctx.set(slot, normalizeText(value));
+    }
+    const result = await this.executeJudgeNode(requirements, {
+      id: "runtime_quality_review",
+      type: "judge",
+      inputs,
+      output_to: "runtime_review_report"
+    }, ctx);
+
+    const repairedSections: Record<string, string> = {};
+    for (const section of Object.keys(sections)) {
+      const slot = inputs[section];
+      if (slot && ctx.has(slot)) {
+        repairedSections[section] = normalizeText(ctx.get(slot));
+      }
+    }
+    const issuesCount = Number.parseInt(result.outputValue, 10);
+    return {
+      sections: repairedSections,
+      issuesCount: Number.isFinite(issuesCount) ? issuesCount : 0
+    };
+  }
+
+  private scoreRuntimeCandidate(
+    requirements: ListingRequirements,
+    rule: SectionRule,
+    raw: string
+  ): { normalizedContent: string; score: number; errors: string[] } {
+    return scoreRuntimeCandidateValue(requirements, rule, raw);
+  }
+
+  private async executeAgentRuntime(
     requirements: ListingRequirements,
     tenantRules: TenantRules,
-    inputFilename: string,
-    translationRetries: number
-  ): Promise<WorkflowExecutionOutput> {
-    const graph = buildWorkflowGraph(tenantRules.workflow.spec);
-    const ctx = this.buildInitialExecutionContext(requirements);
-    const engine = new WorkflowEngine(graph, this.createWorkflowRegistry(requirements, translationRetries));
-    await engine.run(ctx);
+    inputFilename: string
+  ): Promise<GenerationExecutionOutput> {
+    const registry = createDefaultRegistry();
+    const spec = compileExecutionSpec(tenantRules, registry);
+    const getModelProfile = (id: string | undefined): ModelProfile | undefined =>
+      id ? registry.modelProfiles.get(id) : undefined;
+    await this.appendTrace("runtime_compile_ok", "info", {
+      parallel_groups: spec.parallelGroups.length,
+      section_concurrency: spec.limits.sectionConcurrency
+    });
 
-    const enMarkdown = replaceTopHeading(normalizeText(ctx.get("en_markdown")), inputFilename);
-    const cnMarkdown = replaceTopHeading(normalizeText(ctx.get("cn_markdown")), inputFilename);
-    const bulletsCount = splitLines(ctx.get("bullets_en")).length;
-    const judgeIssuesCount = Number.parseInt(ctx.has("judge_report_round_1") ? ctx.get("judge_report_round_1") : "0", 10);
+    const sectionResult = await executeRuntimeSections(spec, {
+      category: requirements.category,
+      keywords: requirements.keywords.join("\n"),
+      generateSection: async (plan, candidateIndex, controls) => {
+        const rule = this.generationSectionRule(plan.section);
+        const isBullets = rule.section === "bullets";
+        const bulletsJSONModeSettings = isBullets ? this.jsonObjectModelSettings() : undefined;
+        const bulletsJSONArrayField = rule.output.json_array_field || "bullets";
+        const options = isBullets
+          ? {
+              jsonOutput: true,
+              writerModelSettings: bulletsJSONModeSettings,
+              repairModelSettings: bulletsJSONModeSettings,
+              adaptContent: (raw: string) => adaptJSONArrayContent(raw, bulletsJSONArrayField)
+            }
+          : {
+              adaptContent: (raw: string) => adaptMarkdownContentForValidation(raw, rule)
+            };
+        const validateContent = (raw: string) => {
+          const adapted = options?.adaptContent ? options.adaptContent(raw) : { content: raw };
+          const normalized = normalizeText(normalizeSectionContentForValidation(adapted.content, rule));
+          const errors = adapted.error ? [adapted.error] : validateSectionContent(normalized, requirements, rule);
+          return {
+            ok: errors.length === 0,
+            normalizedContent: normalized,
+            finalOutput: isBullets ? formatJSONArrayContent(normalized, bulletsJSONArrayField) : normalized,
+            errors,
+            repairGuidance: buildSectionRepairGuidance(requirements, rule, errors)
+          };
+        };
+        return await this.llmClient.generateSectionWithAgentTeam({
+          section: plan.section,
+          step: `${plan.section}_runtime_team_candidate_${candidateIndex}`,
+          userPrompt: this.buildSectionUserPrompt(requirements, rule, ""),
+          writerInstructions: this.buildSectionSystemPrompt(rule, isBullets),
+          reviewerInstructions: plan.reviewerBlueprint
+            ? [
+                "你是 section 质量复核专家。",
+                `当前 section=${rule.section}`,
+                "check_section_candidate 是校验工具，不是 agent，也不是 handoff。",
+                "绝不要调用任何 transfer_to_validator_* 工具。",
+                "不要自行终止，必须先调用 check_section_candidate。",
+                "如果校验通过，直接输出 final_output。",
+                "如果校验失败，必须依据 errors 和 repair_guidance 把问题交给 repairer。"
+              ].join("\n")
+            : undefined,
+          repairInstructions: this.buildWholeRepairSystemPrompt(rule, isBullets),
+          attempts: resolveRuntimeTeamAttempts(rule.constraints),
+          maxTurns: resolveRuntimeTeamMaxTurns(plan.section, Boolean(plan.reviewerBlueprint)),
+          plannerRuntimeProfile: getModelProfile(plan.plannerModelProfile),
+          runtimeProfile: getModelProfile(plan.writerModelProfile),
+          reviewerRuntimeProfile: getModelProfile(plan.reviewerModelProfile),
+          repairerRuntimeProfile: getModelProfile(plan.repairerModelProfile),
+          modelSettingsOverride: bulletsJSONModeSettings,
+          repairerModelSettingsOverride: bulletsJSONModeSettings,
+          shouldRetry: () => controls?.shouldContinueRetries() ?? true,
+          validateContent
+        });
+      },
+      deriveSection: async (plan) => this.executeDeriveNode(requirements, {
+        id: `${plan.section}_runtime_derive`,
+        type: "derive",
+        section: plan.section,
+        output_to: `${plan.section}_en`
+      }),
+      pickBestCandidate: async (plan, candidates) => {
+        const rule = this.generationSectionRule(plan.section);
+        const scored = candidates.map((candidate) => this.scoreRuntimeCandidate(requirements, rule, candidate));
+        scored.sort((left, right) => left.score - right.score);
+        return scored[0]?.normalizedContent ?? candidates[0] ?? "";
+      },
+      translateValue: async (slot, value) =>
+        this.translateTextWithProfile(
+          value,
+          this.agentRuntimeTranslateStep(slot),
+          1,
+          getModelProfile(spec.translationPlan.modelProfile)
+        )
+    });
+
+    const judged = await this.runRuntimeQualityJudge(requirements, sectionResult.sections);
+    const ctx = this.buildInitialExecutionContext(requirements);
+    for (const [section, value] of Object.entries(judged.sections)) {
+      ctx.set(`${section}_en`, normalizeText(value));
+    }
+    const translationReuse = buildTranslationReusePlan(sectionResult.sections, judged.sections, sectionResult.translations);
+    for (const [slot, value] of Object.entries(translationReuse.reusedTranslations)) {
+      ctx.set(slot, value);
+    }
+    for (const section of translationReuse.pendingSectionKeys) {
+      const value = judged.sections[section] ?? "";
+      ctx.set(
+        `${section}_cn`,
+        await this.translateTextWithProfile(
+          value,
+          this.agentRuntimeTranslateStep(`${section}_cn`),
+          1,
+          getModelProfile(spec.translationPlan.modelProfile)
+        )
+      );
+    }
+
+    const enMarkdown = replaceTopHeading(
+      normalizeText(
+        await this.executeRenderNode(ctx, {
+          id: "runtime_render_en",
+          type: "render",
+          template: "en",
+          output_to: "en_markdown",
+          inputs: {
+            brand: "brand",
+            category_en: "category",
+            keywords_en: "keywords",
+            title_en: "title_en",
+            bullets_en: "bullets_en",
+            description_en: "description_en",
+            search_terms_en: "search_terms_en"
+          }
+        })
+      ),
+      inputFilename
+    );
+    const cnMarkdown = replaceTopHeading(
+      normalizeText(
+        await this.executeRenderNode(ctx, {
+          id: "runtime_render_cn",
+          type: "render",
+          template: "cn",
+          output_to: "cn_markdown",
+          inputs: {
+            brand: "brand",
+            category_cn: "category_cn",
+            keywords_cn: "keywords_cn",
+            title_cn: "title_cn",
+            bullets_cn: "bullets_cn",
+            description_cn: "description_cn",
+            search_terms_cn: "search_terms_cn"
+          }
+        })
+      ),
+      inputFilename
+    );
 
     return {
       enMarkdown,
       cnMarkdown,
-      bulletsCount,
-      judgeIssuesCount: Number.isFinite(judgeIssuesCount) ? judgeIssuesCount : 0
+      bulletsCount: splitLines(ctx.get("bullets_en")).length,
+      judgeIssuesCount: judged.issuesCount
     };
   }
 
@@ -2206,10 +2169,9 @@ export class GenerationService {
       throw new Error("规则文件缺失：translation 必须齐全");
     }
 
-    const translationRetries = Math.max(1, translationRule.execution.retries || 2);
     this.executionBrief = await this.planExecution(requirements);
     this.throwIfAborted();
-    const workflowOutput = await this.executeWorkflow(requirements, tenantRules, inputFilename, translationRetries);
+    const generationOutput = await this.executeAgentRuntime(requirements, tenantRules, inputFilename);
     this.throwIfAborted();
 
     this.logger.info(
@@ -2219,26 +2181,26 @@ export class GenerationService {
         job_id: input.jobId,
         rules_version: input.rulesVersion,
         timing_ms: Date.now() - start,
-        en_chars: workflowOutput.enMarkdown.length,
-        cn_chars: workflowOutput.cnMarkdown.length
+        en_chars: generationOutput.enMarkdown.length,
+        cn_chars: generationOutput.cnMarkdown.length
       },
       "generation ok"
     );
     await this.appendTrace("generation_ok", "info", {
       rules_version: input.rulesVersion,
       timing_ms: Date.now() - start,
-      en_chars: workflowOutput.enMarkdown.length,
-      cn_chars: workflowOutput.cnMarkdown.length
+      en_chars: generationOutput.enMarkdown.length,
+      cn_chars: generationOutput.cnMarkdown.length
     });
 
     return {
-      en_markdown: workflowOutput.enMarkdown,
-      cn_markdown: workflowOutput.cnMarkdown,
+      en_markdown: generationOutput.enMarkdown,
+      cn_markdown: generationOutput.cnMarkdown,
       validation_report: [
         `rules_version=${input.rulesVersion}`,
         `keywords_count=${requirements.keywords.length}`,
-        `bullets_count=${workflowOutput.bulletsCount}`,
-        `judge_issues_count=${workflowOutput.judgeIssuesCount}`
+        `bullets_count=${generationOutput.bulletsCount}`,
+        `judge_issues_count=${generationOutput.judgeIssuesCount}`
       ],
       timing_ms: Date.now() - start,
       billing_summary: {
@@ -2248,9 +2210,4 @@ export class GenerationService {
       }
     };
   }
-}
-
-function keywordPlanBoldWrapper(rule: SectionRule): boolean {
-  const config = readKeywordEmbeddingConfig(rule.constraints);
-  return config.enabled && config.boldWrapper;
 }

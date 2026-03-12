@@ -14,7 +14,6 @@ export interface LLMHealthReport {
   checked_at: string;
   cached: boolean;
   llm: {
-    fluxcode: ProviderHealth;
     deepseek: ProviderHealth;
   };
 }
@@ -50,13 +49,12 @@ export class LLMHealthService {
       return { ...this.cachedReport, cached: true };
     }
 
-    const [fluxcode, deepseek] = await Promise.all([this.checkFluxcode(), this.checkDeepseek()]);
+    const deepseek = await this.checkDeepseek();
     const report: LLMHealthReport = {
-      ok: fluxcode.ok && deepseek.ok,
+      ok: deepseek.ok,
       checked_at: new Date().toISOString(),
       cached: false,
       llm: {
-        fluxcode,
         deepseek
       }
     };
@@ -64,66 +62,6 @@ export class LLMHealthService {
     this.cachedReport = report;
     this.cacheExpireAtMs = now + this.env.healthcheckLlmCacheSeconds * 1000;
     return report;
-  }
-
-  private async checkFluxcode(): Promise<ProviderHealth> {
-    const checkedAt = new Date().toISOString();
-    const required = this.env.generationProvider === "fluxcode";
-    if (!this.env.fluxcodeApiKey) {
-      if (!required) {
-        return {
-          ok: true,
-          checked_at: checkedAt,
-          required: false,
-          error: "not_required"
-        };
-      }
-      return {
-        ok: false,
-        checked_at: checkedAt,
-        required: true,
-        error: "FLUXCODE_API_KEY 未配置"
-      };
-    }
-    const url = joinUrl(this.env.fluxcodeBaseUrl, this.env.fluxcodeResponsesPath);
-
-    try {
-      await withRetry(
-        async () => {
-          const response = await fetch(url, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${this.env.fluxcodeApiKey}`
-            },
-            signal: AbortSignal.timeout(this.env.healthcheckLlmTimeoutSeconds * 1000),
-            body: JSON.stringify({
-              model: this.env.fluxcodeModel,
-              reasoning: { effort: "low" },
-              temperature: 0,
-              max_output_tokens: 1,
-              input: [{ role: "user", content: [{ type: "input_text", text: "ping" }] }]
-            })
-          });
-
-          if (!response.ok) {
-            const body = await readBodySafe(response);
-            throw new Error(`status=${response.status} body=${body}`);
-          }
-        },
-        {
-          attempts: this.env.healthcheckLlmRetries,
-          baseMs: this.env.retryBaseMs,
-          maxMs: this.env.retryMaxMs,
-          jitter: this.env.retryJitter
-        }
-      );
-      return { ok: true, checked_at: checkedAt, required };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.logger.warn({ event: "health_fluxcode_invalid", error: message }, "fluxcode key check failed");
-      return { ok: false, checked_at: checkedAt, required, error: message };
-    }
   }
 
   private async checkDeepseek(): Promise<ProviderHealth> {
