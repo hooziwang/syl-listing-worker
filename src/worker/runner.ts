@@ -225,7 +225,7 @@ export function createJobProcessor(
           final_attempt: true
         });
       } else {
-        await store.markStatus(jobId, "running");
+        await store.markStatus(jobId, "retrying");
         jobLogger.warn(
           {
             event: "job_retry_scheduled",

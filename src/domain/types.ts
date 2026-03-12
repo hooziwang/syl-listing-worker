@@ -1,4 +1,4 @@
-export type JobStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+export type JobStatus = "queued" | "running" | "retrying" | "succeeded" | "failed" | "cancelled";
 
 export interface ListingResult {
   en_markdown: string;

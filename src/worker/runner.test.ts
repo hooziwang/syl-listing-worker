@@ -85,5 +85,6 @@ test("非最终重试不会清掉取消请求标记", async () => {
     []
   );
   assert.ok(calls.includes("markStatus:job-1:running"));
-  assert.equal(calls.filter((entry) => entry === "markStatus:job-1:running").length, 2);
+  assert.ok(calls.includes("markStatus:job-1:retrying"));
+  assert.equal(calls.filter((entry) => entry === "markStatus:job-1:running").length, 1);
 });
