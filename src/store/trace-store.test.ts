@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { RedisJobEventBus } from "./job-events.js";
 import { RedisTraceStore } from "./trace-store.js";
 
 type TraceSource = "api" | "runner" | "generation" | "llm";
@@ -40,6 +41,7 @@ class FakeRedis {
   readonly getCalls: string[] = [];
   readonly expireCalls: Array<{ key: string; ttlSeconds: number }> = [];
   readonly rpushCalls: Array<{ key: string; value: string }> = [];
+  readonly publishCalls: Array<{ channel: string; message: string }> = [];
   pipelineExecCount = 0;
   delayNextSet: Promise<void> | null = null;
   pipelineRpushError: Error | null = null;
@@ -74,6 +76,11 @@ class FakeRedis {
 
   async expire(key: string, ttlSeconds: number): Promise<number> {
     this.expireCalls.push({ key, ttlSeconds });
+    return 1;
+  }
+
+  async publish(channel: string, message: string): Promise<number> {
+    this.publishCalls.push({ channel, message });
     return 1;
   }
 
@@ -154,4 +161,29 @@ test("append 会透传 pipeline 内部的 Redis 错误", async () => {
     () => store.append(buildEvent("job-3")),
     /WRONGTYPE Operation against a key holding the wrong kind of value/
   );
+});
+
+test("append 会发布实时 trace 事件，供 SSE 订阅使用", async () => {
+  const redis = new FakeRedis();
+  const store = new RedisTraceStore(redis as never, 60, new RedisJobEventBus(redis as never));
+
+  await store.append(buildEvent("job-live", "generation"));
+
+  assert.equal(redis.publishCalls.length, 1);
+  assert.equal(redis.publishCalls[0]?.channel, "syl:job:event:job-live");
+
+  const payload = JSON.parse(redis.publishCalls[0]!.message) as {
+    type: string;
+    offset: number;
+    item: {
+      job_id: string;
+      source: string;
+      event: string;
+    };
+  };
+  assert.equal(payload.type, "trace");
+  assert.equal(payload.offset, 1);
+  assert.equal(payload.item.job_id, "job-live");
+  assert.equal(payload.item.source, "generation");
+  assert.equal(payload.item.event, "trace_event");
 });

@@ -3,6 +3,7 @@ import type { AppEnv } from "../config/env.js";
 import type { LLMHealthService } from "../services/llm-health.js";
 import type { RulesService } from "../services/rules-service.js";
 import type { VersionService } from "../services/version-service.js";
+import type { RedisJobEventBus } from "../store/job-events.js";
 import type { RedisJobStore } from "../store/job-store.js";
 import type { RedisTraceStore } from "../store/trace-store.js";
 import type { Queue } from "bullmq";
@@ -16,5 +17,6 @@ export interface ApiContext {
   versionService: VersionService;
   jobStore: RedisJobStore;
   traceStore: RedisTraceStore;
+  jobEvents: RedisJobEventBus;
   queue: Queue<GenerateJobData>;
 }

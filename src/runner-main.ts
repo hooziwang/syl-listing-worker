@@ -2,6 +2,7 @@ import { loadEnv } from "./config/env.js";
 import { createLogger } from "./config/logger.js";
 import { createRedisConnection } from "./queue/redis.js";
 import { RulesService } from "./services/rules-service.js";
+import { RedisJobEventBus } from "./store/job-events.js";
 import { RedisJobStore } from "./store/job-store.js";
 import { RedisTraceStore } from "./store/trace-store.js";
 import { createJobRunner } from "./worker/runner.js";
@@ -9,8 +10,9 @@ import { createJobRunner } from "./worker/runner.js";
 const env = loadEnv();
 const logger = createLogger(env);
 const redis = createRedisConnection(env.redisUrl);
-const store = new RedisJobStore(redis, env.jobTtlSeconds);
-const traceStore = new RedisTraceStore(redis, env.jobTtlSeconds);
+const jobEvents = new RedisJobEventBus(redis);
+const store = new RedisJobStore(redis, env.jobTtlSeconds, jobEvents);
+const traceStore = new RedisTraceStore(redis, env.jobTtlSeconds, jobEvents);
 const rulesService = new RulesService(redis, env.rulesFsDir, env.apiPublicBaseUrl);
 
 await rulesService.bootstrap({

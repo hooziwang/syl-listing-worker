@@ -1,5 +1,6 @@
 import type { Redis } from "ioredis";
 import type { JobRecord, JobStatus, ListingResult } from "../domain/types.js";
+import type { RedisJobEventBus } from "./job-events.js";
 
 const JOB_KEY_PREFIX = "syl:job:";
 const JOB_CANCEL_KEY_PREFIX = "syl:job:cancel:";
@@ -16,7 +17,8 @@ function cancelKey(jobId: string): string {
 export class RedisJobStore {
   constructor(
     private readonly redis: Redis,
-    private readonly ttlSeconds: number
+    private readonly ttlSeconds: number,
+    private readonly jobEvents?: RedisJobEventBus
   ) {}
 
   async createQueued(jobId: string, tenantId: string): Promise<JobRecord> {
@@ -30,6 +32,9 @@ export class RedisJobStore {
       updated_at: now
     });
     await this.redis.expire(key, this.ttlSeconds);
+    if (this.jobEvents) {
+      await this.jobEvents.publishStatus(jobId, tenantId, "queued", now);
+    }
     return {
       id: jobId,
       tenant_id: tenantId,
@@ -41,44 +46,76 @@ export class RedisJobStore {
 
   async markStatus(jobId: string, status: JobStatus): Promise<void> {
     const key = jobKey(jobId);
+    const updatedAt = new Date().toISOString();
     await this.redis.hset(key, {
       status,
-      updated_at: new Date().toISOString()
+      updated_at: updatedAt
     });
     await this.redis.expire(key, this.ttlSeconds);
+    if (!this.jobEvents) {
+      return;
+    }
+    const record = await this.get(jobId);
+    if (record) {
+      await this.jobEvents.publishStatus(jobId, record.tenant_id, status, updatedAt, record.error_message);
+    }
   }
 
   async markFailed(jobId: string, message: string): Promise<void> {
     const key = jobKey(jobId);
+    const updatedAt = new Date().toISOString();
     await this.redis.hset(key, {
       status: "failed",
       error_message: message,
-      updated_at: new Date().toISOString()
+      updated_at: updatedAt
     });
     await this.redis.del(cancelKey(jobId));
     await this.redis.expire(key, this.ttlSeconds);
+    if (!this.jobEvents) {
+      return;
+    }
+    const record = await this.get(jobId);
+    if (record) {
+      await this.jobEvents.publishStatus(jobId, record.tenant_id, "failed", updatedAt, message);
+    }
   }
 
   async markCancelled(jobId: string, message = "任务已取消"): Promise<void> {
     const key = jobKey(jobId);
+    const updatedAt = new Date().toISOString();
     await this.redis.hset(key, {
       status: "cancelled",
       error_message: message,
-      updated_at: new Date().toISOString()
+      updated_at: updatedAt
     });
     await this.redis.del(cancelKey(jobId));
     await this.redis.expire(key, this.ttlSeconds);
+    if (!this.jobEvents) {
+      return;
+    }
+    const record = await this.get(jobId);
+    if (record) {
+      await this.jobEvents.publishStatus(jobId, record.tenant_id, "cancelled", updatedAt, message);
+    }
   }
 
   async markSucceeded(jobId: string, result: ListingResult): Promise<void> {
     const key = jobKey(jobId);
+    const updatedAt = new Date().toISOString();
     await this.redis.hset(key, {
       status: "succeeded",
       result_json: JSON.stringify(result),
-      updated_at: new Date().toISOString()
+      updated_at: updatedAt
     });
     await this.redis.del(cancelKey(jobId));
     await this.redis.expire(key, this.ttlSeconds);
+    if (!this.jobEvents) {
+      return;
+    }
+    const record = await this.get(jobId);
+    if (record) {
+      await this.jobEvents.publishStatus(jobId, record.tenant_id, "succeeded", updatedAt);
+    }
   }
 
   async requestCancel(jobId: string): Promise<void> {

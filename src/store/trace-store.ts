@@ -1,4 +1,5 @@
 import type { Redis } from "ioredis";
+import type { RedisJobEventBus } from "./job-events.js";
 
 const TRACE_KEY_PREFIX = "syl:trace:job:";
 const TRACE_START_KEY_PREFIX = "syl:trace:job-start:";
@@ -30,7 +31,8 @@ export class RedisTraceStore {
 
   constructor(
     private readonly redis: Redis,
-    private readonly ttlSeconds: number
+    private readonly ttlSeconds: number,
+    private readonly jobEvents?: RedisJobEventBus
   ) {}
 
   private rememberStartMs(jobId: string, startMs: number): number {
@@ -115,10 +117,18 @@ export class RedisTraceStore {
     if (!results) {
       throw new Error("redis pipeline exec returned null");
     }
+    let traceOffset = 0;
     for (const [error] of results) {
       if (error) {
         throw error;
       }
+    }
+    const rpushResult = results[0]?.[1];
+    if (typeof rpushResult === "number" && Number.isFinite(rpushResult) && rpushResult > 0) {
+      traceOffset = rpushResult;
+    }
+    if (this.jobEvents && traceOffset > 0) {
+      await this.jobEvents.publishTrace(evt.job_id, evt.tenant_id, traceOffset, enriched);
     }
   }
 

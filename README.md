@@ -170,7 +170,7 @@ render:
 - `POST /v1/rules/refresh`
 - `GET /v1/rules/download/:tenant/:version`
 - `POST /v1/generate`
-- `GET /v1/jobs/:jobId`
+- `GET /v1/jobs/:jobId/events`
 - `GET /v1/jobs/:jobId/result`
 - `GET /v1/admin/version`
 - `GET /v1/admin/logs/trace/:jobId`

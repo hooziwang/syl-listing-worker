@@ -2,7 +2,9 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { createHash } from "node:crypto";
 import { basename } from "node:path";
 import { z } from "zod";
+import type { JobStatus } from "../domain/types.js";
 import { enqueueGenerateJob } from "../queue/jobs.js";
+import type { JobEventMessage, StatusJobEventMessage, TraceJobEventMessage } from "../store/job-events.js";
 import { randomId } from "../utils/id.js";
 import type { ApiContext } from "./types.js";
 
@@ -112,6 +114,21 @@ function requestBaseURL(request: FastifyRequest): string {
       : request.headers.host || "127.0.0.1:8080";
 
   return `${proto}://${host}`;
+}
+
+function isTerminalStatus(status: JobStatus): boolean {
+  return status === "succeeded" || status === "failed" || status === "cancelled";
+}
+
+function writeSSE(reply: FastifyReply, eventName: string, payload: unknown, id?: string): void {
+  if (reply.raw.writableEnded) {
+    return;
+  }
+  if (id) {
+    reply.raw.write(`id: ${id}\n`);
+  }
+  reply.raw.write(`event: ${eventName}\n`);
+  reply.raw.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
 export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Promise<void> {
@@ -393,38 +410,6 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
       };
     });
 
-    securedApp.get("/v1/jobs/:jobId", async (request, reply) => {
-      const params = z.object({ jobId: z.string().min(1) }).parse(request.params);
-      const tenantId = request.auth!.tenant_id;
-
-      const record = await ctx.jobStore.get(params.jobId);
-      if (!record || record.tenant_id !== tenantId) {
-        return reply.code(404).send(withTenant(tenantId, { error: "job_not_found" }));
-      }
-
-      request.log.info(
-        {
-          event: "job_status_read",
-          req_id: request.id,
-          tenant_id: tenantId,
-          job_id: record.id,
-          status: record.status
-        },
-        "job status read"
-      );
-      await appendApiTrace(request, tenantId, record.id, "job_status_read", "info", {
-        status: record.status
-      });
-
-      return {
-        job_id: record.id,
-        status: record.status,
-        error: record.error_message || undefined,
-        updated_at: record.updated_at,
-        tenant_id: tenantId
-      };
-    });
-
     securedApp.post("/v1/jobs/:jobId/cancel", async (request, reply) => {
       const params = z.object({ jobId: z.string().min(1) }).parse(request.params);
       const tenantId = request.auth!.tenant_id;
@@ -489,11 +474,10 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
       };
     });
 
-    securedApp.get("/v1/jobs/:jobId/trace", async (request, reply) => {
+    securedApp.get("/v1/jobs/:jobId/events", async (request, reply) => {
       const params = z.object({ jobId: z.string().min(1) }).parse(request.params);
       const query = z
         .object({
-          limit: z.coerce.number().int().positive().max(1000).optional(),
           offset: z.coerce.number().int().min(0).optional()
         })
         .parse(request.query);
@@ -504,29 +488,166 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
         return reply.code(404).send(withTenant(tenantId, { error: "job_not_found" }));
       }
 
-      const limit = query.limit ?? 200;
-      const offset = query.offset ?? 0;
-      const [items, traceCount] = await Promise.all([
-        ctx.traceStore.list(params.jobId, limit, offset),
-        ctx.traceStore.count(params.jobId)
-      ]);
-      const nextOffset = offset + items.length;
-      const hasMore = nextOffset < traceCount;
+      reply.hijack();
+      reply.raw.statusCode = 200;
+      reply.raw.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      reply.raw.setHeader("Cache-Control", "no-cache, no-transform");
+      reply.raw.setHeader("Connection", "keep-alive");
+      reply.raw.setHeader("X-Accel-Buffering", "no");
+      reply.raw.setHeader("x-tenant-id", tenantId);
+      reply.raw.flushHeaders?.();
 
-      reply.header("x-tenant-id", tenantId);
-      return {
-        ok: true,
-        tenant_id: tenantId,
-        job_id: params.jobId,
-        job_status: record.status,
-        updated_at: record.updated_at,
-        trace_count: traceCount,
-        limit,
-        offset,
-        next_offset: nextOffset,
-        has_more: hasMore,
-        items
+      let lastTraceOffset = query.offset ?? 0;
+      let lastStatusKey = "";
+      let cleanedUp = false;
+      let closeTimer: ReturnType<typeof setTimeout> | undefined;
+      let keepaliveTimer: ReturnType<typeof setInterval> | undefined;
+      const bufferedEvents: JobEventMessage[] = [];
+      let backlogReady = false;
+      const subscriber = ctx.jobEvents.createSubscriber();
+
+      const cleanup = async () => {
+        if (cleanedUp) {
+          return;
+        }
+        cleanedUp = true;
+        if (closeTimer) {
+          clearTimeout(closeTimer);
+        }
+        if (keepaliveTimer) {
+          clearInterval(keepaliveTimer);
+        }
+        await subscriber.close();
+        if (!reply.raw.writableEnded) {
+          reply.raw.end();
+        }
       };
+
+      const emitTrace = (evt: TraceJobEventMessage) => {
+        if (evt.offset <= lastTraceOffset) {
+          return;
+        }
+        lastTraceOffset = evt.offset;
+        writeSSE(reply, "trace", evt, String(evt.offset));
+      };
+
+      const emitStatus = (evt: StatusJobEventMessage, closeImmediately = false) => {
+        const statusKey = `${evt.status}:${evt.updated_at}:${evt.error ?? ""}`;
+        if (statusKey === lastStatusKey) {
+          if (closeImmediately && isTerminalStatus(evt.status)) {
+            void cleanup();
+          }
+          return;
+        }
+        lastStatusKey = statusKey;
+        writeSSE(reply, "status", evt);
+        if (!isTerminalStatus(evt.status)) {
+          return;
+        }
+        if (closeImmediately) {
+          void cleanup();
+          return;
+        }
+        if (closeTimer) {
+          clearTimeout(closeTimer);
+        }
+        closeTimer = setTimeout(() => {
+          void cleanup();
+        }, 300);
+      };
+
+      const dispatchEvent = (evt: JobEventMessage) => {
+        if (cleanedUp) {
+          return;
+        }
+        if (evt.type === "trace") {
+          emitTrace(evt);
+          return;
+        }
+        emitStatus(evt);
+      };
+
+      try {
+        await subscriber.subscribe(params.jobId, (evt) => {
+          if (!backlogReady) {
+            bufferedEvents.push(evt);
+            return;
+          }
+          dispatchEvent(evt);
+        });
+
+        for (;;) {
+          const items = await ctx.traceStore.list(params.jobId, 500, lastTraceOffset);
+          if (items.length === 0) {
+            break;
+          }
+          for (const item of items) {
+            emitTrace({
+              type: "trace",
+              job_id: params.jobId,
+              tenant_id: item.tenant_id,
+              offset: lastTraceOffset + 1,
+              item
+            });
+          }
+          if (items.length < 500) {
+            break;
+          }
+        }
+
+        backlogReady = true;
+        for (const evt of bufferedEvents.splice(0)) {
+          dispatchEvent(evt);
+        }
+
+        const latest = await ctx.jobStore.get(params.jobId);
+        if (!latest || latest.tenant_id !== tenantId) {
+          await cleanup();
+          return;
+        }
+        emitStatus(
+          {
+            type: "status",
+            job_id: latest.id,
+            tenant_id: latest.tenant_id,
+            status: latest.status,
+            updated_at: latest.updated_at,
+            error: latest.error_message
+          },
+          isTerminalStatus(latest.status)
+        );
+        if (isTerminalStatus(latest.status)) {
+          return;
+        }
+
+        keepaliveTimer = setInterval(() => {
+          if (!reply.raw.writableEnded) {
+            reply.raw.write(": keepalive\n\n");
+          }
+        }, 15_000);
+
+        request.raw.on("close", () => {
+          void cleanup();
+        });
+      } catch (error) {
+        request.log.error(
+          {
+            event: "job_events_stream_failed",
+            req_id: request.id,
+            tenant_id: tenantId,
+            job_id: params.jobId,
+            message: error instanceof Error ? error.message : String(error)
+          },
+          "job events stream failed"
+        );
+        if (!reply.raw.headersSent) {
+          reply.raw.statusCode = 500;
+          reply.raw.setHeader("Content-Type", "application/json; charset=utf-8");
+          reply.raw.end(JSON.stringify(withTenant(tenantId, { error: "job_events_stream_failed" })));
+          return;
+        }
+        await cleanup();
+      }
     });
 
     securedApp.get("/v1/jobs/:jobId/result", async (request, reply) => {
