@@ -218,3 +218,118 @@ test("generateSectionWithAgentTeam starts reviewer-free sections from writer age
   assert.equal(result, "description content");
   assert.deepEqual(agentNames, ["writer_description_runtime_team_candidate_1"]);
 });
+
+test("generateSectionWithAgentTeam emits lifecycle trace for turns handoffs and tool calls", async () => {
+  const traces: Array<{ event: string; payload?: Record<string, unknown> }> = [];
+  const infos: Array<Record<string, unknown>> = [];
+  const client = new LLMClient(
+    createEnv(),
+    {
+      info(payload: Record<string, unknown>) {
+        infos.push(payload);
+      },
+      warn() {},
+      error() {}
+    } as any,
+    {
+      append(entry: { event: string; payload?: Record<string, unknown> }) {
+        traces.push(entry);
+        return Promise.resolve();
+      }
+    } as any,
+    {
+      tenantId: "syl",
+      jobId: "job_test"
+    }
+  );
+
+  (client as any).resolveGenerationRuntime = () => ({
+    generationProvider: "deepseek",
+    runner: {
+      run: async (entryAgent: {
+        handoffs?: Array<{ handoffs?: unknown[]; tools?: Array<{ name?: string }> }>;
+        emit: (event: string, ...args: unknown[]) => void;
+      }) => {
+        const planner = entryAgent as any;
+        const writer = planner.handoffs?.[0] as any;
+        const reviewer = writer.handoffs?.[0] as any;
+        const validateTool = writer.tools?.[0] as any;
+        const runContext = {} as any;
+        const toolCall = {
+          id: "call_1",
+          callId: "call_1",
+          type: "function_call",
+          name: "check_section_candidate",
+          arguments: "{\"content\":\"draft\"}"
+        } as any;
+
+        planner.emit("agent_start", runContext, []);
+        planner.emit("agent_handoff", runContext, writer);
+        planner.emit("agent_end", runContext, "handoff to writer");
+
+        writer.emit("agent_start", runContext, []);
+        writer.emit("agent_tool_start", runContext, validateTool, { toolCall });
+        writer.emit("agent_tool_end", runContext, validateTool, "{\"ok\":false}", { toolCall });
+        writer.emit("agent_handoff", runContext, reviewer);
+        writer.emit("agent_end", runContext, "handoff to reviewer");
+
+        reviewer.emit("agent_start", runContext, []);
+        reviewer.emit("agent_tool_start", runContext, validateTool, { toolCall });
+        reviewer.emit("agent_tool_end", runContext, validateTool, "{\"ok\":true}", { toolCall });
+        reviewer.emit("agent_end", runContext, "final text");
+
+        return {
+          finalOutput: "final text"
+        };
+      }
+    },
+    model: "deepseek-chat",
+    requestURL: "https://api.deepseek.com/chat/completions",
+    modelSettings: { temperature: 1.1 }
+  });
+
+  const result = await client.generateSectionWithAgentTeam({
+    section: "description",
+    step: "description_runtime_team_candidate_1",
+    userPrompt: "原始任务提示",
+    writerInstructions: "writer",
+    reviewerInstructions: "reviewer",
+    repairInstructions: "repair",
+    attempts: 1,
+    validateContent: (content) => ({
+      ok: true,
+      normalizedContent: content,
+      errors: []
+    })
+  });
+
+  assert.equal(result, "final text");
+  assert.deepEqual(
+    traces
+      .filter((entry) => entry.event.startsWith("agent_team_") && entry.event !== "agent_team_request")
+      .map((entry) => entry.event),
+    [
+      "agent_team_turn_start",
+      "agent_team_handoff",
+      "agent_team_turn_end",
+      "agent_team_turn_start",
+      "agent_team_tool_start",
+      "agent_team_tool_end",
+      "agent_team_handoff",
+      "agent_team_turn_end",
+      "agent_team_turn_start",
+      "agent_team_tool_start",
+      "agent_team_tool_end",
+      "agent_team_turn_end",
+      "agent_team_ok"
+    ]
+  );
+  const handoffTrace = traces.find((entry) => entry.event === "agent_team_handoff");
+  assert.equal(handoffTrace?.payload?.from_agent, "section_planner_description_runtime_team_candidate_1");
+  assert.equal(handoffTrace?.payload?.to_agent, "writer_description_runtime_team_candidate_1");
+  const toolTrace = traces.find((entry) => entry.event === "agent_team_tool_start");
+  assert.equal(toolTrace?.payload?.tool_name, "check_section_candidate");
+  assert.ok(infos.some((entry) => entry.event === "agent_team_turn_start"));
+  assert.ok(infos.some((entry) => entry.event === "agent_team_handoff"));
+  assert.ok(infos.some((entry) => entry.event === "agent_team_tool_start"));
+});

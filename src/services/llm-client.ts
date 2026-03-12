@@ -1,7 +1,7 @@
 import { Agent, MemorySession, OpenAIProvider, Runner, tool, type ModelSettings } from "@openai/agents";
 import type { Logger } from "pino";
 import { z } from "zod";
-import { buildSectionAgentTeam } from "../agent-runtime/section-team.js";
+import { buildSectionAgentTeam, type SectionAgentTeam } from "../agent-runtime/section-team.js";
 import type { ModelProfile } from "../agent-runtime/types.js";
 import type { AppEnv } from "../config/env.js";
 import type { RedisTraceStore } from "../store/trace-store.js";
@@ -166,6 +166,124 @@ export class LLMClient {
     const normalizedRole = role.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 24) || "agent";
     const normalizedStep = step.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 48) || "step";
     return `${normalizedRole}_${normalizedStep}`;
+  }
+
+  private createSectionAgentTeamLifecycleTracer(
+    section: string,
+    step: string,
+    team: SectionAgentTeam
+  ): { cleanup: () => void; flush: () => Promise<void> } {
+    const roleEntries = [
+      ["planner", team.plannerAgent],
+      ["writer", team.writerAgent],
+      ["reviewer", team.reviewerAgent],
+      ["repairer", team.repairerAgent]
+    ].filter((entry): entry is [string, Agent] => Boolean(entry[1]));
+    const pending = new Set<Promise<void>>();
+    const currentTurnByAgent = new Map<string, number>();
+    const listeners: Array<{ agent: Agent; event: string; listener: (...args: any[]) => void }> = [];
+    let nextTurnIndex = 0;
+
+    const enqueue = (task: Promise<void>) => {
+      pending.add(task);
+      void task.finally(() => {
+        pending.delete(task);
+      });
+    };
+
+    const write = (
+      event: string,
+      message: string,
+      payload: Record<string, unknown>
+    ) => enqueue((async () => {
+      await this.appendTrace(event, "info", payload);
+      this.logger.info({ event, ...payload }, message);
+    })());
+
+    const addListener = (agent: Agent, event: string, listener: (...args: any[]) => void) => {
+      agent.on(event as any, listener);
+      listeners.push({ agent, event, listener });
+    };
+
+    for (const [role, agent] of roleEntries) {
+      addListener(agent, "agent_start", (_context, _currentAgent, turnInput) => {
+        const turnIndex = ++nextTurnIndex;
+        currentTurnByAgent.set(agent.name, turnIndex);
+        write("agent_team_turn_start", "agent team turn start", {
+          section,
+          step,
+          turn_index: turnIndex,
+          agent_name: agent.name,
+          agent_role: role,
+          input_items: Array.isArray(turnInput) ? turnInput.length : 0
+        });
+      });
+
+      addListener(agent, "agent_end", (_context, output) => {
+        write("agent_team_turn_end", "agent team turn end", {
+          section,
+          step,
+          turn_index: currentTurnByAgent.get(agent.name) ?? nextTurnIndex,
+          agent_name: agent.name,
+          agent_role: role,
+          output_chars: outputToText(output).length
+        });
+      });
+
+      addListener(agent, "agent_handoff", (_context, nextAgent) => {
+        write("agent_team_handoff", "agent team handoff", {
+          section,
+          step,
+          turn_index: currentTurnByAgent.get(agent.name) ?? nextTurnIndex,
+          from_agent: agent.name,
+          from_role: role,
+          to_agent: nextAgent.name,
+          to_role: roleEntries.find((entry) => entry[1].name === nextAgent.name)?.[0] ?? "unknown"
+        });
+      });
+
+      addListener(agent, "agent_tool_start", (_context, toolDef, details) => {
+        const toolCall = details?.toolCall as { id?: string; callId?: string; name?: string } | undefined;
+        write("agent_team_tool_start", "agent team tool start", {
+          section,
+          step,
+          turn_index: currentTurnByAgent.get(agent.name) ?? nextTurnIndex,
+          agent_name: agent.name,
+          agent_role: role,
+          tool_name: toolDef.name,
+          tool_call_id: toolCall?.callId ?? toolCall?.id ?? "",
+          tool_call_name: toolCall?.name ?? toolDef.name
+        });
+      });
+
+      addListener(agent, "agent_tool_end", (_context, toolDef, result, details) => {
+        const toolCall = details?.toolCall as { id?: string; callId?: string; name?: string } | undefined;
+        write("agent_team_tool_end", "agent team tool end", {
+          section,
+          step,
+          turn_index: currentTurnByAgent.get(agent.name) ?? nextTurnIndex,
+          agent_name: agent.name,
+          agent_role: role,
+          tool_name: toolDef.name,
+          tool_call_id: toolCall?.callId ?? toolCall?.id ?? "",
+          tool_call_name: toolCall?.name ?? toolDef.name,
+          result_chars: outputToText(result).length
+        });
+      });
+    }
+
+    return {
+      cleanup: () => {
+        for (const { agent, event, listener } of listeners) {
+          agent.off(event as any, listener);
+        }
+      },
+      flush: async () => {
+        while (pending.size > 0) {
+          await Promise.all([...pending]);
+        }
+      }
+    };
   }
 
   private resolveGenerationRuntime(
@@ -406,6 +524,7 @@ export class LLMClient {
         });
 
         const session = new MemorySession();
+        const lifecycleTrace = this.createSectionAgentTeamLifecycleTracer(input.section, input.step, team);
         try {
           const prompt = retryValidationErrors.length > 0
             ? buildRetryUserPrompt(input.userPrompt, retryValidationErrors, retryRepairGuidance)
@@ -416,6 +535,7 @@ export class LLMClient {
             session,
             signal: this.abortSignal
           });
+          await lifecycleTrace.flush();
           const text = outputToText(result.finalOutput);
           if (!text) {
             throw new Error("section agent team output empty");
@@ -440,6 +560,7 @@ export class LLMClient {
           });
           return validation.normalizedContent;
         } catch (error) {
+          await lifecycleTrace.flush();
           const message = error instanceof Error ? error.message : String(error);
           const failurePayload = {
             provider: generationProvider,
@@ -457,6 +578,8 @@ export class LLMClient {
             "agent team candidate failed"
           );
           throw error;
+        } finally {
+          lifecycleTrace.cleanup();
         }
       },
       {
