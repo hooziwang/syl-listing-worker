@@ -6,7 +6,7 @@ import type { AppEnv } from "../config/env.js";
 import type { GenerateJobData } from "../queue/jobs.js";
 import { GenerationService, InputValidationError } from "../services/generation-service.js";
 import { RulesService } from "../services/rules-service.js";
-import { RedisJobStore } from "../store/job-store.js";
+import { JOB_CANCEL_CHANNEL, RedisJobStore } from "../store/job-store.js";
 import { RedisTraceStore } from "../store/trace-store.js";
 
 type GenerationServiceFactory = (
@@ -19,6 +19,13 @@ type GenerationServiceFactory = (
   },
   abortSignal: AbortSignal
 ) => Pick<GenerationService, "generate">;
+
+type CancelSubscriptionCleanup = () => Promise<void> | void;
+
+type CancelSubscriptionFactory = (
+  jobId: string,
+  onCancel: (jobId: string) => void
+) => Promise<CancelSubscriptionCleanup>;
 
 class JobCancelledError extends Error {
   constructor(message = "job cancelled") {
@@ -40,13 +47,41 @@ function createGenerationService(
   return new GenerationService(env, logger, traceStore, context, abortSignal);
 }
 
+function createRedisCancelSubscriptionFactory(redis: Redis): CancelSubscriptionFactory {
+  return async (jobId, onCancel) => {
+    const subscriber = redis.duplicate();
+    const messageHandler = (channel: string, payload: string) => {
+      if (channel !== JOB_CANCEL_CHANNEL) {
+        return;
+      }
+      onCancel(payload);
+    };
+    subscriber.on("message", messageHandler);
+    await subscriber.subscribe(JOB_CANCEL_CHANNEL);
+    return async () => {
+      subscriber.off("message", messageHandler);
+      try {
+        await subscriber.unsubscribe(JOB_CANCEL_CHANNEL);
+      } catch {
+        // ignore unsubscribe failure during shutdown
+      }
+      try {
+        await subscriber.quit();
+      } catch {
+        // ignore quit failure during shutdown
+      }
+    };
+  };
+}
+
 export function createJobProcessor(
   env: AppEnv,
   store: RedisJobStore,
   traceStore: RedisTraceStore,
   rulesService: RulesService,
   logger: Logger,
-  generationServiceFactory: GenerationServiceFactory = createGenerationService
+  generationServiceFactory: GenerationServiceFactory = createGenerationService,
+  cancelSubscriptionFactory?: CancelSubscriptionFactory
 ) {
   return async (job: Job<GenerateJobData>) => {
     const { job_id: jobId, tenant_id: tenantId, input_markdown: inputMarkdown, input_filename: inputFilename } = job.data;
@@ -77,30 +112,14 @@ export function createJobProcessor(
     const started = Date.now();
     const currentAttempt = job.attemptsMade + 1;
     const cancelController = new AbortController();
-    let stopCancelWatcher = false;
-    const cancelWatcher = (async () => {
-      while (!stopCancelWatcher && !cancelController.signal.aborted) {
-        await new Promise((resolve) => setTimeout(resolve, 500));
-        if (stopCancelWatcher || cancelController.signal.aborted) {
-          break;
-        }
-        try {
-          const requested = await store.isCancelRequested(jobId);
-          if (requested) {
-            cancelController.abort(new JobCancelledError("job cancelled by user"));
-            break;
+    const unsubscribeCancel = cancelSubscriptionFactory
+      ? await cancelSubscriptionFactory(jobId, (cancelledJobId) => {
+          if (cancelledJobId !== jobId || cancelController.signal.aborted) {
+            return;
           }
-        } catch (error) {
-          jobLogger.warn(
-            {
-              event: "cancel_watch_failed",
-              error: error instanceof Error ? error.message : String(error)
-            },
-            "cancel watch failed"
-          );
-        }
-      }
-    })();
+          cancelController.abort(new JobCancelledError("job cancelled by user"));
+        })
+      : async () => {};
     const generationService = generationServiceFactory(
       env,
       jobLogger,
@@ -252,8 +271,7 @@ export function createJobProcessor(
       }
       throw error;
     } finally {
-      stopCancelWatcher = true;
-      await cancelWatcher;
+      await unsubscribeCancel();
     }
   };
 }
@@ -268,7 +286,7 @@ export function createJobRunner(
 ): Worker<GenerateJobData> {
   const worker = new Worker<GenerateJobData>(
     env.queueName,
-    createJobProcessor(env, store, traceStore, rulesService, logger),
+    createJobProcessor(env, store, traceStore, rulesService, logger, createGenerationService, createRedisCancelSubscriptionFactory(redis)),
     {
       connection: redis,
       concurrency: env.workerConcurrency

@@ -182,3 +182,100 @@ test("重试 attempt 会把已完成 section checkpoint 传回 generation servic
   assert.ok(calls.includes("getRuntimeSections:job-2"));
   assert.ok(calls.includes("saveRuntimeSection:job-2:bullets:cached-bullets"));
 });
+
+test("运行中的任务会通过 cancel pubsub 立即中断，不依赖轮询", async () => {
+  const calls: string[] = [];
+  let onCancelMessage: ((jobId: string) => void) | undefined;
+  let generateAborted = false;
+  let isCancelRequestedCalls = 0;
+  const store = {
+    async markStatus(jobId: string, status: string) {
+      calls.push(`markStatus:${jobId}:${status}`);
+    },
+    async isCancelRequested() {
+      isCancelRequestedCalls += 1;
+      return false;
+    },
+    async markCancelled(jobId: string, message: string) {
+      calls.push(`markCancelled:${jobId}:${message}`);
+    },
+    async markSucceeded(jobId: string) {
+      calls.push(`markSucceeded:${jobId}`);
+    },
+    async markFailed(jobId: string, message: string) {
+      calls.push(`markFailed:${jobId}:${message}`);
+    },
+    async getRuntimeSections() {
+      return {};
+    },
+    async saveRuntimeSection() {
+      // noop
+    }
+  };
+  const traceStore = {
+    async append() {}
+  };
+  const rulesService = {
+    async resolve() {
+      return {
+        rules_version: "rules-v1"
+      };
+    }
+  };
+  const processor = createJobProcessor(
+    {
+      queueName: "queue",
+      workerConcurrency: 1
+    } as never,
+    store as never,
+    traceStore as never,
+    rulesService as never,
+    createLogger() as never,
+    (_env, _logger, _traceStore, _context, abortSignal) => ({
+      async generate() {
+        await new Promise<void>((resolve, reject) => {
+          abortSignal.addEventListener(
+            "abort",
+            () => {
+              generateAborted = true;
+              reject(abortSignal.reason ?? new Error("aborted"));
+            },
+            { once: true }
+          );
+        });
+      }
+    }) as never,
+    async (jobId, onMessage) => {
+      calls.push(`subscribeCancel:${jobId}`);
+      onCancelMessage = onMessage;
+      return async () => {
+        calls.push(`unsubscribeCancel:${jobId}`);
+      };
+    }
+  );
+
+  const running = processor({
+    id: "queue-job-3",
+    attemptsMade: 0,
+    opts: {
+      attempts: 1
+    },
+    data: {
+      job_id: "job-3",
+      tenant_id: "tenant-1",
+      input_markdown: "hello",
+      input_filename: "input.md"
+    }
+  } as never);
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(typeof onCancelMessage, "function");
+  onCancelMessage?.("job-3");
+  await running;
+
+  assert.equal(generateAborted, true);
+  assert.ok(calls.includes("subscribeCancel:job-3"));
+  assert.ok(calls.includes("unsubscribeCancel:job-3"));
+  assert.ok(calls.includes("markCancelled:job-3:任务被用户取消"));
+  assert.equal(isCancelRequestedCalls, 2);
+});
