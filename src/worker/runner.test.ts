@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { InputValidationError } from "../services/generation-service.js";
 import { createJobProcessor } from "./runner.js";
 
 function createLogger() {
@@ -278,4 +279,74 @@ test("运行中的任务会通过 cancel pubsub 立即中断，不依赖轮询",
   assert.ok(calls.includes("unsubscribeCancel:job-3"));
   assert.ok(calls.includes("markCancelled:job-3:任务被用户取消"));
   assert.equal(isCancelRequestedCalls, 2);
+});
+
+test("输入校验错误会直接失败，不进入重试", async () => {
+  const calls: string[] = [];
+  const store = {
+    async markStatus(jobId: string, status: string) {
+      calls.push(`markStatus:${jobId}:${status}`);
+    },
+    async isCancelRequested() {
+      return false;
+    },
+    async markCancelled(jobId: string, message: string) {
+      calls.push(`markCancelled:${jobId}:${message}`);
+    },
+    async markSucceeded(jobId: string) {
+      calls.push(`markSucceeded:${jobId}`);
+    },
+    async markFailed(jobId: string, message: string) {
+      calls.push(`markFailed:${jobId}:${message}`);
+    },
+    async getRuntimeSections() {
+      return {};
+    },
+    async saveRuntimeSection() {
+      // noop
+    }
+  };
+  const traceStore = {
+    async append() {}
+  };
+  const rulesService = {
+    async resolve() {
+      return {
+        rules_version: "rules-v1"
+      };
+    }
+  };
+  const processor = createJobProcessor(
+    {
+      queueName: "queue",
+      workerConcurrency: 1
+    } as never,
+    store as never,
+    traceStore as never,
+    rulesService as never,
+    createLogger() as never,
+    () => ({
+      async generate() {
+        throw new InputValidationError("输入文件未命中当前租户模板标记: ===Listing Requirements===");
+      }
+    }) as never
+  );
+
+  await processor({
+    id: "queue-job-4",
+    attemptsMade: 0,
+    opts: {
+      attempts: 3
+    },
+    data: {
+      job_id: "job-4",
+      tenant_id: "tenant-1",
+      input_markdown: "hello",
+      input_filename: "input.md"
+    }
+  } as never);
+
+  assert.ok(calls.includes("markStatus:job-4:running"));
+  assert.ok(calls.includes("markFailed:job-4:输入文件未命中当前租户模板标记: ===Listing Requirements==="));
+  assert.equal(calls.some((entry) => entry === "markStatus:job-4:retrying"), false);
 });

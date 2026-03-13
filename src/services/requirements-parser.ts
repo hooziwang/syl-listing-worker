@@ -15,6 +15,10 @@ function normalizeLines(input: string): string[] {
     .map((line) => line.trim());
 }
 
+function normalizeMarker(value: string): string {
+  return value.replace(/^\ufeff/, "").trim();
+}
+
 type HeadingMatch = (normalizedHeading: string) => boolean;
 
 function parseHeading(line: string): string | null {
@@ -145,4 +149,13 @@ export function parseRequirements(inputMarkdown: string, inputRules: InputRules)
     category,
     values
   };
+}
+
+export function inputMatchesMarker(inputMarkdown: string, inputRules: InputRules): boolean {
+  const expected = normalizeMarker(inputRules.file_discovery.marker);
+  if (!expected) {
+    return true;
+  }
+  const firstLine = inputMarkdown.replace(/\r\n/g, "\n").split("\n", 1)[0] ?? "";
+  return normalizeMarker(firstLine) === expected;
 }

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseRequirements } from "./requirements-parser.js";
+import { inputMatchesMarker, parseRequirements } from "./requirements-parser.js";
 import type { InputRules } from "./rules-loader.js";
 
 const inputRules: InputRules = {
@@ -69,4 +69,10 @@ Paper Lanterns
   const requirements = parseRequirements(inputMarkdown, inputRules);
 
   assert.equal(requirements.brand, "Gisgfim");
+});
+
+test("inputMatchesMarker requires the configured discovery marker", () => {
+  assert.equal(inputMatchesMarker(`===Listing Requirements===\n\n# Demo`, inputRules), true);
+  assert.equal(inputMatchesMarker(`\ufeff===Listing Requirements===\n\n# Demo`, inputRules), true);
+  assert.equal(inputMatchesMarker(`# Demo\n\n品牌名: Gisgfim`, inputRules), false);
 });

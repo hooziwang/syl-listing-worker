@@ -13,7 +13,7 @@ import {
 import { createDefaultRegistry } from "../agent-runtime/registry.js";
 import type { ModelProfile } from "../agent-runtime/types.js";
 import { LLMClient } from "./llm-client.js";
-import { parseRequirements, type ListingRequirements } from "./requirements-parser.js";
+import { inputMatchesMarker, parseRequirements, type ListingRequirements } from "./requirements-parser.js";
 import { loadTenantRules, type SectionRule, type TenantRules } from "./rules-loader.js";
 import { buildSectionExecutionGuidance, buildSectionRepairGuidance } from "./section-guidance.js";
 import type { RedisTraceStore } from "../store/trace-store.js";
@@ -2235,6 +2235,16 @@ export class GenerationService {
       archive_path: archivePath,
       rules_version: input.rulesVersion
     });
+
+    if (!inputMatchesMarker(input.inputMarkdown, tenantRules.input)) {
+      const marker = tenantRules.input.file_discovery.marker;
+      await this.appendTrace("generation_invalid_input", "error", {
+        error: `输入文件未命中当前租户模板标记: ${marker}`,
+        expected_marker: marker,
+        input_filename: inputFilename || undefined
+      });
+      throw new InputValidationError(`输入文件未命中当前租户模板标记: ${marker}`);
+    }
 
     const requirements = parseRequirements(input.inputMarkdown, tenantRules.input);
     const promptRaw = compactRequirementsRawForPrompt(requirements.raw);
