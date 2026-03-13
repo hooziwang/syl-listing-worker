@@ -30,6 +30,7 @@ function createContext() {
       async read() {
         return {
           service: "syl-listing-worker",
+          worker_version: "v0.1.2",
           git_commit: "abc1234",
           build_time: "2026-03-11T04:00:00Z",
           deployed_at: "2026-03-11T04:05:00Z"
@@ -80,6 +81,7 @@ test("GET /v1/admin/version 返回版本元数据", async (t) => {
     ok: true,
     tenant_id: "admin",
     service: "syl-listing-worker",
+    worker_version: "v0.1.2",
     git_commit: "abc1234",
     build_time: "2026-03-11T04:00:00Z",
     deployed_at: "2026-03-11T04:05:00Z",

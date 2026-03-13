@@ -20,6 +20,7 @@ import type { RedisTraceStore } from "../store/trace-store.js";
 import { ExecutionContext } from "../runtime-support/execution-context.js";
 import type { GenerationNode } from "../runtime-support/types.js";
 import { buildRenderVariables, collectNodeSectionSlots, parseJudgeIssues } from "../runtime-support/bindings.js";
+import { VersionService } from "./version-service.js";
 
 interface GenerationInput {
   jobId: string;
@@ -1378,6 +1379,7 @@ export function shouldRunPromptPlanningForTest(rules: Pick<TenantRules, "generat
 
 export class GenerationService {
   private readonly llmClient: LLMClient;
+  private readonly versionService: VersionService;
   private executionBrief = "";
   private currentRules: TenantRules | null = null;
   private requirementsRawForPrompt = "";
@@ -1390,6 +1392,7 @@ export class GenerationService {
     private readonly abortSignal?: AbortSignal
   ) {
     this.llmClient = new LLMClient(env, logger, traceStore, traceContext, abortSignal);
+    this.versionService = new VersionService();
   }
 
   private isAbortLikeError(error: unknown): boolean {
@@ -2230,10 +2233,12 @@ export class GenerationService {
     );
     const archivePath = join(this.env.rulesFsDir, input.tenantId, input.rulesVersion, "rules.tar.gz");
     const tenantRules = await loadTenantRules(archivePath, input.tenantId, input.rulesVersion);
+    const runtimeVersion = await this.versionService.read();
     this.currentRules = tenantRules;
     await this.appendTrace("rules_loaded", "info", {
       archive_path: archivePath,
-      rules_version: input.rulesVersion
+      rules_version: input.rulesVersion,
+      worker_version: runtimeVersion.worker_version
     });
 
     if (!inputMatchesMarker(input.inputMarkdown, tenantRules.input)) {

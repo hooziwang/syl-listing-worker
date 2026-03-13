@@ -4,6 +4,7 @@ export const DEFAULT_RUNTIME_VERSION_FILE = "/data/syl-listing/runtime/version.j
 
 export interface RuntimeVersionMetadata {
   service: string;
+  worker_version: string;
   git_commit: string;
   build_time: string;
   deployed_at: string;
@@ -33,7 +34,7 @@ export class VersionService {
     if (!data || typeof data !== "object") {
       throw new Error(`版本文件内容非法: ${this.versionFile}`);
     }
-    for (const field of ["service", "git_commit", "build_time", "deployed_at"] as const) {
+    for (const field of ["service", "worker_version", "git_commit", "build_time", "deployed_at"] as const) {
       if (typeof data[field] !== "string" || data[field]!.trim() === "") {
         throw new Error(`版本文件缺少字段: ${field}`);
       }
@@ -41,6 +42,7 @@ export class VersionService {
 
     return {
       service: data.service!.trim(),
+      worker_version: data.worker_version!.trim(),
       git_commit: data.git_commit!.trim(),
       build_time: data.build_time!.trim(),
       deployed_at: data.deployed_at!.trim()

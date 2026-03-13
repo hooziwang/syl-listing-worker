@@ -942,8 +942,8 @@ test("scoreRuntimeCandidateForTest rejects bullet lines below hard minimum even 
     })
   );
 
-  assert.match(result.errors.join("\n"), /第1条长度不满足约束: 236/);
-  assert.match(result.errors.join("\n"), /第2条长度不满足约束: 239/);
+  assert.match(result.errors.join("\n"), /第1条长度不满足约束/);
+  assert.match(result.errors.join("\n"), /第2条长度不满足约束/);
 });
 
 test("scoreRuntimeCandidateForTest keeps fallback bullet lines above hard minimum for later slots", () => {

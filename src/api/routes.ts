@@ -231,6 +231,7 @@ export async function registerRoutes(app: FastifyInstance, ctx: ApiContext): Pro
       return withTenant("admin", {
         ok: true,
         service: version.service,
+        worker_version: version.worker_version,
         git_commit: version.git_commit,
         build_time: version.build_time,
         deployed_at: version.deployed_at,
