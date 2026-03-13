@@ -4,7 +4,12 @@ import type { Logger } from "pino";
 import type { AppEnv } from "../config/env.js";
 import type { ListingResult } from "../domain/types.js";
 import { compileExecutionSpec } from "../agent-runtime/compiler.js";
-import { executeRuntimeSections } from "../agent-runtime/planner.js";
+import {
+  executeRuntimeSections,
+  type RuntimeSectionCandidate,
+  type RuntimeSectionCandidateFailure,
+  type RuntimeSectionCandidateResult
+} from "../agent-runtime/planner.js";
 import { createDefaultRegistry } from "../agent-runtime/registry.js";
 import type { ModelProfile } from "../agent-runtime/types.js";
 import { LLMClient } from "./llm-client.js";
@@ -22,6 +27,8 @@ interface GenerationInput {
   rulesVersion: string;
   inputMarkdown: string;
   inputFilename?: string;
+  resumeSections?: Record<string, string>;
+  persistRuntimeSection?: (section: string, value: string) => Promise<void> | void;
 }
 
 export class InputValidationError extends Error {
@@ -740,6 +747,97 @@ export function scoreRuntimeCandidateForTest(
   raw: string
 ): { normalizedContent: string; score: number; errors: string[] } {
   return scoreRuntimeCandidateValue(requirements, rule, raw);
+}
+
+type RuntimeCandidateTraceSummary = {
+  candidate_index: number;
+  score?: number;
+  error_count?: number;
+  normalized_chars?: number;
+  failure_reason?: string;
+  selected: boolean;
+  errors?: string[];
+};
+
+type ScoredRuntimeCandidate = {
+  candidateIndex: number;
+  normalizedContent: string;
+  score: number;
+  errors: string[];
+};
+
+type FailedRuntimeCandidate = {
+  candidateIndex: number;
+  failureReason: string;
+};
+
+function isScoredRuntimeCandidate(candidate: ScoredRuntimeCandidate | FailedRuntimeCandidate): candidate is ScoredRuntimeCandidate {
+  return "score" in candidate;
+}
+
+function summarizeRuntimeCandidateSelection(
+  requirements: ListingRequirements,
+  rule: SectionRule,
+  candidates: RuntimeSectionCandidateResult[]
+): {
+  selectedContent: string;
+  selectedCandidateIndex: number;
+  selectedScore: number;
+  candidates: RuntimeCandidateTraceSummary[];
+} {
+  const scored: Array<ScoredRuntimeCandidate | FailedRuntimeCandidate> = candidates.map((candidate) => {
+    if ("error" in candidate) {
+      return {
+        candidateIndex: candidate.candidateIndex,
+        failureReason: candidate.error || "候选生成失败"
+      };
+    }
+    const result = scoreRuntimeCandidateValue(requirements, rule, candidate.content);
+    return {
+      candidateIndex: candidate.candidateIndex,
+      ...result
+    };
+  });
+  const successful = scored.filter(isScoredRuntimeCandidate);
+  const ranked = [...successful].sort((left, right) => left.score - right.score || left.candidateIndex - right.candidateIndex);
+  const winner = ranked[0];
+  const winnerIndex = winner?.candidateIndex ?? candidates.find((candidate): candidate is RuntimeSectionCandidate => "content" in candidate)?.candidateIndex ?? 1;
+  return {
+    selectedContent: winner?.normalizedContent ?? candidates.find((candidate): candidate is RuntimeSectionCandidate => "content" in candidate)?.content ?? "",
+    selectedCandidateIndex: winnerIndex,
+    selectedScore: winner?.score ?? 0,
+    candidates: scored.map((candidate) => ({
+      candidate_index: candidate.candidateIndex,
+      selected: candidate.candidateIndex === winnerIndex,
+      ...(isScoredRuntimeCandidate(candidate)
+        ? {
+            score: candidate.score,
+            error_count: candidate.errors.length,
+            normalized_chars: candidate.normalizedContent.length,
+            errors: candidate.errors
+          }
+        : {
+            failure_reason: candidate.failureReason
+          })
+    }))
+  };
+}
+
+export function summarizeRuntimeCandidateSelectionForTest(
+  requirements: ListingRequirements,
+  rule: SectionRule,
+  candidates: RuntimeSectionCandidateResult[]
+): {
+  selected_candidate_index: number;
+  selected_score: number;
+  candidates: RuntimeCandidateTraceSummary[];
+} {
+  const summary = summarizeRuntimeCandidateSelection(requirements, rule, candidates);
+  return {
+    selected_candidate_index: summary.selectedCandidateIndex,
+    selected_score: summary.selectedScore,
+    candidates: summary.candidates
+  };
 }
 
 function scoreRuntimeCandidateValue(
@@ -1927,7 +2025,9 @@ export class GenerationService {
   private async executeAgentRuntime(
     requirements: ListingRequirements,
     tenantRules: TenantRules,
-    inputFilename: string
+    inputFilename: string,
+    resumeSections: Record<string, string> = {},
+    persistRuntimeSection?: (section: string, value: string) => Promise<void> | void
   ): Promise<GenerationExecutionOutput> {
     const registry = createDefaultRegistry();
     const spec = compileExecutionSpec(tenantRules, registry);
@@ -1941,6 +2041,14 @@ export class GenerationService {
     const sectionResult = await executeRuntimeSections(spec, {
       category: requirements.category,
       keywords: requirements.keywords.join("\n"),
+      initialSections: Object.fromEntries(
+        Object.entries(resumeSections)
+          .filter(([section, value]) => spec.sectionPlans.has(section) && typeof value === "string" && value.trim() !== "")
+          .map(([section, value]) => [section, normalizeText(value)])
+      ),
+      onSectionComplete: async (section, value) => {
+        await persistRuntimeSection?.(section, normalizeText(value));
+      },
       generateSection: async (plan, candidateIndex, controls) => {
         const rule = this.generationSectionRule(plan.section);
         const isBullets = rule.section === "bullets";
@@ -1994,6 +2102,7 @@ export class GenerationService {
           modelSettingsOverride: bulletsJSONModeSettings,
           repairerModelSettingsOverride: bulletsJSONModeSettings,
           shouldRetry: () => controls?.shouldContinueRetries() ?? true,
+          signal: controls?.signal,
           validateContent
         });
       },
@@ -2005,9 +2114,15 @@ export class GenerationService {
       }),
       pickBestCandidate: async (plan, candidates) => {
         const rule = this.generationSectionRule(plan.section);
-        const scored = candidates.map((candidate) => this.scoreRuntimeCandidate(requirements, rule, candidate));
-        scored.sort((left, right) => left.score - right.score);
-        return scored[0]?.normalizedContent ?? candidates[0] ?? "";
+        const summary = summarizeRuntimeCandidateSelection(requirements, rule, candidates);
+        await this.appendTrace("runtime_candidate_selection", "info", {
+          section: plan.section,
+          candidate_count: candidates.length,
+          selected_candidate_index: summary.selectedCandidateIndex,
+          selected_score: summary.selectedScore,
+          candidates: summary.candidates
+        });
+        return summary.selectedContent;
       },
       translateValue: async (slot, value) =>
         this.translateTextWithProfile(
@@ -2171,7 +2286,13 @@ export class GenerationService {
 
     this.executionBrief = await this.planExecution(requirements);
     this.throwIfAborted();
-    const generationOutput = await this.executeAgentRuntime(requirements, tenantRules, inputFilename);
+    const generationOutput = await this.executeAgentRuntime(
+      requirements,
+      tenantRules,
+      inputFilename,
+      input.resumeSections ?? {},
+      input.persistRuntimeSection
+    );
     this.throwIfAborted();
 
     this.logger.info(

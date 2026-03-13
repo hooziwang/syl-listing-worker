@@ -3,6 +3,22 @@ import assert from "node:assert/strict";
 import { executeRuntimeSections } from "./planner.js";
 import type { AgentExecutionSpec, SectionExecutionPlan } from "./types.js";
 
+function candidateContent(candidate: unknown): string {
+  if (!candidate || typeof candidate !== "object" || !("content" in candidate)) {
+    return "";
+  }
+  const value = (candidate as { content?: string }).content;
+  return typeof value === "string" ? value : "";
+}
+
+function candidateError(candidate: unknown): string {
+  if (!candidate || typeof candidate !== "object" || !("error" in candidate)) {
+    return "";
+  }
+  const value = (candidate as { error?: string }).error;
+  return typeof value === "string" ? value : "";
+}
+
 function createSpec(): AgentExecutionSpec {
   return {
     parallelGroups: [["title", "bullets"], ["description", "search_terms"]],
@@ -89,8 +105,10 @@ test("executeRuntimeSections runs each parallel group concurrently and translate
       return `${plan.section}-en`;
     },
     pickBestCandidate: async (plan, candidates) => {
-      events.push(`pick:${plan.section}:${candidates.length}`);
-      return candidates[candidates.length - 1] ?? "";
+      events.push(
+        `pick:${plan.section}:${candidates.length}:${candidates.map((candidate) => candidate.candidateIndex).join(",")}`
+      );
+      return candidateContent(candidates[candidates.length - 1] ?? {}) ?? "";
     },
     translateValue: async (slot, value) => {
       events.push(`translate:${slot}`);
@@ -100,11 +118,11 @@ test("executeRuntimeSections runs each parallel group concurrently and translate
 
   assert.equal(maxActive, 3);
   assert.equal(result.sections.title, "title-candidate-1");
-  assert.equal(result.sections.bullets, "bullets-candidate-1");
+  assert.equal(result.sections.bullets, "bullets-candidate-2");
   assert.equal(result.sections.search_terms, "search_terms-en");
   assert.equal(result.translations.title_cn, "title-candidate-1-cn");
   assert.equal(result.translations.category_cn, "patio decor-cn");
-  assert.ok(events.includes("pick:bullets:1"));
+  assert.ok(events.includes("pick:bullets:2:1,2"));
   assert.ok(events.indexOf("translate:title_cn") > events.indexOf("end:title:1"));
   assert.ok(events.indexOf("translate:description_cn") > events.indexOf("end:description:1"));
 });
@@ -122,7 +140,7 @@ test("executeRuntimeSections ignores failed candidates when another candidate su
       return `${plan.section}-candidate-${candidateIndex}`;
     },
     deriveSection: async (plan) => `${plan.section}-en`,
-    pickBestCandidate: async (_plan, candidates) => candidates[candidates.length - 1] ?? "",
+    pickBestCandidate: async (_plan, candidates) => candidateContent(candidates[candidates.length - 1] ?? {}),
     translateValue: async (_slot, value) => `${value}-cn`
   });
 
@@ -143,14 +161,14 @@ test("executeRuntimeSections throws when all candidates fail", async () => {
         return "";
       },
       deriveSection: async (plan) => `${plan.section}-en`,
-      pickBestCandidate: async (_plan, candidates) => candidates[0] ?? "",
+      pickBestCandidate: async (_plan, candidates) => candidateContent(candidates[0] ?? {}),
       translateValue: async (_slot, value) => `${value}-cn`
     }),
     /title failed|bullets failed|description failed/
   );
 });
 
-test("executeRuntimeSections signals loser candidates to stop retrying after one winner succeeds", async () => {
+test("executeRuntimeSections keeps slower candidates retrying until they settle for candidate scoring", async () => {
   const spec = createSpec();
   const attempts: string[] = [];
 
@@ -172,18 +190,18 @@ test("executeRuntimeSections signals loser candidates to stop retrying after one
       attempts.push(`candidate-${candidateIndex}:attempt-1`);
       await new Promise((resolve) => setTimeout(resolve, 15));
       if (controls?.shouldContinueRetries() === false) {
-        throw new Error("retry stopped after winner");
+        throw new Error("retry stopped before scoring");
       }
       attempts.push(`candidate-${candidateIndex}:attempt-2`);
       return "bullets-candidate-1-late";
     }) as any,
     deriveSection: async (plan) => `${plan.section}-en`,
-    pickBestCandidate: async (_plan, candidates) => candidates[0] ?? "",
+    pickBestCandidate: async (_plan, candidates) => candidateContent(candidates[0] ?? {}),
     translateValue: async (_slot, value) => `${value}-cn`
   });
 
-  assert.equal(result.sections.bullets, "bullets-candidate-2");
-  assert.deepEqual(attempts, ["candidate-1:attempt-1"]);
+  assert.equal(result.sections.bullets, "bullets-candidate-1-late");
+  assert.deepEqual(attempts, ["candidate-1:attempt-1", "candidate-1:attempt-2"]);
 });
 
 test("executeRuntimeSections translates independent slots concurrently", async () => {
@@ -197,7 +215,7 @@ test("executeRuntimeSections translates independent slots concurrently", async (
     keywords: "solar lantern\noutdoor lantern",
     generateSection: async (plan, candidateIndex) => `${plan.section}-candidate-${candidateIndex}`,
     deriveSection: async (plan) => `${plan.section}-en`,
-    pickBestCandidate: async (_plan, candidates) => candidates[0] ?? "",
+    pickBestCandidate: async (_plan, candidates) => candidateContent(candidates[0] ?? {}),
     translateValue: async (slot, value) => {
       active += 1;
       maxActive = Math.max(maxActive, active);
@@ -213,7 +231,7 @@ test("executeRuntimeSections translates independent slots concurrently", async (
   assert.ok(events.indexOf("start:keywords_cn") < events.indexOf("end:category_cn"));
 });
 
-test("executeRuntimeSections accepts the first successful candidate without waiting for slower peers", async () => {
+test("executeRuntimeSections waits for slower successful peers before picking the best candidate", async () => {
   const spec = createSpec();
   const started = Date.now();
   const picked: string[][] = [];
@@ -234,14 +252,134 @@ test("executeRuntimeSections accepts the first successful candidate without wait
     },
     deriveSection: async (plan) => `${plan.section}-en`,
     pickBestCandidate: async (_plan, candidates) => {
-      picked.push(candidates);
-      return candidates[0] ?? "";
+      picked.push(candidates.map((candidate) => `${candidate.candidateIndex}:${candidateContent(candidate)}`));
+      return candidateContent(candidates[0] ?? {});
     },
     translateValue: async (_slot, value) => `${value}-cn`
   });
 
   const durationMs = Date.now() - started;
-  assert.equal(result.sections.bullets, "bullets-candidate-fast");
-  assert.ok(durationMs < 70, `expected early acceptance before slow peer finished, got ${durationMs}ms`);
-  assert.deepEqual(picked, [["title-candidate-1"], ["bullets-candidate-fast"], ["description-candidate-1"]]);
+  assert.equal(result.sections.bullets, "bullets-candidate-slow");
+  assert.ok(durationMs >= 70, `expected waiting for slow peer before scoring, got ${durationMs}ms`);
+  assert.ok(
+    picked.some(
+      (candidates) =>
+        candidates.length === 2 &&
+        candidates[0] === "1:bullets-candidate-slow" &&
+        candidates[1] === "2:bullets-candidate-fast"
+    )
+  );
+});
+
+test("executeRuntimeSections passes failed candidates to pickBestCandidate for trace reporting", async () => {
+  const spec = createSpec();
+  const picked: string[] = [];
+
+  const result = await executeRuntimeSections(spec, {
+    category: "patio decor",
+    keywords: "solar lantern\noutdoor lantern",
+    generateSection: async (plan, candidateIndex) => {
+      if (plan.section === "bullets" && candidateIndex === 1) {
+        throw new Error("candidate 1 failed");
+      }
+      return `${plan.section}-candidate-${candidateIndex}`;
+    },
+    deriveSection: async (plan) => `${plan.section}-en`,
+    pickBestCandidate: async (plan, candidates) => {
+      if (plan.section === "bullets") {
+        picked.push(
+          ...candidates.map((candidate) =>
+            candidateContent(candidate) != ""
+              ? `#${candidate.candidateIndex}=${candidateContent(candidate)}`
+              : `#${candidate.candidateIndex}!${candidateError(candidate)}`
+          )
+        );
+      }
+      const winner = candidates.find((candidate) => candidateContent(candidate) != "");
+      return candidateContent(winner ?? {});
+    },
+    translateValue: async (_slot, value) => `${value}-cn`
+  });
+
+  assert.equal(result.sections.bullets, "bullets-candidate-2");
+  assert.deepEqual(picked, ["#1!candidate 1 failed", "#2=bullets-candidate-2"]);
+});
+
+test("executeRuntimeSections aborts in-flight sibling sections after a fatal section failure", async () => {
+  const spec = createSpec();
+  const events: string[] = [];
+
+  await assert.rejects(
+    executeRuntimeSections(spec, {
+      category: "patio decor",
+      keywords: "solar lantern\noutdoor lantern",
+      generateSection: async (
+        _plan: SectionExecutionPlan,
+        _candidateIndex: number,
+        controls?: { shouldContinueRetries: () => boolean; signal: AbortSignal }
+      ) => {
+        if (_plan.section === "bullets") {
+          throw new Error("bullets failed");
+        }
+        return await new Promise<string>((resolve, reject) => {
+          const started = Date.now();
+          const tick = () => {
+            if (controls?.signal?.aborted || controls?.shouldContinueRetries() === false) {
+              events.push(`${_plan.section}:aborted`);
+              reject(new Error(`${_plan.section} aborted`));
+              return;
+            }
+            if (Date.now() - started > 80) {
+              events.push(`${_plan.section}:finished`);
+              resolve(`${_plan.section}-late-success`);
+              return;
+            }
+            setTimeout(tick, 5);
+          };
+          tick();
+        });
+      },
+      deriveSection: async (plan: SectionExecutionPlan) => `${plan.section}-en`,
+      pickBestCandidate: async (
+        _plan: SectionExecutionPlan,
+        candidates: Array<{ candidateIndex: number; content?: string; error?: string }>
+      ) => candidateContent(candidates[0] ?? {}),
+      translateValue: async (_slot: string, value: string) => `${value}-cn`
+    } as any),
+    /bullets failed/
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.ok(events.includes("title:aborted"), `events=${events.join(",")}`);
+  assert.ok(!events.includes("title:finished"), `events=${events.join(",")}`);
+});
+
+test("executeRuntimeSections reuses completed sections from checkpoint and skips regenerating them", async () => {
+  const spec = createSpec();
+  const generated: string[] = [];
+
+  const result = await executeRuntimeSections(spec, {
+    category: "patio decor",
+    keywords: "solar lantern\noutdoor lantern",
+    initialSections: {
+      title: "cached-title",
+      description: "cached-description"
+    },
+    generateSection: async (plan: SectionExecutionPlan, candidateIndex: number) => {
+      generated.push(`${plan.section}:${candidateIndex}`);
+      return `${plan.section}-candidate-${candidateIndex}`;
+    },
+    deriveSection: async (plan: SectionExecutionPlan) => `${plan.section}-en`,
+    pickBestCandidate: async (
+      _plan: SectionExecutionPlan,
+      candidates: Array<{ candidateIndex: number; content?: string; error?: string }>
+    ) => candidateContent(candidates[0] ?? {}),
+    translateValue: async (_slot: string, value: string) => `${value}-cn`
+  } as any);
+
+  assert.equal(result.sections.title, "cached-title");
+  assert.equal(result.sections.description, "cached-description");
+  assert.deepEqual(generated, ["bullets:1", "bullets:2"]);
+  assert.equal(result.translations.title_cn, "cached-title-cn");
+  assert.equal(result.translations.description_cn, "cached-description-cn");
 });

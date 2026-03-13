@@ -4,6 +4,7 @@ import type { RedisJobEventBus } from "./job-events.js";
 
 const JOB_KEY_PREFIX = "syl:job:";
 const JOB_CANCEL_KEY_PREFIX = "syl:job:cancel:";
+const JOB_RUNTIME_SECTION_FIELD_PREFIX = "runtime_section:";
 export const JOB_CANCEL_CHANNEL = "syl:job:cancel:channel";
 
 function jobKey(jobId: string): string {
@@ -12,6 +13,10 @@ function jobKey(jobId: string): string {
 
 function cancelKey(jobId: string): string {
   return `${JOB_CANCEL_KEY_PREFIX}${jobId}`;
+}
+
+function runtimeSectionField(section: string): string {
+  return `${JOB_RUNTIME_SECTION_FIELD_PREFIX}${section}`;
 }
 
 export class RedisJobStore {
@@ -139,6 +144,28 @@ export class RedisJobStore {
 
   async clearCancelRequest(jobId: string): Promise<void> {
     await this.redis.del(cancelKey(jobId));
+  }
+
+  async saveRuntimeSection(jobId: string, section: string, value: string): Promise<void> {
+    const key = jobKey(jobId);
+    const updatedAt = new Date().toISOString();
+    await this.redis.hset(key, {
+      [runtimeSectionField(section)]: value,
+      updated_at: updatedAt
+    });
+    await this.redis.expire(key, this.ttlSeconds);
+  }
+
+  async getRuntimeSections(jobId: string): Promise<Record<string, string>> {
+    const data = await this.redis.hgetall(jobKey(jobId));
+    if (!data || Object.keys(data).length === 0) {
+      return {};
+    }
+    return Object.fromEntries(
+      Object.entries(data)
+        .filter(([field, value]) => field.startsWith(JOB_RUNTIME_SECTION_FIELD_PREFIX) && typeof value === "string" && value.trim() !== "")
+        .map(([field, value]) => [field.slice(JOB_RUNTIME_SECTION_FIELD_PREFIX.length), value])
+    );
   }
 
   async get(jobId: string): Promise<JobRecord | null> {

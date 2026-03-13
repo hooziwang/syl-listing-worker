@@ -68,6 +68,40 @@ function buildRetryUserPrompt(basePrompt: string, errors: string[], repairGuidan
   ].join("\n");
 }
 
+function linkAbortSignals(...signals: Array<AbortSignal | undefined>): { signal?: AbortSignal; cleanup: () => void } {
+  const activeSignals = signals.filter(Boolean) as AbortSignal[];
+  if (activeSignals.length === 0) {
+    return { cleanup: () => {} };
+  }
+  if (activeSignals.length === 1) {
+    return { signal: activeSignals[0], cleanup: () => {} };
+  }
+  const controller = new AbortController();
+  const listeners: Array<{ signal: AbortSignal; listener: () => void }> = [];
+  const abortWith = (signal: AbortSignal) => {
+    if (!controller.signal.aborted) {
+      controller.abort(signal.reason);
+    }
+  };
+  for (const signal of activeSignals) {
+    if (signal.aborted) {
+      abortWith(signal);
+      return { signal: controller.signal, cleanup: () => {} };
+    }
+    const listener = () => abortWith(signal);
+    signal.addEventListener("abort", listener, { once: true });
+    listeners.push({ signal, listener });
+  }
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      for (const { signal, listener } of listeners) {
+        signal.removeEventListener("abort", listener);
+      }
+    }
+  };
+}
+
 export class LLMClient {
   private readonly generationRunner: Runner;
   private readonly generationRequestURL: string;
@@ -436,6 +470,7 @@ export class LLMClient {
     reviewerModelSettingsOverride?: Partial<ModelSettings>;
     repairerModelSettingsOverride?: Partial<ModelSettings>;
     shouldRetry?: (attempt: number, error: Error) => boolean;
+    signal?: AbortSignal;
     validateContent: (content: string) => {
       ok: boolean;
       normalizedContent: string;
@@ -525,6 +560,7 @@ export class LLMClient {
 
         const session = new MemorySession();
         const lifecycleTrace = this.createSectionAgentTeamLifecycleTracer(input.section, input.step, team);
+        const linkedAbort = linkAbortSignals(this.abortSignal, input.signal);
         try {
           const prompt = retryValidationErrors.length > 0
             ? buildRetryUserPrompt(input.userPrompt, retryValidationErrors, retryRepairGuidance)
@@ -533,7 +569,7 @@ export class LLMClient {
           const result = await runner.run(entryAgent, prompt, {
             maxTurns: input.maxTurns ?? 8,
             session,
-            signal: this.abortSignal
+            signal: linkedAbort.signal
           });
           await lifecycleTrace.flush();
           const text = outputToText(result.finalOutput);
@@ -579,6 +615,7 @@ export class LLMClient {
           );
           throw error;
         } finally {
+          linkedAbort.cleanup();
           lifecycleTrace.cleanup();
         }
       },

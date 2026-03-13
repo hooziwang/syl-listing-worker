@@ -558,11 +558,12 @@ test("compileExecutionSpec honors section overrides from runtime-policy fixture"
   assert.equal(spec.sectionPlans.get("bullets")?.candidateCount, 2);
 });
 
-test("compileExecutionSpec uses two bullets candidates for syl runtime policy", async () => {
+test("compileExecutionSpec uses runtime policy candidate counts for syl sections", async () => {
   const archivePath = await createArchiveFromTenantFixture("syl");
   const rules = await loadTenantRules(archivePath, "syl-runtime", "rules-syl-runtime-candidate-count");
 
   const spec = compileExecutionSpec(rules, createDefaultRegistry());
 
   assert.equal(spec.sectionPlans.get("bullets")?.candidateCount, 2);
+  assert.equal(spec.sectionPlans.get("description")?.candidateCount, 2);
 });

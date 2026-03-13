@@ -34,6 +34,12 @@ test("非最终重试不会清掉取消请求标记", async () => {
     },
     async clearCancelRequest(jobId: string) {
       calls.push(`clearCancelRequest:${jobId}`);
+    },
+    async getRuntimeSections() {
+      return {};
+    },
+    async saveRuntimeSection() {
+      // noop
     }
   };
   const traceStore = {
@@ -87,4 +93,92 @@ test("非最终重试不会清掉取消请求标记", async () => {
   assert.ok(calls.includes("markStatus:job-1:running"));
   assert.ok(calls.includes("markStatus:job-1:retrying"));
   assert.equal(calls.filter((entry) => entry === "markStatus:job-1:running").length, 1);
+});
+
+test("重试 attempt 会把已完成 section checkpoint 传回 generation service", async () => {
+  const calls: string[] = [];
+  let receivedInput: any;
+  const store = {
+    async markStatus(jobId: string, status: string) {
+      calls.push(`markStatus:${jobId}:${status}`);
+    },
+    async isCancelRequested() {
+      return false;
+    },
+    async markCancelled(jobId: string, message: string) {
+      calls.push(`markCancelled:${jobId}:${message}`);
+    },
+    async markSucceeded(jobId: string) {
+      calls.push(`markSucceeded:${jobId}`);
+    },
+    async markFailed(jobId: string, message: string) {
+      calls.push(`markFailed:${jobId}:${message}`);
+    },
+    async getRuntimeSections(jobId: string) {
+      calls.push(`getRuntimeSections:${jobId}`);
+      return {
+        title: "cached-title",
+        description: "cached-description"
+      };
+    },
+    async saveRuntimeSection(jobId: string, section: string, value: string) {
+      calls.push(`saveRuntimeSection:${jobId}:${section}:${value}`);
+    }
+  };
+  const traceStore = {
+    async append() {}
+  };
+  const rulesService = {
+    async resolve() {
+      return {
+        rules_version: "rules-v1"
+      };
+    }
+  };
+  const processor = createJobProcessor(
+    {
+      queueName: "queue",
+      workerConcurrency: 1
+    } as never,
+    store as never,
+    traceStore as never,
+    rulesService as never,
+    createLogger() as never,
+    () => ({
+      async generate(input: unknown) {
+        receivedInput = input;
+        const runtimeInput = input as {
+          persistRuntimeSection?: (section: string, value: string) => Promise<void>;
+        };
+        await runtimeInput.persistRuntimeSection?.("bullets", "cached-bullets");
+        throw new Error("transient network error");
+      }
+    }) as never
+  );
+
+  await assert.rejects(
+    () =>
+      processor({
+        id: "queue-job-2",
+        attemptsMade: 1,
+        opts: {
+          attempts: 3
+        },
+        data: {
+          job_id: "job-2",
+          tenant_id: "tenant-1",
+          input_markdown: "hello",
+          input_filename: "input.md"
+        }
+      } as never),
+    /transient network error/
+  );
+
+  assert.deepEqual(receivedInput?.resumeSections, {
+    title: "cached-title",
+    description: "cached-description"
+  });
+  assert.equal(typeof receivedInput?.persistRuntimeSection, "function");
+  assert.ok(calls.includes("getRuntimeSections:job-2"));
+  assert.ok(calls.includes("saveRuntimeSection:job-2:bullets:cached-bullets"));
 });

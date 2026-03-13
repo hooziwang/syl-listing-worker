@@ -161,12 +161,17 @@ export function createJobProcessor(
         await markCancelled("任务在规则解析后被取消");
         return;
       }
+      const resumeSections = await store.getRuntimeSections(jobId);
       const result = await generationService.generate({
         jobId,
         tenantId,
         rulesVersion: resolved.rules_version,
         inputMarkdown,
-        inputFilename
+        inputFilename,
+        resumeSections,
+        persistRuntimeSection: async (section, value) => {
+          await store.saveRuntimeSection(jobId, section, value);
+        }
       });
       await store.markSucceeded(jobId, result);
       jobLogger.info(

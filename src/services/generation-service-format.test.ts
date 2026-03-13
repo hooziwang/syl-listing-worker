@@ -8,7 +8,8 @@ import {
   resolveRuntimeTeamAttemptsForTest,
   resolveRuntimeTeamMaxTurnsForTest,
   shouldRunPromptPlanningForTest,
-  scoreRuntimeCandidateForTest
+  scoreRuntimeCandidateForTest,
+  summarizeRuntimeCandidateSelectionForTest
 } from "./generation-service.js";
 import type { SectionRule } from "./rules-loader.js";
 
@@ -123,6 +124,93 @@ test("scoreRuntimeCandidateForTest keeps normalized bullets text instead of re-p
   );
 
   assert.equal(result.normalizedContent, "Package Contents: line one.\nDimensions: line two.");
+});
+
+test("summarizeRuntimeCandidateSelectionForTest keeps candidate indexes and selected winner for trace output", () => {
+  const rule: SectionRule = {
+    section: "title",
+    language: "en",
+    instruction: "generate title",
+    constraints: {
+      min_chars: 10,
+      max_chars: 20
+    },
+    execution: {
+      retries: 3,
+      repair_mode: "whole",
+      generation_mode: "sentence",
+      sentence_count: 1
+    },
+    output: {
+      format: "markdown"
+    }
+  };
+
+  const summary = summarizeRuntimeCandidateSelectionForTest(
+    {
+      brand: "gisgfim",
+      category: "Paper Lanterns",
+      keywords: [],
+      raw: "# raw",
+      values: {}
+    },
+    rule,
+    [
+      { candidateIndex: 2, content: "Colorful Paper Lanterns" },
+      { candidateIndex: 5, content: "Paper Lanterns" }
+    ]
+  );
+
+  assert.equal(summary.selected_candidate_index, 5);
+  assert.equal(summary.candidates[0]?.candidate_index, 2);
+  assert.equal(summary.candidates[1]?.candidate_index, 5);
+  assert.equal(summary.candidates[1]?.selected, true);
+  assert.equal(summary.candidates[1]?.error_count, 0);
+});
+
+test("summarizeRuntimeCandidateSelectionForTest keeps failed candidates with failure reasons in trace output", () => {
+  const rule: SectionRule = {
+    section: "bullets",
+    language: "en",
+    instruction: "generate bullets",
+    constraints: {
+      line_count: 1,
+      min_chars_per_line: 10,
+      max_chars_per_line: 300
+    },
+    execution: {
+      retries: 3,
+      repair_mode: "whole",
+      generation_mode: "sentence",
+      sentence_count: 1
+    },
+    output: {
+      format: "json",
+      json_array_field: "bullets"
+    }
+  };
+
+  const summary = summarizeRuntimeCandidateSelectionForTest(
+    {
+      brand: "gisgfim",
+      category: "Paper Lanterns",
+      keywords: [],
+      raw: "# raw",
+      values: {}
+    },
+    rule,
+    [
+      { candidateIndex: 1, error: "第2条长度不满足约束: 235" },
+      { candidateIndex: 2, content: "Feature Focus: colorful paper lanterns for classroom decor." }
+    ]
+  );
+
+  assert.equal(summary.selected_candidate_index, 2);
+  assert.equal(summary.candidates[0]?.candidate_index, 1);
+  assert.equal(summary.candidates[0]?.failure_reason, "第2条长度不满足约束: 235");
+  assert.equal(summary.candidates[0]?.selected, false);
+  assert.equal(summary.candidates[1]?.candidate_index, 2);
+  assert.equal(summary.candidates[1]?.selected, true);
 });
 
 test("scoreRuntimeCandidateForTest tolerates trailing prose after bullets JSON output", () => {
