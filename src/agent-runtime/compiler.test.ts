@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { cp, mkdir, mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { create as createTar } from "tar";
 import { compileExecutionSpec } from "./compiler.js";
 import { createDefaultRegistry } from "./registry.js";
@@ -145,14 +145,91 @@ function createFixtureRules(): TenantRules {
   };
 }
 
-async function createArchiveFromTenantFixture(tenant: "demo" | "syl"): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), `syl-agent-runtime-${tenant}-`));
-  const tenantRoot = join(root, "tenant");
-  const sourceRoot = resolve(process.cwd(), "..", "rules", "tenants", tenant);
-  await mkdir(tenantRoot, { recursive: true });
-  await cp(join(sourceRoot, "rules"), join(tenantRoot, "rules"), { recursive: true });
-  await cp(join(sourceRoot, "runtime-policy.yaml"), join(tenantRoot, "runtime-policy.yaml"));
-  const archivePath = join(root, `${tenant}.tar.gz`);
+async function createArchiveFromRuntimePolicyFixture(
+  prefix: string,
+  runtimePolicyDoc: string
+): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), `syl-agent-runtime-${prefix}-`));
+  const rulesRoot = join(root, "tenant", "rules");
+  await mkdir(join(rulesRoot, "sections"), { recursive: true });
+  await mkdir(join(rulesRoot, "templates"), { recursive: true });
+
+  await writeFile(
+    join(rulesRoot, "package.yaml"),
+    `required_sections:
+  - title
+  - bullets
+  - description
+  - search_terms
+  - translation
+templates:
+  en: templates/en.md.tmpl
+  cn: templates/cn.md.tmpl
+`
+  );
+  await writeFile(
+    join(rulesRoot, "input.yaml"),
+    `file_discovery:
+  marker: "===Listing Requirements==="
+fields:
+  - key: keywords
+    type: list
+    capture: heading_section
+    heading_aliases: ["关键词"]
+    min_count: 1
+`
+  );
+  await writeFile(
+    join(rulesRoot, "generation-config.yaml"),
+    `planning:
+  enabled: true
+  retries: 2
+  system_prompt: plan
+  user_prompt: plan
+judge:
+  enabled: true
+  max_rounds: 2
+  retries: 2
+  system_prompt: judge
+  user_prompt: judge
+  ignore_messages: ["OK"]
+  skip_sections: ["search_terms"]
+translation:
+  system_prompt: translate
+render:
+  keywords_item_template: "{{item}}"
+  bullets_item_template: "{{item}}"
+  bullets_separator: "\\n"
+display_labels: {}
+`
+  );
+  await writeFile(join(rulesRoot, "templates", "en.md.tmpl"), "# EN\n{{title_en}}\n");
+  await writeFile(join(rulesRoot, "templates", "cn.md.tmpl"), "# CN\n{{title_cn}}\n");
+
+  for (const section of ["title", "bullets", "description", "search_terms", "translation"]) {
+    const constraintsDoc =
+      section === "search_terms"
+        ? `constraints:
+  source: keywords_copy`
+        : `constraints: {}`;
+    await writeFile(
+      join(rulesRoot, "sections", `${section}.yaml`),
+      `section: ${section}
+language: ${section === "translation" ? "zh" : "en"}
+instruction: ${section}
+${constraintsDoc}
+execution:
+  retries: 2
+  generation_mode: whole
+output:
+  format: ${section === "bullets" ? "json" : section === "description" ? "markdown" : "text"}
+`
+    );
+  }
+
+  await writeFile(join(root, "tenant", "runtime-policy.yaml"), runtimePolicyDoc);
+
+  const archivePath = join(root, `${prefix}.tar.gz`);
   await createTar(
     {
       gzip: true,
@@ -548,7 +625,27 @@ test("compileExecutionSpec rejects reviewer requirement when writer blueprint fo
 });
 
 test("compileExecutionSpec honors section overrides from runtime-policy fixture", async () => {
-  const archivePath = await createArchiveFromTenantFixture("demo");
+  const archivePath = await createArchiveFromRuntimePolicyFixture(
+    "demo",
+    `intent:
+  primary: maximize_parallelism
+parallelism:
+  section_concurrency: 4
+specialists:
+  - blueprint: section_planner
+  - blueprint: title_writer
+  - blueprint: bullets_writer
+  - blueprint: description_writer
+  - blueprint: translation_specialist
+  - blueprint: reviewer
+  - blueprint: repairer
+section_overrides:
+  - section: bullets
+    candidate_count: 2
+  - section: description
+    reviewer_required: false
+`
+  );
   const rules = await loadTenantRules(archivePath, "demo-runtime", "rules-demo-runtime-team-template");
 
   const spec = compileExecutionSpec(rules, createDefaultRegistry());
@@ -559,7 +656,27 @@ test("compileExecutionSpec honors section overrides from runtime-policy fixture"
 });
 
 test("compileExecutionSpec uses runtime policy candidate counts for syl sections", async () => {
-  const archivePath = await createArchiveFromTenantFixture("syl");
+  const archivePath = await createArchiveFromRuntimePolicyFixture(
+    "syl",
+    `intent:
+  primary: maximize_parallelism
+parallelism:
+  section_concurrency: 4
+specialists:
+  - blueprint: section_planner
+  - blueprint: title_writer
+  - blueprint: bullets_writer
+  - blueprint: description_writer
+  - blueprint: translation_specialist
+  - blueprint: reviewer
+  - blueprint: repairer
+section_overrides:
+  - section: bullets
+    candidate_count: 2
+  - section: description
+    candidate_count: 2
+`
+  );
   const rules = await loadTenantRules(archivePath, "syl-runtime", "rules-syl-runtime-candidate-count");
 
   const spec = compileExecutionSpec(rules, createDefaultRegistry());
