@@ -1061,10 +1061,10 @@ test("resolveRuntimeTeamAttemptsForTest defaults runtime agent team retries to o
   assert.equal(resolveRuntimeTeamAttemptsForTest({ api_attempts: 3 }), 3);
 });
 
-test("resolveRuntimeTeamMaxTurnsForTest keeps bullets high but tightens reviewer-free sections", () => {
+test("resolveRuntimeTeamMaxTurnsForTest keeps bullets high while giving description extra repair budget", () => {
   assert.equal(resolveRuntimeTeamMaxTurnsForTest("bullets", true), 12);
   assert.equal(resolveRuntimeTeamMaxTurnsForTest("title", true), 8);
-  assert.equal(resolveRuntimeTeamMaxTurnsForTest("description", false), 6);
+  assert.equal(resolveRuntimeTeamMaxTurnsForTest("description", false), 8);
 });
 
 test("compactSectionRequirementsRawForPromptForTest removes duplicated keyword and category blocks for description", () => {

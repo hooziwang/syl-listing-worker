@@ -1306,6 +1306,9 @@ function resolveRuntimeTeamMaxTurns(section: string, hasReviewer: boolean): numb
   if (section === "bullets") {
     return 12;
   }
+  if (section === "description") {
+    return 8;
+  }
   if (!hasReviewer) {
     return 6;
   }
