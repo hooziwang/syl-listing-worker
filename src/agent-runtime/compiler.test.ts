@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { cp, mkdir, mkdtemp } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { cp, mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { create as createTar } from "tar";
@@ -148,7 +150,7 @@ function createFixtureRules(): TenantRules {
 async function createArchiveFromTenantFixture(tenant: "demo" | "syl"): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), `syl-agent-runtime-${tenant}-`));
   const tenantRoot = join(root, "tenant");
-  const sourceRoot = resolve(process.cwd(), "..", "rules", "tenants", tenant);
+  const sourceRoot = resolveTenantFixtureRoot(process.cwd(), tenant);
   await mkdir(tenantRoot, { recursive: true });
   await cp(join(sourceRoot, "rules"), join(tenantRoot, "rules"), { recursive: true });
   await cp(join(sourceRoot, "runtime-policy.yaml"), join(tenantRoot, "runtime-policy.yaml"));
@@ -163,6 +165,55 @@ async function createArchiveFromTenantFixture(tenant: "demo" | "syl"): Promise<s
   );
   return archivePath;
 }
+
+function resolveTenantFixtureRoot(baseDir: string, tenant: "demo" | "syl"): string {
+  const candidates = new Set<string>([
+    resolve(baseDir, "..", "rules", "tenants", tenant),
+    resolve(baseDir, "..", "syl-listing-pro-rules", "tenants", tenant)
+  ]);
+
+  for (const worktreeRoot of listGitWorktreeRoots(baseDir)) {
+    candidates.add(resolve(worktreeRoot, "..", "rules", "tenants", tenant));
+    candidates.add(resolve(worktreeRoot, "..", "syl-listing-pro-rules", "tenants", tenant));
+  }
+
+  for (const candidate of candidates) {
+    if (existsSync(join(candidate, "rules")) && existsSync(join(candidate, "runtime-policy.yaml"))) {
+      return candidate;
+    }
+  }
+
+  return Array.from(candidates)[0];
+}
+
+function listGitWorktreeRoots(baseDir: string): string[] {
+  try {
+    const output = execFileSync("git", ["worktree", "list", "--porcelain"], {
+      cwd: baseDir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    });
+    return output
+      .split("\n")
+      .filter((line) => line.startsWith("worktree "))
+      .map((line) => line.slice("worktree ".length).trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+test("resolveTenantFixtureRoot supports syl-listing-pro-rules sibling repo name", async () => {
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "syl-worker-fixture-root-"));
+  const workerRepo = join(workspaceRoot, "syl-listing-worker");
+  const rulesRepo = join(workspaceRoot, "syl-listing-pro-rules", "tenants", "syl");
+  await mkdir(workerRepo, { recursive: true });
+  await mkdir(join(rulesRepo, "rules"), { recursive: true });
+  await writeFile(join(rulesRepo, "runtime-policy.yaml"), "section_overrides: []\n");
+  const got = resolveTenantFixtureRoot(workerRepo, "syl");
+  const want = join(workspaceRoot, "syl-listing-pro-rules", "tenants", "syl");
+  assert.equal(got, want);
+});
 
 test("compileExecutionSpec builds a runtime section plan", () => {
   const spec = compileExecutionSpec(createFixtureRules(), createDefaultRegistry());
