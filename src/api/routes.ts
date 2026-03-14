@@ -99,19 +99,22 @@ function requireAuth(ctx: ApiContext) {
 }
 
 function requestBaseURL(request: FastifyRequest): string {
+  const firstForwardedValue = (value: string | string[] | undefined): string => {
+    const raw = Array.isArray(value) ? value[0] : value;
+    if (typeof raw !== "string") {
+      return "";
+    }
+    return raw
+      .split(",")
+      .map((item) => item.trim())
+      .find(Boolean) ?? "";
+  };
+
   const forwardedProto = request.headers["x-forwarded-proto"];
-  const proto = Array.isArray(forwardedProto)
-    ? forwardedProto[0]
-    : typeof forwardedProto === "string" && forwardedProto.length > 0
-      ? forwardedProto
-      : request.protocol || "http";
+  const proto = firstForwardedValue(forwardedProto) || request.protocol || "http";
 
   const forwardedHost = request.headers["x-forwarded-host"];
-  const host = Array.isArray(forwardedHost)
-    ? forwardedHost[0]
-    : typeof forwardedHost === "string" && forwardedHost.length > 0
-      ? forwardedHost
-      : request.headers.host || "127.0.0.1:8080";
+  const host = firstForwardedValue(forwardedHost) || request.headers.host || "127.0.0.1:8080";
 
   return `${proto}://${host}`;
 }
