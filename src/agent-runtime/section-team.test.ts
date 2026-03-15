@@ -35,6 +35,7 @@ test("buildSectionAgentTeam tells repairer to never invent transfer tools", () =
   assert.ok(team.repairerAgent);
   assert.equal(team.repairerAgent?.handoffs.length, 0);
   assert.match(String(team.repairerAgent?.instructions), /不要调用任何 transfer_to_/);
+  assert.equal(team.repairerAgent?.tools.length, 0);
 });
 
 test("buildSectionAgentTeam makes validation an explicit tool instead of a handoff target", () => {
@@ -65,12 +66,14 @@ test("buildSectionAgentTeam makes validation an explicit tool instead of a hando
     repairInstructions: "repair"
   });
 
-  assert.match(String(team.writerAgent.instructions), /不是 agent，也不是 handoff/);
-  assert.match(String(team.reviewerAgent?.instructions), /不是 agent，也不是 handoff/);
-  assert.match(String(team.repairerAgent?.instructions), /不是 agent，也不是 handoff/);
+  assert.doesNotMatch(String(team.writerAgent.instructions), /check_section_candidate/);
+  assert.doesNotMatch(String(team.reviewerAgent?.instructions), /check_section_candidate/);
+  assert.doesNotMatch(String(team.repairerAgent?.instructions), /check_section_candidate/);
+  assert.equal(team.writerAgent.tools.length, 0);
+  assert.equal(team.reviewerAgent?.tools.length, 0);
 });
 
-test("buildSectionAgentTeam filters tool history before handoff to repairer", () => {
+test("buildSectionAgentTeam no longer wires reviewer handoff to repairer inside the runtime team", () => {
   const validateTool = tool({
     name: "validate_section_candidate",
     description: "validate",
@@ -98,11 +101,71 @@ test("buildSectionAgentTeam filters tool history before handoff to repairer", ()
     repairInstructions: "repair"
   });
 
-  const reviewerRepairHandoff = team.reviewerAgent?.handoffs[0] as { inputFilter?: unknown } | undefined;
-  const writerRepairHandoff = team.writerAgent.handoffs.find((item) => "agentName" in item && item.agentName === team.repairerAgent?.name) as
-    | { inputFilter?: unknown }
-    | undefined;
+  assert.equal(team.reviewerAgent?.handoffs.length, 0);
+  assert.equal(team.writerAgent.handoffs.some((item) => "agentName" in item && item.agentName === team.repairerAgent?.name), false);
+});
 
-  assert.equal(typeof reviewerRepairHandoff?.inputFilter, "function");
-  assert.equal(typeof writerRepairHandoff?.inputFilter, "function");
+test("buildSectionAgentTeam forces writer to hand off to reviewer instead of finishing directly", () => {
+  const validateTool = tool({
+    name: "validate_section_candidate",
+    description: "validate",
+    parameters: z.object({
+      content: z.string()
+    }),
+    execute: async () => JSON.stringify({ ok: true, errors: [] })
+  });
+
+  const team = buildSectionAgentTeam({
+    section: "bullets",
+    step: "bullets_runtime_team_candidate_3",
+    validateToolName: "check_section_candidate",
+    plannerRuntime: {
+      model: "deepseek-chat",
+      modelSettings: {}
+    },
+    writerRuntime: {
+      model: "deepseek-chat",
+      modelSettings: {}
+    },
+    validateTool,
+    writerInstructions: "writer",
+    reviewerInstructions: "reviewer",
+    repairInstructions: "repair"
+  });
+
+  assert.match(String(team.writerAgent.instructions), /若 reviewer 可用，完成候选稿后必须 handoff 给 reviewer/);
+  assert.match(String(team.reviewerAgent?.instructions), /直接输出最终稿/);
+});
+
+test("buildSectionAgentTeam exposes only reviewer handoff to writer when reviewer exists", () => {
+  const validateTool = tool({
+    name: "validate_section_candidate",
+    description: "validate",
+    parameters: z.object({
+      content: z.string()
+    }),
+    execute: async () => JSON.stringify({ ok: true, errors: [] })
+  });
+
+  const team = buildSectionAgentTeam({
+    section: "bullets",
+    step: "bullets_runtime_team_candidate_4",
+    validateToolName: "check_section_candidate",
+    plannerRuntime: {
+      model: "deepseek-chat",
+      modelSettings: {}
+    },
+    writerRuntime: {
+      model: "deepseek-chat",
+      modelSettings: {}
+    },
+    validateTool,
+    writerInstructions: "writer",
+    reviewerInstructions: "reviewer",
+    repairInstructions: "repair"
+  });
+
+  assert.equal(team.writerAgent.handoffs.length, 1);
+  assert.equal("agentName" in team.writerAgent.handoffs[0], true);
+  assert.equal(("agentName" in team.writerAgent.handoffs[0] ? team.writerAgent.handoffs[0].agentName : ""), team.reviewerAgent?.name);
 });

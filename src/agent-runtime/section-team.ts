@@ -52,26 +52,14 @@ export function buildSectionAgentTeam(config: SectionAgentTeamConfig): SectionAg
         name: buildAgentName("repairer", config.step),
         instructions: [
           config.repairInstructions,
-          `${config.validateToolName} 是校验工具，不是 agent，也不是 handoff。`,
           "你没有任何 handoff 目标。",
-          "绝不要调用任何 transfer_to_validator_* 工具。",
-          "不要调用任何 transfer_to_* 工具；校验通过后直接输出 final_output 文本。",
-          `若 ${config.validateToolName} 返回 repair_guidance，必须优先逐条执行其中的修复指令。`,
-          `必须先根据上下文重写内容，再调用 ${config.validateToolName}。`,
-          `若 ${config.validateToolName} 返回 errors，必须逐条消除这些错误后再继续。`,
-          "若校验通过，只输出 final_output，不要解释。",
-          "若校验未通过，可继续重写并再次调用工具。"
+          "不要调用任何 transfer_to_* 工具，也不要调用任何校验工具。",
+          "你只负责根据失败原因重写完整终稿。",
+          "收到修复要求后，必须直接输出修复后的完整终稿，不要解释。"
         ].join("\n"),
         handoffDescription: `修复 ${config.section} section 的专家`,
         model: config.repairerRuntime?.model ?? config.writerRuntime.model,
-        modelSettings: config.repairerRuntime?.modelSettings ?? config.writerRuntime.modelSettings,
-        tools: [config.validateTool]
-      })
-    : undefined;
-
-  const repairerHandoff = repairerAgent
-    ? handoff(repairerAgent, {
-        inputFilter: removeAllTools
+        modelSettings: config.repairerRuntime?.modelSettings ?? config.writerRuntime.modelSettings
       })
     : undefined;
 
@@ -80,39 +68,41 @@ export function buildSectionAgentTeam(config: SectionAgentTeamConfig): SectionAg
         name: buildAgentName("reviewer", config.step),
         instructions: [
           config.reviewerInstructions,
-          `${config.validateToolName} 是校验工具，不是 agent，也不是 handoff。`,
-          repairerHandoff ? describeAllowedHandoffs([repairerHandoff]) : describeAllowedHandoffs([]),
-          "绝不要调用任何 transfer_to_validator_* 工具。",
-          `必须调用 ${config.validateToolName} 复核最近的候选内容。`,
-          "若返回 errors 或 repair_guidance，先基于这些结果判断哪些条目要修，避免无关改写。",
-          "若校验通过，只输出 final_output，不要解释。",
-          "若校验未通过，立刻 handoff 给 repairer。"
+          "你负责复核 writer 刚交来的候选稿。",
+          "不要调用任何工具，也不要再 handoff 给其它 agent。",
+          "若发现明显问题，直接把整稿修到更符合要求后再输出。",
+          "直接输出最终稿，不要解释。"
         ].join("\n"),
         handoffDescription: `复核 ${config.section} section 的专家`,
         model: config.reviewerRuntime?.model ?? config.writerRuntime.model,
-        modelSettings: config.reviewerRuntime?.modelSettings ?? config.writerRuntime.modelSettings,
-        tools: [config.validateTool],
-        handoffs: repairerHandoff ? [repairerHandoff] : undefined
+        modelSettings: config.reviewerRuntime?.modelSettings ?? config.writerRuntime.modelSettings
       })
     : undefined;
 
-  const writerHandoffs = [reviewerAgent, repairerHandoff].filter((item): item is Agent | Handoff => !!item);
+  const reviewerHandoff = reviewerAgent
+    ? handoff(reviewerAgent, {
+        inputFilter: removeAllTools
+      })
+    : undefined;
+
+  const writerHandoffs = reviewerAgent
+    ? [reviewerHandoff].filter((item): item is Handoff => !!item)
+    : [];
   const writerAgent = new Agent({
     name: buildAgentName("writer", config.step),
     instructions: [
       config.writerInstructions,
-      `${config.validateToolName} 是校验工具，不是 agent，也不是 handoff。`,
       describeAllowedHandoffs(writerHandoffs),
-      "绝不要调用任何 transfer_to_validator_* 工具。",
-      `先生成候选内容，再调用 ${config.validateToolName}。`,
-      "若返回 errors 或 repair_guidance，优先按 repair_guidance 调整，不要盲目整体改写。",
-      "若校验通过，只输出 final_output，不要解释。",
-      "若校验未通过且 reviewer 可用，handoff 给 reviewer；否则 handoff 给 repairer。"
+      "不要调用任何工具。",
+      "先完成完整候选稿。",
+      reviewerAgent
+        ? "若 reviewer 可用，完成候选稿后必须 handoff 给 reviewer。"
+        : "若校验通过，只输出 final_output，不要解释。",
+      reviewerAgent ? "writer 不允许直接结束任务。" : "若校验未通过，handoff 给 repairer。"
     ].join("\n"),
     handoffDescription: `生成 ${config.section} section 的专家`,
     model: config.writerRuntime.model,
     modelSettings: config.writerRuntime.modelSettings,
-    tools: [config.validateTool],
     handoffs: writerHandoffs
   });
 
@@ -121,8 +111,7 @@ export function buildSectionAgentTeam(config: SectionAgentTeamConfig): SectionAg
     instructions: [
       `你负责协调 ${config.section} section 的生成。`,
       "立刻 handoff 给 writer specialist。",
-      `${config.validateToolName} 是校验工具，不是 agent，也不是 handoff。`,
-      "只在最终内容已经通过校验工具后才允许结束。"
+      "不要自己输出正文。"
     ].join("\n"),
     model: config.plannerRuntime.model,
     modelSettings: config.plannerRuntime.modelSettings,

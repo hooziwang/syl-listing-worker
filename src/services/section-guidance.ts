@@ -77,6 +77,19 @@ function extractParagraphErrorIndex(error: string): number | null {
   return Number.isFinite(index) && index > 0 ? index - 1 : null;
 }
 
+function extractMissingKeyword(error: string): { index: number; keyword: string } | null {
+  const matched = /^缺少关键词 #(\d+):\s*(.+)$/.exec(error.trim());
+  if (!matched) {
+    return null;
+  }
+  const index = Number.parseInt(matched[1], 10) - 1;
+  const keyword = normalizeLine(matched[2] ?? "");
+  if (!Number.isFinite(index) || index < 0 || !keyword) {
+    return null;
+  }
+  return { index, keyword };
+}
+
 function extractLineLengthViolation(error: string): { index: number; violation: LengthViolation } | null {
   const matched = lineLengthErrorPattern.exec(error.trim());
   if (!matched) {
@@ -146,14 +159,42 @@ function buildAdaptiveSlotLengthBudgets(keywordPlan: string[][], minChars: numbe
   });
 }
 
+function resolvePreferredPerLineRange(rule: SectionRule): { min: number; max: number } {
+  const preferredMin = getNumber(rule.constraints, "preferred_min_chars_per_line", 0);
+  const preferredMax = getNumber(rule.constraints, "preferred_max_chars_per_line", 0);
+  if (preferredMin > 0 && preferredMax >= preferredMin) {
+    return { min: preferredMin, max: preferredMax };
+  }
+  return {
+    min: getNumber(rule.constraints, "min_chars_per_line", 0),
+    max: getNumber(rule.constraints, "max_chars_per_line", 0)
+  };
+}
+
+function resolveBulletRepairTargetRange(rule: SectionRule): { min: number; max: number } {
+  if (rule.section !== "bullets") {
+    return resolvePreferredPerLineRange(rule);
+  }
+  const rawMax = getNumber(rule.constraints, "max_chars_per_line", 0);
+  const tolerance = getNumber(rule.constraints, "tolerance_chars", 0);
+  if (rawMax > 0) {
+    const min = rawMax + 2;
+    const hardMax = rawMax + tolerance;
+    const max = hardMax > 0 ? Math.min(rawMax + 8, hardMax) : rawMax + 8;
+    return { min, max: Math.max(min, max) };
+  }
+  return resolvePreferredPerLineRange(rule);
+}
+
 function buildSlotLengthBudgets(rule: SectionRule, keywordPlan: string[][]): SlotLengthBudget[] {
   if (rule.section !== "bullets") {
     return [];
   }
+  const preferred = resolvePreferredPerLineRange(rule);
   return buildAdaptiveSlotLengthBudgets(
     keywordPlan,
-    getNumber(rule.constraints, "min_chars_per_line", 0),
-    getNumber(rule.constraints, "max_chars_per_line", 0)
+    preferred.min,
+    preferred.max
   );
 }
 
@@ -273,6 +314,7 @@ export function buildSectionExecutionGuidance(requirements: ListingRequirements,
   if (rule.section === "bullets") {
     const minChars = getNumber(rule.constraints, "min_chars_per_line", 0);
     const maxChars = getNumber(rule.constraints, "max_chars_per_line", 0);
+    const preferred = resolvePreferredPerLineRange(rule);
     const hardMax = maxChars > 0 ? maxChars + tolerance : 0;
     const budgets = buildSlotLengthBudgets(rule, plan);
     return [
@@ -282,7 +324,7 @@ export function buildSectionExecutionGuidance(requirements: ListingRequirements,
       "- 每条首个关键词必须在小标题后尽快出现，再按批次顺序带入后续关键词。",
       "- 关键词一律使用小写并加粗，格式示例：**paper lanterns**。",
       "- 第2、3、4条不要套固定模版，优先发掘产品最强优点，不要机械重复尺寸/材质/颜色。",
-      "- 字符数按最终文本逐字符计算，空格和标点都计入长度。",
+      "- 字符数按最终文本逐字符计算，空格和标点都计入长度；连续的 2 个星号 ** 不计入字符数。",
       "- 第二句只补 1 个结果或用途，不要继续枚举多个场景、并列多个空泛卖点。",
       "- 禁止 that/which/while/allowing/providing/making/ensuring 这类拖尾扩写。",
       "- 禁止 ideal、perfect、transform、create、bring、enhance 这类空泛词。",
@@ -296,7 +338,8 @@ export function buildSectionExecutionGuidance(requirements: ListingRequirements,
           return `- 第${index + 1}条建议长度 ${budget.min}-${budget.max} 字符${note ? `；${note}` : "。"} `;
         })
         .map((line) => line.trim()),
-      minChars > 0 && maxChars > 0 ? `- 每条目标长度 ${minChars}-${maxChars} 字符，尽量贴近 250 字符。` : "",
+      preferred.min > 0 && preferred.max > 0 ? `- 每条最佳落点 ${preferred.min}-${preferred.max} 字符，略高于 250 字符更稳妥。` : "",
+      minChars > 0 ? `- 每条不得少于 ${minChars} 字符。` : "",
       hardMax > 0 ? `- 每条绝对上限 ${hardMax} 字符，超出就整条重写，不要只砍尾巴。` : ""
     ].filter(Boolean).join("\n");
   }
@@ -311,6 +354,7 @@ export function buildSectionExecutionGuidance(requirements: ListingRequirements,
       "Description 结构化执行要求:",
       `- 固定输出 ${plan.length} 段，仅保留 1 个空行分段；每段聚焦不同价值点。`,
       "- 每段控制 2-3 句，句末必须带标点，不要拆成第 3 段。",
+      "- 字符数按最终文本逐字符计算，空格和标点都计入长度；连续的 2 个星号 ** 不计入字符数。",
       perParagraphMin > 0 && perParagraphMax > 0 ? `- 每段建议控制在 ${perParagraphMin}-${perParagraphMax} 字符，优先均匀分配篇幅。` : "",
       "- 严格按以下段落批次消化关键词，不要把第 2 段关键词提前到第 1 段。",
       ...plan.map((keywords, index) => `- 第${index + 1}段关键词批次: ${keywords.map((item) => `**${item}**`).join(" -> ")}`),
@@ -339,6 +383,8 @@ export function buildSectionRepairGuidance(
   const lineCount = getNumber(rule.constraints, "line_count", 0);
   const minChars = getNumber(rule.constraints, "min_chars_per_line", 0);
   const maxChars = getNumber(rule.constraints, "max_chars_per_line", 0);
+  const preferred = resolvePreferredPerLineRange(rule);
+  const repairTarget = resolveBulletRepairTargetRange(rule);
   const minTotalChars = getNumber(rule.constraints, "min_chars", 0);
   const maxTotalChars = getNumber(rule.constraints, "max_chars", 0);
   const tolerance = getNumber(rule.constraints, "tolerance_chars", 0);
@@ -371,6 +417,43 @@ export function buildSectionRepairGuidance(
   const keywordLineIndex = keywordErrorIndex === undefined ? null : keywordIndexToLine(counts, keywordErrorIndex);
   const hasParagraphCountError = errors.some((error) => error.startsWith("段落数量不满足约束:"));
 
+  if (rule.section === "title") {
+    const lines = ["修复指导:", "- 标题必须保持单行，只输出标题文本。"];
+    if (minTotalChars > 0 && maxTotalChars > 0) {
+      lines.push(
+        `- 总长度控制在 ${minTotalChars}-${maxTotalChars} 字符，${hardTotalMax > 0 ? `绝不超过 ${hardTotalMax} 字符。` : "保持长度稳定。"}`
+      );
+    }
+    if (totalViolation) {
+      lines.push(`- ${describeLengthDelta(totalViolation)}。`);
+      if (totalViolation.actual > totalViolation.tolMax) {
+        lines.push("- 超长时先删重复场景词、并列同义修饰和空泛形容词，不要删品牌词与前 3 条核心关键词。");
+        lines.push("- 保留 1 个核心使用场景和必要规格信息，不要并列堆多个节日、场景或近义短语。");
+      } else if (totalViolation.actual < totalViolation.tolMin) {
+        lines.push("- 过短时优先补 1 个核心使用场景或规格信息，不要堆空泛形容词。");
+      }
+    }
+    if (requirements.brand && errors.some((error) => error === `缺少品牌词: ${requirements.brand}`)) {
+      lines.push(`- 必须补回品牌词 ${requirements.brand}，且保持自然可读。`);
+    }
+    const missingTopKeywords = errors
+      .map((error) => extractMissingKeyword(error))
+      .filter((value): value is { index: number; keyword: string } => value !== null)
+      .sort((left, right) => left.index - right.index);
+    const topKeywords = requirements.keywords
+      .slice(0, 3)
+      .map((keyword) => normalizeLine(keyword))
+      .filter(Boolean);
+    if (topKeywords.length > 0) {
+      lines.push(`- 前 3 条核心关键词必须保持原词序自然出现：${topKeywords.join(" -> ")}。`);
+    }
+    if (missingTopKeywords.length > 0) {
+      lines.push(`- 必须补回前 3 条核心关键词中缺失的短语：${missingTopKeywords.map((item) => item.keyword).join(" -> ")}。`);
+    }
+    lines.push("- 优先结构：品牌 + 核心产品词 + 关键使用场景 + 规格信息。");
+    return lines.join("\n");
+  }
+
   if (rule.section === "description") {
     const lines = ["修复指导:"];
     if (slotCount > 0) {
@@ -389,6 +472,8 @@ export function buildSectionRepairGuidance(
     if (totalViolation) {
       lines.push(`- ${describeLengthDelta(totalViolation)}。`);
       if (totalViolation.actual > totalViolation.tolMax && slotCount > 0) {
+        lines.push("- 当前整体超长，先压缩再润色，不要只微调几个词。");
+        lines.push("- 优先删除重复场景串、同义复述和空泛修饰；每段最多保留 2 个场景例子。");
         const targetBudget = paragraphBudgets[slotCount - 1];
         if (targetBudget) {
           const note = describeBudgetNote("段", targetBudget);
@@ -398,6 +483,8 @@ export function buildSectionRepairGuidance(
         } else {
           lines.push(`- 优先把第${slotCount}段压缩到建议长度，删除重复修饰、同义复述和非关键信息。`);
         }
+      } else if (totalViolation.actual < totalViolation.tolMin) {
+        lines.push("- 当前整体偏短，优先补足具体产品细节、使用收益或安装体验，不要补空话。");
       }
     }
     if (hasParagraphCountError) {
@@ -425,12 +512,13 @@ export function buildSectionRepairGuidance(
   const lines = [
     "修复指导:",
     "- 优先保留已通过的前序条目，只重写被点名的条目和其后的乱序条目。",
-    "- 每条小标题控制在 2-4 个英文单词，关键词一律使用小写加粗，空格和标点都计入字符数。"
+    "- 未被点名的条目尽量逐字保持原样，不要顺手改写通过的条目。",
+    "- 每条小标题控制在 2-4 个英文单词，关键词一律使用小写加粗，空格和标点都计入字符数；连续的 2 个星号 ** 不计入字符数。"
   ];
   for (const lineIndex of lineIndexes) {
-    if (minChars > 0 && maxChars > 0) {
+    if (repairTarget.min > 0 && repairTarget.max > 0) {
       lines.push(
-        `- 第${lineIndex + 1}条重写到 ${minChars}-${maxChars} 字符，${hardMax > 0 ? `绝不超过 ${hardMax} 字符。` : "保持长度稳定。"}`
+        `- 第${lineIndex + 1}条重写到 ${repairTarget.min}-${repairTarget.max} 字符，${hardMax > 0 ? `绝不超过 ${hardMax} 字符。` : "保持长度稳定。"}`
       );
     }
     lines.push(`- ${buildBulletLineRoleGuidance(lineIndex)}`);
@@ -443,9 +531,17 @@ export function buildSectionRepairGuidance(
     }
     const violation = lineViolations.get(lineIndex);
     if (violation) {
-      lines.push(`- 第${lineIndex + 1}条${describeLengthDelta(violation)}，优先删除重复修饰和泛化铺陈。`);
-      lines.push(`- 第${lineIndex + 1}条删掉 that/which/while/allowing/providing/making/ensuring 这类拖尾扩写。`);
-      lines.push(`- 第${lineIndex + 1}条不要再补 ideal、perfect、transform、create、bring、enhance 这类空泛词。`);
+      if (violation.actual < violation.tolMin) {
+        lines.push(`- 第${lineIndex + 1}条${describeLengthDelta(violation)}，优先补 1 个具体产品细节或结果句。`);
+        lines.push(`- 第${lineIndex + 1}条当前至少还差 ${violation.tolMin - violation.actual} 个可见字符，补完后最好落到 ${repairTarget.min}-${repairTarget.max} 字符。`);
+        lines.push(`- 第${lineIndex + 1}条不要停在 230-239 这类仍会失败的长度，至少补到 ${repairTarget.min} 字符以上再停。`);
+        lines.push(`- 第${lineIndex + 1}条不要只改几个词，至少补足缺少的长度，同时保持关键词顺序不变。`);
+        lines.push(`- 第${lineIndex + 1}条补充数量、尺寸、安装体验、可复用性或教室场景收益这类具体信息，不要补空话。`);
+      } else {
+        lines.push(`- 第${lineIndex + 1}条${describeLengthDelta(violation)}，优先删除重复修饰和泛化铺陈。`);
+        lines.push(`- 第${lineIndex + 1}条删掉 that/which/while/allowing/providing/making/ensuring 这类拖尾扩写。`);
+        lines.push(`- 第${lineIndex + 1}条不要再补 ideal、perfect、transform、create、bring、enhance 这类空泛词。`);
+      }
     }
   }
   if (keywordLineIndex !== null) {

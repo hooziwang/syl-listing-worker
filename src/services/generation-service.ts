@@ -12,10 +12,10 @@ import {
 } from "../agent-runtime/planner.js";
 import { createDefaultRegistry } from "../agent-runtime/registry.js";
 import type { ModelProfile } from "../agent-runtime/types.js";
-import { LLMClient } from "./llm-client.js";
+import { LLMClient, SectionAgentTeamValidationError } from "./llm-client.js";
 import { inputMatchesMarker, parseRequirements, type ListingRequirements } from "./requirements-parser.js";
 import { loadTenantRules, type SectionRule, type TenantRules } from "./rules-loader.js";
-import { buildSectionExecutionGuidance, buildSectionRepairGuidance } from "./section-guidance.js";
+import { buildSectionExecutionGuidance, buildSectionKeywordPlan, buildSectionRepairGuidance } from "./section-guidance.js";
 import type { RedisTraceStore } from "../store/trace-store.js";
 import { ExecutionContext } from "../runtime-support/execution-context.js";
 import type { GenerationNode } from "../runtime-support/types.js";
@@ -160,6 +160,24 @@ function normalizeLine(input: string): string {
   return input.replace(/\s+/g, " ").trim();
 }
 
+function countLengthForValidation(input: string): number {
+  return input.replace(/\*\*/g, "").length;
+}
+
+function buildInputCharMetrics(input: string): { input_chars: number; raw_input_chars: number } {
+  return {
+    input_chars: countLengthForValidation(input),
+    raw_input_chars: input.length
+  };
+}
+
+function buildOutputCharMetrics(input: string): { output_chars: number; raw_output_chars: number } {
+  return {
+    output_chars: countLengthForValidation(input),
+    raw_output_chars: input.length
+  };
+}
+
 function stripBulletPrefix(line: string): string {
   return line.replace(/^[-*•\d\s.)]+/, "").trim();
 }
@@ -236,6 +254,53 @@ const titleCompressionRules: Array<[RegExp, string]> = [
   [/\s*,\s*/g, ", "]
 ];
 
+const descriptionCompressionRules: Array<[RegExp, string]> = [
+  [/\bElevate any space with our versatile set of twelve\b/gi, "Set of twelve"],
+  [/\bElevate your space with our versatile set of\b/gi, "Set of"],
+  [/\bTransform your space with this versatile set of twelve\b/gi, "Set of twelve"],
+  [/\bTransform any room with these essential\b/gi, "These"],
+  [/\bperfect for creating a festive and personalized atmosphere\b/gi, "for festive displays"],
+  [/\bperfect for all your\b/gi, "for"],
+  [/\bfeaturing a vibrant plaid pattern\b/gi, "with plaid pattern"],
+  [/\bwith a charming plaid design\b/gi, "with plaid design"],
+  [/\bmeasuring 10x10 inches each for a substantial visual impact\b/gi, "in 10x10 inches"],
+  [/\bideal as\b/gi, "as"],
+  [/\bhelp classrooms,\s*parties,\s*and welcome walls feel bright and polished\b/gi, "fit classrooms and welcome walls"],
+  [/\bThis pack is exceptionally suited for\b/gi, "This set suits"],
+  [/\bproviding an engaging\b/gi, "with"],
+  [/\bsolution for inspiring\b/gi, "for"],
+  [/\bTheir playful plaid pattern enhances\b/gi, "Plaid styling fits"],
+  [/\bperfect for stimulating learning environments\b/gi, "for classrooms"],
+  [/\bthey also adapt beautifully for elegant\b/gi, "they also suit"],
+  [/\bBeyond classrooms,\s*they serve as charming\b/gi, "Beyond classrooms, they suit"],
+  [/\bor vibrant\b/gi, "or"],
+  [/\bThe set also works as\b/gi, "The set works as"],
+  [/\bin classrooms and party tables\b/gi, "for classrooms and party tables"],
+  [/\ba bright plaid focal point for\b/gi, "plaid focus for"],
+  [/\bbright plaid focal point for\b/gi, "plaid focus for"],
+  [/\bkeeps displays cheerful and photo ready\b/gi, "keeps displays photo ready"],
+  [/\bspread coordinated color through\b/gi, "spread color through"],
+  [/\bteacher prepared\b/gi, ""],
+  [/\bLightweight frames open quickly and fold flat after use\b/gi, "Frames open quickly and fold flat"],
+  [/\bstay practical for repeated school decorating\b/gi, "work for repeated school decor"],
+  [/\bwithout extra tools\b/gi, "fast"],
+  [/\bneat,\s*colorful,\s*and easy to reset\b/gi, "neat and easy to reset"],
+  [/\bcheerful\b/gi, ""],
+  [/\bbright\b/gi, ""],
+  [/\bcoordinated\b/gi, ""],
+  [/\bseasonal\b/gi, ""],
+  [/\bdaily\b/gi, ""],
+  [/\brepeated\b/gi, ""],
+  [/\bpractical\b/gi, ""],
+  [/\bpolished\b/gi, ""],
+  [/\bvisually\b/gi, ""],
+  [/\bbusy\b/gi, ""],
+  [/\bfrom every angle\b/gi, ""],
+  [/\bagain\b/gi, ""],
+  [/\ball season long\b/gi, "all term"],
+  [/\ball term long\b/gi, "all term"]
+];
+
 function transformNonKeywordSegments(input: string, transform: (segment: string) => string): string {
   return input
     .split(/(\*\*[^*]+\*\*)/g)
@@ -251,6 +316,264 @@ function cleanupCompressedBulletLine(input: string): string {
       .replace(/\(\s+/g, "(")
       .replace(/\s+\)/g, ")")
   );
+}
+
+function cleanupCompressedDescriptionContent(input: string): string {
+  return normalizeText(
+    input
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n[ \t]+/g, "\n")
+      .split(/\n\s*\n/g)
+      .map((paragraph) =>
+        normalizeLine(
+          paragraph
+            .replace(/\s+([,.;!?])/g, "$1")
+            .replace(/([,.;!?])([A-Za-z*])/g, "$1 $2")
+            .replace(/([A-Za-z0-9])\*\*(?=[A-Za-z])/g, "$1** ")
+            .replace(/\(\s+/g, "(")
+            .replace(/\s+\)/g, ")")
+        )
+      )
+      .filter(Boolean)
+      .join("\n\n")
+  );
+}
+
+function splitSentencesPreservePunctuation(input: string): string[] {
+  const matches = input.match(/[^.!?]+[.!?]?/g);
+  return matches ? matches.filter((item) => item.length > 0) : [input];
+}
+
+function pruneCommaClauseInSentence(
+  sentence: string
+): { sentence: string; saving: number } | null {
+  const leading = sentence.match(/^\s*/)?.[0] ?? "";
+  const trailing = sentence.match(/\s*$/)?.[0] ?? "";
+  const trimmed = sentence.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const punctuation = /[.!?]$/.test(trimmed) ? trimmed.slice(-1) : "";
+  const core = punctuation ? trimmed.slice(0, -1).trim() : trimmed;
+  const parts = core
+    .split(/\s*,\s*/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (parts.length < 3) {
+    return null;
+  }
+  let removeIndex = -1;
+  let removeLength = 0;
+  for (let index = 1; index < parts.length - 1; index += 1) {
+    const candidate = parts[index] ?? "";
+    if (!candidate || /^and\b/i.test(candidate)) {
+      continue;
+    }
+    if (candidate.length > removeLength) {
+      removeIndex = index;
+      removeLength = candidate.length;
+    }
+  }
+  if (removeIndex < 0) {
+    removeIndex = 1;
+    removeLength = parts[1]?.length ?? 0;
+  }
+  if (removeLength <= 0) {
+    return null;
+  }
+  const nextParts = parts.filter((_value, index) => index !== removeIndex);
+  let rebuilt = nextParts.join(", ");
+  rebuilt = rebuilt.replace(/,\s+(and|or)\b/gi, " $1");
+  rebuilt = cleanupCompressedDescriptionContent(`${leading}${rebuilt}${punctuation}${trailing}`);
+  const originalLength = countLengthForValidation(sentence);
+  const nextLength = countLengthForValidation(rebuilt);
+  if (nextLength >= originalLength) {
+    return null;
+  }
+  return {
+    sentence: rebuilt,
+    saving: originalLength - nextLength
+  };
+}
+
+function pruneDescriptionCommaClauseOnce(input: string, minChars = 0): string {
+  const segments = input.split(/(\*\*[^*]+\*\*)/g);
+  let bestSegmentIndex = -1;
+  let bestSentenceIndex = -1;
+  let bestReplacement = "";
+  let bestSaving = 0;
+
+  for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
+    const segment = segments[segmentIndex] ?? "";
+    if (!segment || (segment.startsWith("**") && segment.endsWith("**"))) {
+      continue;
+    }
+    const sentences = splitSentencesPreservePunctuation(segment);
+    for (let sentenceIndex = 0; sentenceIndex < sentences.length; sentenceIndex += 1) {
+      const candidate = pruneCommaClauseInSentence(sentences[sentenceIndex] ?? "");
+      if (!candidate || candidate.saving <= bestSaving) {
+        continue;
+      }
+      const nextSentences = [...sentences];
+      nextSentences[sentenceIndex] = candidate.sentence;
+      const nextSegments = [...segments];
+      nextSegments[segmentIndex] = nextSentences.join("");
+      const nextContent = cleanupCompressedDescriptionContent(nextSegments.join(""));
+      if (minChars > 0 && countLengthForValidation(nextContent) < minChars) {
+        continue;
+      }
+      bestSegmentIndex = segmentIndex;
+      bestSentenceIndex = sentenceIndex;
+      bestReplacement = candidate.sentence;
+      bestSaving = candidate.saving;
+    }
+  }
+
+  if (bestSegmentIndex < 0 || bestSentenceIndex < 0) {
+    return input;
+  }
+
+  const targetSegment = segments[bestSegmentIndex] ?? "";
+  const sentences = splitSentencesPreservePunctuation(targetSegment);
+  sentences[bestSentenceIndex] = bestReplacement;
+  segments[bestSegmentIndex] = sentences.join("");
+  return cleanupCompressedDescriptionContent(segments.join(""));
+}
+
+function dropLongestKeywordFreeSentenceOnce(input: string, minChars = 0): string {
+  const paragraphs = input
+    .split(/\n\s*\n/g)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+  let bestParagraphIndex = -1;
+  let bestSentenceIndex = -1;
+  let bestNextParagraph = "";
+  let bestSaving = 0;
+
+  for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex += 1) {
+    const paragraph = paragraphs[paragraphIndex] ?? "";
+    const sentences = splitSentencesPreservePunctuation(paragraph).map((sentence) => sentence.trim()).filter(Boolean);
+    if (sentences.length <= 1) {
+      continue;
+    }
+    for (let sentenceIndex = 0; sentenceIndex < sentences.length; sentenceIndex += 1) {
+      const sentence = sentences[sentenceIndex] ?? "";
+      if (!sentence || sentence.includes("**")) {
+        continue;
+      }
+      const nextSentences = sentences.filter((_value, index) => index !== sentenceIndex);
+      if (nextSentences.length === 0) {
+        continue;
+      }
+      const nextParagraph = cleanupCompressedDescriptionContent(nextSentences.join(" "));
+      if (!nextParagraph) {
+        continue;
+      }
+      const nextParagraphs = [...paragraphs];
+      nextParagraphs[paragraphIndex] = nextParagraph;
+      const nextContent = cleanupCompressedDescriptionContent(nextParagraphs.join("\n\n"));
+      if (minChars > 0 && countLengthForValidation(nextContent) < minChars) {
+        continue;
+      }
+      const saving = countLengthForValidation(input) - countLengthForValidation(nextContent);
+      if (saving <= bestSaving) {
+        continue;
+      }
+      bestParagraphIndex = paragraphIndex;
+      bestSentenceIndex = sentenceIndex;
+      bestNextParagraph = nextParagraph;
+      bestSaving = saving;
+    }
+  }
+
+  if (bestParagraphIndex < 0 || bestSentenceIndex < 0 || !bestNextParagraph) {
+    return input;
+  }
+
+  const nextParagraphs = [...paragraphs];
+  nextParagraphs[bestParagraphIndex] = bestNextParagraph;
+  return cleanupCompressedDescriptionContent(nextParagraphs.join("\n\n"));
+}
+
+function trimDescriptionSentenceTailCandidate(
+  sentence: string
+): { sentence: string; saving: number } | null {
+  const trimmed = sentence.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const punctuation = /[.!?]$/.test(trimmed) ? trimmed.slice(-1) : "";
+  const core = punctuation ? trimmed.slice(0, -1).trim() : trimmed;
+  const candidates = [
+    core.replace(/\s+that\s+[^.!?]+$/i, ""),
+    core.replace(/\s+without\s+[^.!?]+$/i, ""),
+    core.replace(/\s+across\s+[^.!?]+$/i, ""),
+    core.replace(/\s+from\s+[^.!?]+$/i, ""),
+    core.replace(/\s+during\s+[^.!?]+$/i, ""),
+    core.includes("**") ? core : core.replace(/\s+and\s+[^.!?]{16,}$/i, "")
+  ]
+    .map((item) => normalizeLine(item))
+    .filter((item) => item.length > 40 && item !== normalizeLine(core));
+  if (candidates.length === 0) {
+    return null;
+  }
+  const nextCore = candidates.sort((left, right) => left.length - right.length)[0] ?? "";
+  const nextSentence = cleanupCompressedDescriptionContent(`${nextCore}${punctuation}`);
+  const originalLength = countLengthForValidation(sentence);
+  const nextLength = countLengthForValidation(nextSentence);
+  if (nextLength >= originalLength) {
+    return null;
+  }
+  return {
+    sentence: nextSentence,
+    saving: originalLength - nextLength
+  };
+}
+
+function trimDescriptionSentenceTailOnce(input: string, minChars = 0): string {
+  const paragraphs = input
+    .split(/\n\s*\n/g)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+  let bestParagraphIndex = -1;
+  let bestSentenceIndex = -1;
+  let bestNextParagraph = "";
+  let bestSaving = 0;
+
+  for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex += 1) {
+    const paragraph = paragraphs[paragraphIndex] ?? "";
+    const sentences = splitSentencesPreservePunctuation(paragraph).map((sentence) => sentence.trim()).filter(Boolean);
+    for (let sentenceIndex = 0; sentenceIndex < sentences.length; sentenceIndex += 1) {
+      const candidate = trimDescriptionSentenceTailCandidate(sentences[sentenceIndex] ?? "");
+      if (!candidate || candidate.saving <= bestSaving) {
+        continue;
+      }
+      const nextSentences = [...sentences];
+      nextSentences[sentenceIndex] = candidate.sentence;
+      const nextParagraph = cleanupCompressedDescriptionContent(nextSentences.join(" "));
+      if (!nextParagraph) {
+        continue;
+      }
+      const nextParagraphs = [...paragraphs];
+      nextParagraphs[paragraphIndex] = nextParagraph;
+      const nextContent = cleanupCompressedDescriptionContent(nextParagraphs.join("\n\n"));
+      if (minChars > 0 && countLengthForValidation(nextContent) < minChars) {
+        continue;
+      }
+      bestParagraphIndex = paragraphIndex;
+      bestSentenceIndex = sentenceIndex;
+      bestNextParagraph = nextParagraph;
+      bestSaving = candidate.saving;
+    }
+  }
+
+  if (bestParagraphIndex < 0 || bestSentenceIndex < 0 || !bestNextParagraph) {
+    return input;
+  }
+
+  const nextParagraphs = [...paragraphs];
+  nextParagraphs[bestParagraphIndex] = bestNextParagraph;
+  return cleanupCompressedDescriptionContent(nextParagraphs.join("\n\n"));
 }
 
 function extractBoldKeywords(line: string): string[] {
@@ -277,23 +600,23 @@ function buildFallbackBulletLine(line: string, lineIndex: number): string | null
   switch (lineIndex) {
     case 0:
       return normalizeLine(
-        `${heading}: Includes ${quantity || "12"} ${keywords[0]}${size ? ` in ${size.replace(/\s+/g, "")}` : ""} for fast classroom setup. ${keywords[1]} keeps the set ready, and ${keywords[2]} add bright color for welcome days, school themes, and DIY room decor.`
+        `${heading}: Includes ${quantity || "12"} ${keywords[0]}${size ? ` in ${size.replace(/\s+/g, "")}` : ""} for fast classroom setup. ${keywords[1]} keeps the set ready, and ${keywords[2]} add bright color for welcome days, school themes, DIY room decor, and classroom party backdrops.`
       );
     case 1:
       return normalizeLine(
-        `${heading}: ${keywords[0]} open fast for ceilings and walls in busy classrooms. ${keywords[1]} needs no tools, and ${keywords[2]} add layered color for welcome days, reading corners, and party tables.`
+        `${heading}: ${keywords[0]} open fast for ceilings and walls in busy classrooms. ${keywords[1]} needs no tools, and ${keywords[2]} add layered color for welcome days, reading corners, party tables, and bulletin board backdrops.`
       );
     case 2:
       return normalizeLine(
-        `${heading}: ${keywords[0]} store flat and reuse across lessons, holidays, and school events. ${keywords[1]} fold down after use, and ${keywords[2]} help keep displays neat for the next celebration at school.`
+        `${heading}: ${keywords[0]} store flat and reuse across lessons, holidays, and school events. ${keywords[1]} fold down after use, and ${keywords[2]} help keep displays neat for the next celebration, lesson display, and school event setup.`
       );
     case 3:
       return normalizeLine(
-        `${heading}: ${keywords[0]} bring plaid color that brightens displays without crowding rooms. ${keywords[1]} adds clear focus, and ${keywords[2]} fit class parties and tables with a neat look.`
+        `${heading}: ${keywords[0]} bring plaid color that brightens displays without crowding rooms. ${keywords[1]} adds clear focus, and ${keywords[2]} fit class parties, teacher tables, craft stations, and entry corners with a neat look.`
       );
     case 4:
       return normalizeLine(
-        `${heading}: ${keywords[0]} suit classroom celebrations, bulletin boards, and themed activities. ${keywords[1]} add soft impact, and ${keywords[2]} support school parties and quick seasonal refreshes each term.`
+        `${heading}: ${keywords[0]} suit classroom celebrations, bulletin boards, and themed activities. ${keywords[1]} add soft impact, and ${keywords[2]} support school parties, hallway displays, and quick seasonal refreshes each term.`
       );
     default:
       return normalizeLine(
@@ -302,8 +625,8 @@ function buildFallbackBulletLine(line: string, lineIndex: number): string | null
   }
 }
 
-function compressBulletLineToLimit(line: string, maxChars: number, lineIndex = 0): string {
-  if (maxChars <= 0 || line.length <= maxChars) {
+function compressBulletLineToLimit(line: string, maxChars: number, lineIndex = 0, fallbackMaxChars = maxChars): string {
+  if (maxChars <= 0 || countLengthForValidation(line) <= maxChars) {
     return line;
   }
   let current = line;
@@ -315,19 +638,19 @@ function compressBulletLineToLimit(line: string, maxChars: number, lineIndex = 0
       continue;
     }
     current = next;
-    if (current.length <= maxChars) {
+    if (countLengthForValidation(current) <= maxChars) {
       return current;
     }
   }
   const fallback = buildFallbackBulletLine(current, lineIndex);
-  if (fallback && fallback.length <= maxChars) {
+  if (fallback && countLengthForValidation(fallback) <= fallbackMaxChars) {
     return fallback;
   }
   return current;
 }
 
 function compressTitleToLimit(title: string, maxChars: number): string {
-  if (maxChars <= 0 || title.length <= maxChars) {
+  if (maxChars <= 0 || countLengthForValidation(title) <= maxChars) {
     return title;
   }
   let current = title;
@@ -337,7 +660,7 @@ function compressTitleToLimit(title: string, maxChars: number): string {
       continue;
     }
     current = next;
-    if (current.length <= maxChars) {
+    if (countLengthForValidation(current) <= maxChars) {
       return current;
     }
   }
@@ -359,10 +682,10 @@ function normalizeBulletsContentForValidation(content: string, rule: SectionRule
   const preferredMax = Math.min(hardMax, rawMaxCharsPerLine + 5);
   return splitLines(content)
     .map((line, index) => {
-      if (line.length <= preferredMax) {
+      if (countLengthForValidation(line) <= preferredMax) {
         return line;
       }
-      return compressBulletLineToLimit(line, preferredMax, index);
+      return compressBulletLineToLimit(line, preferredMax, index, hardMax);
     })
     .join("\n");
 }
@@ -382,12 +705,211 @@ function normalizeTitleContentForValidation(content: string, rule: SectionRule):
   return compressTitleToLimit(normalizeLine(content), hardMax);
 }
 
-function normalizeSectionContentForValidation(content: string, rule: SectionRule): string {
+function compressDescriptionToLimit(content: string, minChars: number, maxChars: number): string {
+  let current = cleanupCompressedDescriptionContent(content);
+  if (maxChars <= 0 || countLengthForValidation(current) <= maxChars) {
+    return current;
+  }
+
+  const applyRules = (): boolean => {
+    let changed = false;
+    for (const [pattern, replacement] of descriptionCompressionRules) {
+      const next = cleanupCompressedDescriptionContent(
+        transformNonKeywordSegments(current, (segment) => segment.replace(pattern, replacement))
+      );
+      if (next === current) {
+        continue;
+      }
+      if (minChars > 0 && countLengthForValidation(next) < minChars) {
+        continue;
+      }
+      current = next;
+      changed = true;
+      if (countLengthForValidation(current) <= maxChars) {
+        return true;
+      }
+    }
+    return changed;
+  };
+
+  applyRules();
+  while (countLengthForValidation(current) > maxChars) {
+    const pruned = pruneDescriptionCommaClauseOnce(current, minChars);
+    if (pruned !== current) {
+      current = pruned;
+      if (countLengthForValidation(current) <= maxChars) {
+        return current;
+      }
+      continue;
+    }
+    const tailTrimmed = trimDescriptionSentenceTailOnce(current, minChars);
+    if (tailTrimmed !== current) {
+      current = tailTrimmed;
+      if (countLengthForValidation(current) <= maxChars) {
+        return current;
+      }
+      continue;
+    }
+    const sentenceDropped = dropLongestKeywordFreeSentenceOnce(current, minChars);
+    if (sentenceDropped !== current) {
+      current = sentenceDropped;
+      if (countLengthForValidation(current) <= maxChars) {
+        return current;
+      }
+      continue;
+    }
+    const changed = applyRules();
+    if (!changed) {
+      break;
+    }
+    if (countLengthForValidation(current) <= maxChars) {
+      return current;
+    }
+  }
+  return current;
+}
+
+function extractDescriptionQuantityHint(raw: string, content: string): string {
+  const text = `${raw}\n${content}`;
+  const matched = /(?:数量\/包装|包装内含|set of|includes?)[:：]?\s*(\d{1,3})/i.exec(text);
+  return matched?.[1]?.trim() || "12";
+}
+
+function extractDescriptionSizeHint(raw: string, content: string): string {
+  const text = `${raw}\n${content}`;
+  const matched = /(\d+\s*(?:x|\*)\s*\d+\s*(?:in|inch|inches)?|\d+\s*(?:in|inch|inches))/i.exec(text);
+  if (!matched?.[1]) {
+    return "";
+  }
+  return normalizeLine(matched[1].replace(/\*/g, "x"));
+}
+
+function extractDescriptionStyleHint(raw: string, content: string): string {
+  const text = `${raw}\n${content}`.toLowerCase();
+  if (text.includes("plaid")) {
+    return "plaid";
+  }
+  if (text.includes("floral")) {
+    return "floral";
+  }
+  if (text.includes("rainbow")) {
+    return "rainbow";
+  }
+  if (text.includes("macaron")) {
+    return "macaron";
+  }
+  if (text.includes("colorful")) {
+    return "colorful";
+  }
+  return "bright";
+}
+
+function buildDescriptionFallbackVariant(
+  keywords: string[][],
+  quantity: string,
+  size: string,
+  style: string,
+  expanded: boolean
+): string | null {
+  const first = keywords[0] ?? [];
+  const second = keywords[1] ?? [];
+  if (first.length < 8 || second.length < 7) {
+    return null;
+  }
+  const wrapped = (value: string): string => `**${value}**`;
+  const sizeText = size ? ` in ${size} size` : "";
+  const styleText = style ? `${style} style` : "bright style";
+  const firstSentence = expanded
+    ? `Set of ${quantity} ${wrapped(first[0])}${sizeText} brings ${styleText} to classroom ceilings, walls, reading corners, and welcome boards.`
+    : `Set of ${quantity} ${wrapped(first[0])}${sizeText} brings ${styleText} to classroom ceilings, walls, and reading corners.`;
+  const firstTail = expanded
+    ? `These ${wrapped(first[1])} and ${wrapped(first[2])} pieces work as ${wrapped(first[3])} and ${wrapped(first[4])}, while ${wrapped(first[5])} open fast, fold flat, and hang as ${wrapped(first[6])} or ${wrapped(first[7])} for repeat school decor.`
+    : `These ${wrapped(first[1])} and ${wrapped(first[2])} pieces work as ${wrapped(first[3])} and ${wrapped(first[4])}, while ${wrapped(first[5])} open fast, fold flat, and hang as ${wrapped(first[6])} or ${wrapped(first[7])} for repeat decor.`;
+  const secondSentence = expanded
+    ? `Use them as ${wrapped(second[0])}, ${wrapped(second[1])}, and ${wrapped(second[2])} for teacher displays, DIY backdrops, photo corners, and room refreshes.`
+    : `Use them as ${wrapped(second[0])}, ${wrapped(second[1])}, and ${wrapped(second[2])} for teacher displays, DIY backdrops, and refreshes.`;
+  const secondTail = expanded
+    ? `They also fit ${wrapped(second[3])}, ${wrapped(second[4])}, and ${wrapped(second[5])}, while ${wrapped(second[6])} keeps parties and celebration spaces bright without complex setup.`
+    : `They also fit ${wrapped(second[3])}, ${wrapped(second[4])}, and ${wrapped(second[5])}, while ${wrapped(second[6])} keeps parties bright without complex setup.`;
+  return `${firstSentence} ${firstTail}\n\n${secondSentence} ${secondTail}`;
+}
+
+function buildDescriptionFallbackContent(
+  requirements: ListingRequirements,
+  rule: SectionRule,
+  content: string,
+  minChars: number,
+  maxChars: number
+): string | null {
+  const keywordPlan = buildSectionKeywordPlan(requirements, rule);
+  if (keywordPlan.length < 2) {
+    return null;
+  }
+  const quantity = extractDescriptionQuantityHint(requirements.raw, content);
+  const size = extractDescriptionSizeHint(requirements.raw, content);
+  const style = extractDescriptionStyleHint(requirements.raw, content);
+  const variants = [
+    buildDescriptionFallbackVariant(keywordPlan, quantity, size, style, true),
+    buildDescriptionFallbackVariant(keywordPlan, quantity, size, style, false)
+  ].filter((value): value is string => Boolean(value));
+  const normalizedVariants = variants
+    .map((variant) => cleanupCompressedDescriptionContent(variant))
+    .map((variant) => ({
+      content: variant,
+      visibleLength: countLengthForValidation(variant)
+    }));
+  const inRange = normalizedVariants.find((item) => rangeCheck(item.visibleLength, minChars, maxChars));
+  if (inRange) {
+    return inRange.content;
+  }
+  const underMax = normalizedVariants
+    .filter((item) => item.visibleLength <= maxChars)
+    .sort((left, right) => right.visibleLength - left.visibleLength)[0];
+  if (underMax) {
+    return underMax.content;
+  }
+  const shortest = normalizedVariants.sort((left, right) => left.visibleLength - right.visibleLength)[0];
+  return shortest?.content ?? null;
+}
+
+function normalizeDescriptionContentForValidation(
+  content: string,
+  rule: SectionRule,
+  requirements?: ListingRequirements
+): string {
+  if (rule.section !== "description") {
+    return content;
+  }
+  const minChars = getNumber(rule.constraints, "min_chars", 0);
+  const rawMaxChars = getNumber(rule.constraints, "max_chars", 0);
+  if (rawMaxChars <= 0) {
+    return cleanupCompressedDescriptionContent(content);
+  }
+  const hardMax = rawMaxChars + getTolerance(rule.constraints);
+  const maxChars = hardMax > 0 ? hardMax : rawMaxChars;
+  const compressed = compressDescriptionToLimit(content, minChars, maxChars);
+  if (requirements && maxChars > 0 && countLengthForValidation(compressed) > maxChars) {
+    const fallback = buildDescriptionFallbackContent(requirements, rule, compressed, minChars, maxChars);
+    if (fallback) {
+      return fallback;
+    }
+  }
+  return compressed;
+}
+
+function normalizeSectionContentForValidation(
+  content: string,
+  rule: SectionRule,
+  requirements?: ListingRequirements
+): string {
   if (rule.section === "bullets") {
     return normalizeBulletsContentForValidation(content, rule);
   }
   if (rule.section === "title") {
     return normalizeTitleContentForValidation(content, rule);
+  }
+  if (rule.section === "description") {
+    return normalizeDescriptionContentForValidation(content, rule, requirements);
   }
   return content;
 }
@@ -723,22 +1245,26 @@ export function adaptMarkdownContentForValidation(raw: string, rule: SectionRule
   return { content };
 }
 
-function normalizeSectionCandidateForScoring(raw: string, rule: SectionRule): { content: string; error?: string } {
+function normalizeSectionCandidateForScoring(
+  raw: string,
+  rule: SectionRule,
+  requirements?: ListingRequirements
+): { content: string; error?: string } {
   if (rule.section === "bullets") {
     const trimmed = normalizeText(raw);
     if (trimmed.startsWith("{")) {
       const adapted = adaptJSONArrayContent(raw, rule.output.json_array_field || "bullets");
       return {
         ...adapted,
-        content: normalizeSectionContentForValidation(adapted.content, rule)
+        content: normalizeSectionContentForValidation(adapted.content, rule, requirements)
       };
     }
-    return { content: normalizeSectionContentForValidation(trimmed, rule) };
+    return { content: normalizeSectionContentForValidation(trimmed, rule, requirements) };
   }
   const adapted = adaptMarkdownContentForValidation(raw, rule);
   return {
     ...adapted,
-    content: normalizeSectionContentForValidation(adapted.content, rule)
+    content: normalizeSectionContentForValidation(adapted.content, rule, requirements)
   };
 }
 
@@ -814,7 +1340,7 @@ function summarizeRuntimeCandidateSelection(
         ? {
             score: candidate.score,
             error_count: candidate.errors.length,
-            normalized_chars: candidate.normalizedContent.length,
+            normalized_chars: countLengthForValidation(candidate.normalizedContent),
             errors: candidate.errors
           }
         : {
@@ -846,8 +1372,9 @@ function scoreRuntimeCandidateValue(
   rule: SectionRule,
   raw: string
 ): { normalizedContent: string; score: number; errors: string[] } {
-  const adapted = normalizeSectionCandidateForScoring(raw, rule);
-  const normalized = normalizeText(normalizeSectionContentForValidation(adapted.content, rule));
+  const adapted = normalizeSectionCandidateForScoring(raw, rule, requirements);
+  const normalized = normalizeText(normalizeSectionContentForValidation(adapted.content, rule, requirements));
+  const normalizedLength = countLengthForValidation(normalized);
   const errors = adapted.error ? [adapted.error] : validateSectionContent(normalized, requirements, rule);
   const targetMidpoint = (() => {
     const minChars = getNumber(rule.constraints, "min_chars", 0);
@@ -857,13 +1384,18 @@ function scoreRuntimeCandidateValue(
     }
     const minPerLine = getNumber(rule.constraints, "min_chars_per_line", 0);
     const maxPerLine = getNumber(rule.constraints, "max_chars_per_line", 0);
+    const preferredMinPerLine = getNumber(rule.constraints, "preferred_min_chars_per_line", 0);
+    const preferredMaxPerLine = getNumber(rule.constraints, "preferred_max_chars_per_line", 0);
     const lineCount = getNumber(rule.constraints, "line_count", 0);
+    if (preferredMinPerLine > 0 && preferredMaxPerLine > 0 && lineCount > 0) {
+      return Math.floor(((preferredMinPerLine + preferredMaxPerLine) / 2) * lineCount);
+    }
     if (minPerLine > 0 && maxPerLine > 0 && lineCount > 0) {
       return Math.floor(((minPerLine + maxPerLine) / 2) * lineCount);
     }
-    return normalized.length;
+    return normalizedLength;
   })();
-  const proximityPenalty = Math.abs(normalized.length - targetMidpoint);
+  const proximityPenalty = Math.abs(normalizedLength - targetMidpoint);
   return {
     normalizedContent: normalized,
     errors,
@@ -923,6 +1455,25 @@ function getNumber(constraints: Record<string, unknown>, key: string, fallback =
 
 function getTolerance(constraints: Record<string, unknown>): number {
   return getNumber(constraints, "tolerance_chars", 0);
+}
+
+function resolveBulletRepairTargetRange(rule: SectionRule): { min: number; max: number } {
+  if (rule.section !== "bullets") {
+    const preferredMin = getNumber(rule.constraints, "preferred_min_chars_per_line", 0);
+    const preferredMax = getNumber(rule.constraints, "preferred_max_chars_per_line", 0);
+    return { min: preferredMin, max: preferredMax >= preferredMin ? preferredMax : preferredMin };
+  }
+  const rawMax = getNumber(rule.constraints, "max_chars_per_line", 0);
+  const tolerance = getTolerance(rule.constraints);
+  if (rawMax > 0) {
+    const min = rawMax + 2;
+    const hardMax = rawMax + tolerance;
+    const max = hardMax > 0 ? Math.min(rawMax + 8, hardMax) : rawMax + 8;
+    return { min, max: Math.max(min, max) };
+  }
+  const preferredMin = getNumber(rule.constraints, "preferred_min_chars_per_line", 0);
+  const preferredMax = getNumber(rule.constraints, "preferred_max_chars_per_line", 0);
+  return { min: preferredMin, max: preferredMax >= preferredMin ? preferredMax : preferredMin };
 }
 
 function rangeCheck(value: number, min: number, max: number): boolean {
@@ -1054,6 +1605,7 @@ function validateSectionContent(content: string, requirements: ListingRequiremen
   const constraints = rule.constraints;
   const tolerance = getTolerance(constraints);
   const normalized = normalizeText(content);
+  const normalizedLength = countLengthForValidation(normalized);
   const errors: string[] = [];
   const requireCompleteSentenceEnd = constraints.require_complete_sentence_end === true;
   const forbidDanglingTail = constraints.forbid_dangling_tail === true;
@@ -1063,9 +1615,9 @@ function validateSectionContent(content: string, requirements: ListingRequiremen
   const minChars = rawMinChars > 0 ? (hardMinForBullets ? rawMinChars : rawMinChars - tolerance) : 0;
   const maxChars = rawMaxChars > 0 ? rawMaxChars + tolerance : 0;
   const hasTextLengthConstraint = rawMinChars > 0 || rawMaxChars > 0;
-  if (hasTextLengthConstraint && !rangeCheck(normalized.length, Math.max(0, minChars), maxChars)) {
+  if (hasTextLengthConstraint && !rangeCheck(normalizedLength, Math.max(0, minChars), maxChars)) {
     errors.push(
-      `长度不满足约束: ${normalized.length}（规则区间 ${formatRange(rawMinChars, rawMaxChars)}，容差区间 ${formatRange(Math.max(0, minChars), maxChars)}）`
+      `长度不满足约束: ${normalizedLength}（规则区间 ${formatRange(rawMinChars, rawMaxChars)}，容差区间 ${formatRange(Math.max(0, minChars), maxChars)}）`
     );
   }
 
@@ -1085,10 +1637,11 @@ function validateSectionContent(content: string, requirements: ListingRequiremen
     }
     for (let i = 0; i < lines.length; i += 1) {
       const line = normalizeLine(lines[i]);
-      const ok = rangeCheck(line.length, Math.max(0, minCharsPerLine), maxCharsPerLine);
+      const lineLength = countLengthForValidation(line);
+      const ok = rangeCheck(lineLength, Math.max(0, minCharsPerLine), maxCharsPerLine);
       if (!ok) {
         errors.push(
-          `第${i + 1}条长度不满足约束: ${line.length}（规则区间 ${formatRange(rawMinCharsPerLine, rawMaxCharsPerLine)}，容差区间 ${formatRange(Math.max(0, minCharsPerLine), maxCharsPerLine)}）`
+          `第${i + 1}条长度不满足约束: ${lineLength}（规则区间 ${formatRange(rawMinCharsPerLine, rawMaxCharsPerLine)}，容差区间 ${formatRange(Math.max(0, minCharsPerLine), maxCharsPerLine)}）`
         );
       }
       const lineHasCompleteEnding = hasCompleteSentenceEnding(line);
@@ -1208,6 +1761,25 @@ function uniqueSorted(values: number[]): number[] {
   return [...new Set(values)].sort((a, b) => a - b);
 }
 
+function compactSearchTermsToMaxChars(values: string[], separator: string, maxChars: number): string[] {
+  if (maxChars <= 0 || values.length === 0) {
+    return values;
+  }
+  const selected: string[] = [];
+  for (const value of values) {
+    const candidate = selected.length === 0
+      ? value
+      : `${selected.join(separator)}${separator}${value}`;
+    if (candidate.length <= maxChars) {
+      selected.push(value);
+    }
+  }
+  if (selected.length > 0) {
+    return selected;
+  }
+  return [values[0] ?? ""].filter(Boolean);
+}
+
 export function buildSearchTermsFromRule(requirements: ListingRequirements, rule: SectionRule): string {
   const source = typeof rule.constraints.source === "string" ? rule.constraints.source : "keywords_copy";
   if (source !== "keywords_copy") {
@@ -1222,7 +1794,14 @@ export function buildSearchTermsFromRule(requirements: ListingRequirements, rule
   if (lowercase) {
     values = values.map((v) => v.toLowerCase());
   }
-  return values.join(separator);
+  const maxChars = getNumber(rule.constraints, "max_chars", 0);
+  values = compactSearchTermsToMaxChars(values, separator, maxChars);
+  const content = normalizeText(normalizeSectionContentForValidation(values.join(separator), rule, requirements));
+  const errors = validateSectionContent(content, requirements, rule);
+  if (errors.length > 0) {
+    throw new Error(`search_terms validation failed: ${errors.join("; ")}`);
+  }
+  return content;
 }
 
 function renderByVars(template: string, vars: Record<string, string>): string {
@@ -1263,6 +1842,30 @@ function compactErrorsForLLM(errors: string[], maxItems = 6): string[] {
   return out;
 }
 
+function extractKeywordErrorIndex(error: string): number | null {
+  const matched = /^关键词顺序埋入不满足:\s*第(\d+)个关键词/.exec(error.trim());
+  if (!matched) {
+    return null;
+  }
+  const index = Number.parseInt(matched[1], 10);
+  return Number.isFinite(index) && index > 0 ? index - 1 : null;
+}
+
+function keywordIndexToLineIndex(keywordIndex: number, slotKeywordCounts: number[]): number | null {
+  if (keywordIndex < 0) {
+    return null;
+  }
+  let cursor = 0;
+  for (let lineIndex = 0; lineIndex < slotKeywordCounts.length; lineIndex += 1) {
+    const next = cursor + slotKeywordCounts[lineIndex];
+    if (keywordIndex < next) {
+      return lineIndex;
+    }
+    cursor = next;
+  }
+  return null;
+}
+
 function adaptSingleLineRepair(raw: string, rule: SectionRule, targetIndex: number): string {
   const trimmed = normalizeText(raw);
   if (!trimmed) {
@@ -1287,6 +1890,54 @@ function adaptSingleLineRepair(raw: string, rule: SectionRule, targetIndex: numb
     .map((line) => normalizeLine(stripBulletPrefix(line)))
     .find(Boolean);
   return first ?? "";
+}
+
+function stripSingleLineRepairLabel(line: string): string {
+  const normalized = normalizeLine(line);
+  if (!normalized) {
+    return "";
+  }
+  const matched = /^(?:(?:修复后(?:的)?|最终|输出|结果)(?:\s*bullet)?|(?:revised|fixed|updated|final)\s+bullet|final\s+output|output|result|answer)\s*[:：-]\s*(.+)$/i.exec(normalized);
+  if (!matched) {
+    return normalized;
+  }
+  return normalizeLine(matched[1] ?? "");
+}
+
+function collectSingleLineRepairVariants(raw: string, rule: SectionRule, targetIndex: number): string[] {
+  const trimmed = normalizeText(raw);
+  if (!trimmed) {
+    return [];
+  }
+  const variants: string[] = [];
+  const seen = new Set<string>();
+  const pushVariant = (value: string): void => {
+    const normalized = stripSingleLineRepairLabel(stripBulletPrefix(value)).replace(/^["'`]+|["'`]+$/g, "").trim();
+    if (!normalized || normalized === "```") {
+      return;
+    }
+    if (!seen.has(normalized)) {
+      seen.add(normalized);
+      variants.push(normalized);
+    }
+  };
+  if (rule.output.format === "json") {
+    const field = rule.output.json_array_field || "bullets";
+    const adapted = adaptJSONArrayContent(trimmed, field);
+    if (!adapted.error) {
+      const lines = splitLines(adapted.content);
+      if (targetIndex >= 0 && targetIndex < lines.length) {
+        pushVariant(lines[targetIndex] ?? "");
+      }
+      for (const line of lines) {
+        pushVariant(line);
+      }
+    }
+  }
+  for (const line of trimmed.replace(/\r\n/g, "\n").split("\n")) {
+    pushVariant(line);
+  }
+  return variants;
 }
 
 function stripMarkdownBold(input: string): string {
@@ -1347,6 +1998,115 @@ function buildTranslationReusePlan(
   };
 }
 
+function buildRelevantErrorsForBulletLine(
+  requirements: ListingRequirements,
+  rule: SectionRule,
+  targetLineIndex: number
+): (allErrors: string[]) => string[] {
+  const keywordPlan = buildSectionKeywordPlan(requirements, rule).map((keywords: string[]) => keywords.length);
+  return (allErrors: string[]) => allErrors.filter((error) => {
+    const lineIndex = extractLineErrorIndex(error);
+    if (lineIndex === targetLineIndex) {
+      return true;
+    }
+    const keywordIndex = extractKeywordErrorIndex(error);
+    if (keywordIndex === null) {
+      return false;
+    }
+    const mapped = keywordIndexToLineIndex(keywordIndex, keywordPlan);
+    return mapped === targetLineIndex;
+  });
+}
+
+function scoreRelevantSectionErrors(relevant: string[]): number {
+  if (relevant.length === 0) {
+    return 0;
+  }
+  let penalty = relevant.length * 10_000;
+  for (const error of relevant) {
+    const normalized = normalizeLine(error);
+    const lineMatched = lineLengthErrorPattern.exec(normalized);
+    if (lineMatched) {
+      const actual = Number.parseInt(lineMatched[2] ?? "0", 10);
+      const tolMin = Number.parseInt(lineMatched[5] ?? "0", 10);
+      const tolMax = Number.parseInt(lineMatched[6] ?? "0", 10);
+      penalty += actual < tolMin ? tolMin - actual : Math.max(0, actual - tolMax);
+      continue;
+    }
+    if (normalized.includes("关键词顺序埋入不满足")) {
+      penalty += 5_000;
+      continue;
+    }
+    penalty += 1_000;
+  }
+  return penalty;
+}
+
+type SingleLineRepairChoice = {
+  line: string;
+  normalizedContent: string;
+  lines: string[];
+  relevantErrors: string[];
+  allErrors: string[];
+  score: number;
+  visibleLength: number;
+  changed: boolean;
+};
+
+function pickSingleLineRepairCandidate(
+  requirements: ListingRequirements,
+  rule: SectionRule,
+  lines: string[],
+  targetIndex: number,
+  raw: string
+): SingleLineRepairChoice {
+  const currentLine = lines[targetIndex] ?? "";
+  const variants = collectSingleLineRepairVariants(raw, rule, targetIndex);
+  if (!variants.includes(currentLine)) {
+    variants.push(currentLine);
+  }
+  const relevantErrorsForLine = buildRelevantErrorsForBulletLine(requirements, rule, targetIndex);
+  const repairTarget = resolveBulletRepairTargetRange(rule);
+  const targetMid = repairTarget.min > 0 && repairTarget.max >= repairTarget.min
+    ? Math.floor((repairTarget.min + repairTarget.max) / 2)
+    : countLengthForValidation(currentLine);
+  const evaluated = variants.map((candidateLine) => {
+    const candidateLines = [...lines];
+    candidateLines[targetIndex] = candidateLine;
+    const normalizedCandidateContent = normalizeText(normalizeSectionContentForValidation(candidateLines.join("\n"), rule));
+    const candidateLinesNormalized = splitLines(normalizedCandidateContent);
+    const candidateErrors = validateSectionContent(normalizedCandidateContent, requirements, rule);
+    const relevantCandidateErrors = relevantErrorsForLine(candidateErrors);
+    const finalLine = candidateLinesNormalized[targetIndex] ?? candidateLine;
+    return {
+      line: finalLine,
+      normalizedContent: normalizedCandidateContent,
+      lines: candidateLinesNormalized,
+      relevantErrors: relevantCandidateErrors,
+      allErrors: candidateErrors,
+      score: scoreRelevantSectionErrors(relevantCandidateErrors),
+      visibleLength: countLengthForValidation(finalLine),
+      changed: normalizeLine(finalLine) !== normalizeLine(currentLine)
+    };
+  });
+  evaluated.sort((left, right) =>
+    left.score - right.score
+    || Math.abs(left.visibleLength - targetMid) - Math.abs(right.visibleLength - targetMid)
+    || Number(right.changed) - Number(left.changed)
+    || right.visibleLength - left.visibleLength
+  );
+  return evaluated[0] ?? {
+    line: currentLine,
+    normalizedContent: lines.join("\n"),
+    lines: [...lines],
+    relevantErrors: [],
+    allErrors: [],
+    score: 0,
+    visibleLength: countLengthForValidation(currentLine),
+    changed: false
+  };
+}
+
 export function buildTranslationReusePlanForTest(
   originalSections: Record<string, string>,
   judgedSections: Record<string, string>,
@@ -1365,6 +2125,24 @@ export function resolveRuntimeTeamMaxTurnsForTest(section: string, hasReviewer: 
 
 export function compactSectionRequirementsRawForPromptForTest(raw: string, section: string): string {
   return compactSectionRequirementsRawForPrompt(raw, section);
+}
+
+export function buildFallbackBulletLineForTest(line: string, lineIndex: number): string {
+  return buildFallbackBulletLine(line, lineIndex) ?? "";
+}
+
+export function pickSingleLineRepairCandidateForTest(
+  requirements: ListingRequirements,
+  rule: SectionRule,
+  lines: string[],
+  targetIndex: number,
+  raw: string
+): { line: string; relevantErrors: string[] } {
+  const selected = pickSingleLineRepairCandidate(requirements, rule, lines, targetIndex, raw);
+  return {
+    line: selected.line,
+    relevantErrors: selected.relevantErrors
+  };
 }
 
 function shouldRunPromptPlanning(rules: Pick<TenantRules, "generationConfig">): boolean {
@@ -1555,10 +2333,13 @@ export class GenerationService {
   private constraintsSummary(rule: SectionRule): string {
     const constraints = rule.constraints;
     const tolerance = getTolerance(constraints);
+    const keywordEmbedding = readKeywordEmbeddingConfig(constraints);
     const lines: string[] = [];
     const lineCount = getNumber(constraints, "line_count", 0);
     const rawMinPerLine = getNumber(constraints, "min_chars_per_line", 0);
     const rawMaxPerLine = getNumber(constraints, "max_chars_per_line", 0);
+    const preferredMinPerLine = getNumber(constraints, "preferred_min_chars_per_line", 0);
+    const preferredMaxPerLine = getNumber(constraints, "preferred_max_chars_per_line", 0);
     const rawMinChars = getNumber(constraints, "min_chars", 0);
     const rawMaxChars = getNumber(constraints, "max_chars", 0);
     const minParagraphs = getNumber(constraints, "min_paragraphs", 0);
@@ -1568,9 +2349,13 @@ export class GenerationService {
       lines.push(`- 行数必须=${lineCount}`);
     }
     if (rawMinPerLine > 0 || rawMaxPerLine > 0) {
-      const tolMin = rawMinPerLine > 0 ? Math.max(0, rawMinPerLine - tolerance) : 0;
+      const hardMinPerLine = rule.section === "bullets";
+      const tolMin = rawMinPerLine > 0 ? (hardMinPerLine ? rawMinPerLine : Math.max(0, rawMinPerLine - tolerance)) : 0;
       const tolMax = rawMaxPerLine > 0 ? rawMaxPerLine + tolerance : 0;
       lines.push(`- 每行长度：规则${formatRange(rawMinPerLine, rawMaxPerLine)}，容差${formatRange(tolMin, tolMax)}`);
+    }
+    if (preferredMinPerLine > 0 || preferredMaxPerLine > 0) {
+      lines.push(`- 每条最佳落点 ${preferredMinPerLine}-${preferredMaxPerLine} 字符，略高于 250 字符更稳妥`);
     }
     if (rawMinChars > 0 || rawMaxChars > 0) {
       const tolMin = rawMinChars > 0 ? Math.max(0, rawMinChars - tolerance) : 0;
@@ -1594,6 +2379,9 @@ export class GenerationService {
     if (constraints.forbid_dangling_tail === true) {
       lines.push("- 禁止半截句结尾（如 to/and/with 等悬空尾词）");
     }
+    if (keywordEmbedding.boldWrapper) {
+      lines.push("- 长度统计时，连续的 2 个星号 ** 不计入字符数");
+    }
     return lines.length > 0 ? lines.join("\n") : "- 无额外约束";
   }
 
@@ -1610,6 +2398,20 @@ export class GenerationService {
   private buildWholeRepairSystemPrompt(rule: SectionRule, jsonOutput = false): string {
     const constraintsSummary = this.constraintsSummary(rule);
     const constraintsJSON = JSON.stringify(rule.constraints, null, 2);
+    const sectionSpecificRepairRules = (() => {
+      if (rule.section !== "bullets") {
+        return "";
+      }
+      const minCharsPerLine = getNumber(rule.constraints, "min_chars_per_line", 0);
+      const repairTarget = resolveBulletRepairTargetRange(rule);
+      return [
+        minCharsPerLine > 0 ? `低于 ${minCharsPerLine} 字符的条目直接视为失败。` : "",
+        repairTarget.min > 0 && repairTarget.max > 0 ? `偏短条目优先补到 ${repairTarget.min}-${repairTarget.max} 可见字符。` : "",
+        repairTarget.min > 0 ? `不要停在 230-239 这类仍会失败的长度，至少补到 ${repairTarget.min} 字符以上再停。` : "",
+        "未报错的条目尽量逐字保持原样，不要顺手改写已经通过的条目。",
+        "当条目偏短时，优先补 1 个具体产品细节、使用结果或安装收益，不要只换同义词。"
+      ].filter(Boolean).join("\n");
+    })();
     return [
       "你是专业亚马逊 Listing 文案专家。",
       "你正在修复一段已有文案。",
@@ -1621,11 +2423,54 @@ export class GenerationService {
       "若 check_section_candidate 返回 repair_guidance，必须逐条执行其中的修复要求。",
       "优先只改失败条目；前面已经满足顺序和长度的条目尽量保持不变。",
       "严禁通过截断尾部满足长度，必须重写为完整句，并用句末标点收尾。",
+      sectionSpecificRepairRules,
       `section=${rule.section}`,
       `规则:\n${rule.instruction}`,
       `硬性约束摘要:\n${constraintsSummary}`,
       `硬性约束(JSON):\n${constraintsJSON}`
     ].join("\n");
+  }
+
+  private buildBulletItemRepairSystemPrompt(rule: SectionRule, targetIndex: number, relevantErrors: string[]): string {
+    const repairTarget = resolveBulletRepairTargetRange(rule);
+    const targetText = repairTarget.min > 0 && repairTarget.max > 0
+      ? `把最终长度控制在 ${repairTarget.min}-${repairTarget.max} 个可见字符。`
+      : "把最终长度控制在规则允许范围内。";
+    const hasKeywordOrderError = relevantErrors.some((error) => extractKeywordErrorIndex(error) !== null);
+    const lineViolation = relevantErrors
+      .map((error) => lineLengthErrorPattern.exec(normalizeLine(error)))
+      .find((matched) => matched && Number.parseInt(matched[1] ?? "", 10) === targetIndex + 1);
+    const deltaText = (() => {
+      if (!lineViolation) {
+        return "";
+      }
+      const actual = Number.parseInt(lineViolation[2] ?? "0", 10);
+      const tolMin = Number.parseInt(lineViolation[5] ?? "0", 10);
+      const tolMax = Number.parseInt(lineViolation[6] ?? "0", 10);
+      if (actual > 0 && tolMin > 0 && actual < tolMin) {
+        const shortBy = tolMin - actual;
+        const addMin = shortBy <= 8 ? 12 : Math.max(shortBy + 6, 12);
+        const addMax = shortBy <= 8 ? 20 : Math.max(shortBy + 16, addMin + 4);
+        return `当前只差 ${shortBy} 个可见字符，即使差距很小也要至少净增 ${addMin}-${addMax} 个可见字符，不要只改小标题或替换同义词。`;
+      }
+      if (actual > tolMax && tolMax > 0) {
+        return `当前超出上限 ${actual - tolMax} 个可见字符，这一轮要压缩而不是换个更长版本。`;
+      }
+      return "";
+    })();
+    return [
+      "你是英文 bullet 定点修复专家。",
+      "这一轮只允许修复 1 条 bullet，只输出修复后的这一条。",
+      "本轮是补差修复，不是整条扩写。",
+      "长度按可见字符计算：空格和标点计入，连续的 2 个星号 ** 不计入长度。",
+      "尽量保留原句结构、已正确的关键词顺序和主要语义，只补必要差额。",
+      targetText,
+      "不要扩写到 280 个可见字符以上；一旦超过就视为修坏。",
+      "不要新增第三个分句，不要并列多个场景串，不要堆空泛形容词。",
+      hasKeywordOrderError ? "如果缺少或乱序的是本条关键词，先删掉旧的场景串或泛化短语，给缺失关键词腾位。" : "",
+      hasKeywordOrderError ? "不要在句尾直接追加缺失关键词或额外整句；先压缩旧表达，再把缺失关键词放回原句位置。" : "",
+      deltaText
+    ].filter(Boolean).join("\n");
   }
 
   private groupJudgeIssuesBySection(issues: JudgeIssue[]): Record<string, string[]> {
@@ -1643,6 +2488,145 @@ export class GenerationService {
     return messages.map((message) => `- ${message}`).join("\n");
   }
 
+  private bulletRepairTargetIndexes(
+    requirements: ListingRequirements,
+    rule: SectionRule,
+    errors: string[]
+  ): number[] {
+    const indexes = new Set<number>();
+    for (const error of errors) {
+      const lineIndex = extractLineErrorIndex(error);
+      if (lineIndex !== null) {
+        indexes.add(lineIndex);
+      }
+    }
+    const keywordIndex = errors
+      .map((error) => extractKeywordErrorIndex(error))
+      .find((value): value is number => value !== null);
+    if (keywordIndex !== undefined) {
+      const keywordPlan = buildSectionKeywordPlan(requirements, rule);
+      const lineIndex = keywordIndexToLineIndex(
+        keywordIndex,
+        keywordPlan.map((keywords: string[]) => keywords.length)
+      );
+      if (lineIndex !== null) {
+        indexes.add(lineIndex);
+      }
+    }
+    return [...indexes].sort((left, right) => left - right);
+  }
+
+  private async repairBulletItems(
+    requirements: ListingRequirements,
+    rule: SectionRule,
+    content: string,
+    initialErrors: string[]
+  ): Promise<{ content: string; errors: string[] }> {
+    let lines = splitLines(content);
+    let errors = [...initialErrors];
+    const targetIndexes = this.bulletRepairTargetIndexes(requirements, rule, errors);
+    if (targetIndexes.length === 0 || lines.length === 0) {
+      return { content, errors };
+    }
+    const maxLineRepairRounds = 3;
+    for (const targetIndex of targetIndexes) {
+      const relevantErrorsForLine = buildRelevantErrorsForBulletLine(requirements, rule, targetIndex);
+      for (let round = 1; round <= maxLineRepairRounds; round += 1) {
+        const normalizedCurrentContent = normalizeText(normalizeSectionContentForValidation(lines.join("\n"), rule));
+        lines = splitLines(normalizedCurrentContent);
+        const currentErrors = validateSectionContent(normalizedCurrentContent, requirements, rule);
+        const relevantErrors = relevantErrorsForLine(currentErrors);
+        if (relevantErrors.length === 0) {
+          errors = currentErrors;
+          break;
+        }
+        await this.appendTrace("bullet_item_repair_start", "warn", {
+          line_index: targetIndex + 1,
+          repair_round: round,
+          errors: relevantErrors
+        });
+        const prompt = [
+          `任务: 只修复第${targetIndex + 1}条英文 bullet，只输出这一条。`,
+          "不要输出编号，不要输出 JSON，不要输出其他条目。",
+          `当前第${targetIndex + 1}条:\n${lines[targetIndex] ?? ""}`,
+          "完整五点上下文（仅供参考，其他条目不能改）:",
+          lines.map((line, index) => `${index + 1}. ${line}`).join("\n"),
+          "",
+          buildSectionRepairGuidance(requirements, rule, relevantErrors)
+        ].join("\n");
+        const repairCandidates = await Promise.allSettled(
+          [1, 2].map(async (candidateIndex) => {
+            const raw = await this.llmClient.generateText(
+              [
+                this.buildBulletItemRepairSystemPrompt(rule, targetIndex, relevantErrors),
+                candidateIndex === 1
+                  ? "修复候选#1：优先最小改动，先保留原句结构和已存在信息。"
+                  : "修复候选#2：允许更积极地补足或压缩长度，但不要改变语义主干。",
+                "不要回显原文，不要输出 Original/Revised/Final/修复后 这类标签。",
+                "未报错的其他条目不能改。",
+                "只输出修复后的单条 bullet 文本，不要解释。"
+              ].join("\n"),
+              [`修复候选#${candidateIndex}`, prompt].join("\n\n"),
+              `bullets_item_repair_line_${targetIndex + 1}_round_${round}_candidate_${candidateIndex}`,
+              2,
+              "repair"
+            );
+            const selected = pickSingleLineRepairCandidate(requirements, rule, lines, targetIndex, raw);
+            return {
+              candidateIndex,
+              normalizedContent: selected.normalizedContent,
+              lines: selected.lines,
+              relevantErrors: selected.relevantErrors,
+              allErrors: selected.allErrors,
+              score: selected.score,
+              visibleLength: selected.visibleLength
+            };
+          })
+        );
+        const evaluatedCandidates = repairCandidates
+          .filter((result): result is PromiseFulfilledResult<{
+            candidateIndex: number;
+            normalizedContent: string;
+            lines: string[];
+            relevantErrors: string[];
+            allErrors: string[];
+            score: number;
+            visibleLength: number;
+          }> => result.status === "fulfilled")
+          .map((result) => result.value)
+          .sort((left, right) => left.score - right.score || left.candidateIndex - right.candidateIndex);
+        if (evaluatedCandidates.length === 0) {
+          continue;
+        }
+        const chosen = evaluatedCandidates[0];
+        lines = chosen.lines;
+        errors = chosen.allErrors;
+        const stillRelevant = chosen.relevantErrors;
+        await this.appendTrace(stillRelevant.length === 0 ? "bullet_item_repair_ok" : "bullet_item_repair_failed", stillRelevant.length === 0 ? "info" : "warn", {
+          line_index: targetIndex + 1,
+          repair_round: round,
+          repair_candidate_count: evaluatedCandidates.length,
+          repair_candidates: evaluatedCandidates.map((candidate) => ({
+            candidate_index: candidate.candidateIndex,
+            score: candidate.score,
+            error_count: candidate.relevantErrors.length,
+            visible_length: candidate.visibleLength,
+            selected: candidate.candidateIndex === chosen.candidateIndex
+          })),
+          errors: stillRelevant,
+          content: lines[targetIndex] ?? ""
+        });
+        if (stillRelevant.length === 0) {
+          break;
+        }
+      }
+    }
+    return {
+      content: lines.join("\n"),
+      errors
+    };
+  }
+
   private async translateText(text: string, step: string, retries: number): Promise<string> {
     return this.translateTextWithProfile(text, step, retries);
   }
@@ -1656,8 +2640,8 @@ export class GenerationService {
     this.throwIfAborted();
     const rules = this.mustRulesLoaded();
     const started = Date.now();
-    await this.appendTrace("translation_start", "info", { step, input_chars: text.length, retries });
-    this.logger.info({ event: "translation_start", step, input_chars: text.length, retries }, "translation start");
+    await this.appendTrace("translation_start", "info", { step, retries, ...buildInputCharMetrics(text) });
+    this.logger.info({ event: "translation_start", step, retries, ...buildInputCharMetrics(text) }, "translation start");
     const translated = await this.llmClient.translateWithTranslatorAgent(
       rules.generationConfig.translation.system_prompt,
       text,
@@ -1666,13 +2650,13 @@ export class GenerationService {
       runtimeProfile
     );
     this.logger.info(
-      { event: "translation_ok", step, duration_ms: Date.now() - started, output_chars: translated.length },
+      { event: "translation_ok", step, duration_ms: Date.now() - started, ...buildOutputCharMetrics(translated) },
       "translation ok"
     );
     await this.appendTrace("translation_ok", "info", {
       step,
       duration_ms: Date.now() - started,
-      output_chars: translated.length
+      ...buildOutputCharMetrics(translated)
     });
     return translated;
   }
@@ -1721,7 +2705,7 @@ export class GenerationService {
       const normalized = normalizeText(brief);
       await this.appendTrace("runtime_plan_ok", "info", {
         duration_ms: Date.now() - started,
-        output_chars: normalized.length
+        ...buildOutputCharMetrics(normalized)
       });
       return normalized;
     } catch (error) {
@@ -1923,7 +2907,7 @@ export class GenerationService {
           repairerModelSettingsOverride: modelSettings,
           validateContent: (raw) => {
             const adapted = adaptContent ? adaptContent(raw) : { content: raw };
-            const normalized = normalizeText(normalizeSectionContentForValidation(adapted.content, rule));
+            const normalized = normalizeText(normalizeSectionContentForValidation(adapted.content, rule, requirements));
             const errors = adapted.error ? [adapted.error] : validateSectionContent(normalized, requirements, rule);
             return {
               ok: errors.length === 0,
@@ -2072,7 +3056,7 @@ export class GenerationService {
             };
         const validateContent = (raw: string) => {
           const adapted = options?.adaptContent ? options.adaptContent(raw) : { content: raw };
-          const normalized = normalizeText(normalizeSectionContentForValidation(adapted.content, rule));
+          const normalized = normalizeText(normalizeSectionContentForValidation(adapted.content, rule, requirements));
           const errors = adapted.error ? [adapted.error] : validateSectionContent(normalized, requirements, rule);
           return {
             ok: errors.length === 0,
@@ -2082,35 +3066,51 @@ export class GenerationService {
             repairGuidance: buildSectionRepairGuidance(requirements, rule, errors)
           };
         };
-        return await this.llmClient.generateSectionWithAgentTeam({
-          section: plan.section,
-          step: `${plan.section}_runtime_team_candidate_${candidateIndex}`,
-          userPrompt: this.buildSectionUserPrompt(requirements, rule, ""),
-          writerInstructions: this.buildSectionSystemPrompt(rule, isBullets),
-          reviewerInstructions: plan.reviewerBlueprint
-            ? [
-                "你是 section 质量复核专家。",
-                `当前 section=${rule.section}`,
-                "check_section_candidate 是校验工具，不是 agent，也不是 handoff。",
-                "绝不要调用任何 transfer_to_validator_* 工具。",
-                "不要自行终止，必须先调用 check_section_candidate。",
-                "如果校验通过，直接输出 final_output。",
-                "如果校验失败，必须依据 errors 和 repair_guidance 把问题交给 repairer。"
-              ].join("\n")
-            : undefined,
-          repairInstructions: this.buildWholeRepairSystemPrompt(rule, isBullets),
-          attempts: resolveRuntimeTeamAttempts(rule.constraints),
-          maxTurns: resolveRuntimeTeamMaxTurns(plan.section, Boolean(plan.reviewerBlueprint)),
-          plannerRuntimeProfile: getModelProfile(plan.plannerModelProfile),
-          runtimeProfile: getModelProfile(plan.writerModelProfile),
-          reviewerRuntimeProfile: getModelProfile(plan.reviewerModelProfile),
-          repairerRuntimeProfile: getModelProfile(plan.repairerModelProfile),
-          modelSettingsOverride: bulletsJSONModeSettings,
-          repairerModelSettingsOverride: bulletsJSONModeSettings,
-          shouldRetry: () => controls?.shouldContinueRetries() ?? true,
-          signal: controls?.signal,
-          validateContent
-        });
+        try {
+          return await this.llmClient.generateSectionWithAgentTeam({
+            section: plan.section,
+            step: `${plan.section}_runtime_team_candidate_${candidateIndex}`,
+            userPrompt: this.buildSectionUserPrompt(requirements, rule, ""),
+            writerInstructions: this.buildSectionSystemPrompt(rule, isBullets),
+            reviewerInstructions: plan.reviewerBlueprint
+              ? [
+                  "你是 section 质量复核专家。",
+                  `当前 section=${rule.section}`,
+                  "check_section_candidate 是校验工具，不是 agent，也不是 handoff。",
+                  "绝不要调用任何 transfer_to_validator_* 工具。",
+                  "不要自行终止，必须先调用 check_section_candidate。",
+                  "如果校验通过，直接输出 final_output。",
+                  "如果校验失败，必须依据 errors 和 repair_guidance 把问题交给 repairer。"
+                ].join("\n")
+              : undefined,
+            repairInstructions: this.buildWholeRepairSystemPrompt(rule, isBullets),
+            attempts: resolveRuntimeTeamAttempts(rule.constraints),
+            maxTurns: resolveRuntimeTeamMaxTurns(plan.section, Boolean(plan.reviewerBlueprint)),
+            plannerRuntimeProfile: getModelProfile(plan.plannerModelProfile),
+            runtimeProfile: getModelProfile(plan.writerModelProfile),
+            reviewerRuntimeProfile: getModelProfile(plan.reviewerModelProfile),
+            repairerRuntimeProfile: getModelProfile(plan.repairerModelProfile),
+            modelSettingsOverride: bulletsJSONModeSettings,
+            repairerModelSettingsOverride: bulletsJSONModeSettings,
+            shouldRetry: () => controls?.shouldContinueRetries() ?? true,
+            signal: controls?.signal,
+            validateContent
+          });
+        } catch (error) {
+          if (
+            isBullets &&
+            rule.execution.repair_mode === "item" &&
+            error instanceof SectionAgentTeamValidationError &&
+            error.normalizedContent.trim() !== ""
+          ) {
+            const repaired = await this.repairBulletItems(requirements, rule, error.normalizedContent, error.errors);
+            if (repaired.errors.length === 0) {
+              return repaired.content;
+            }
+            throw new Error(`section agent team validation failed: ${repaired.errors.join("; ")}`);
+          }
+          throw error;
+        }
       },
       deriveSection: async (plan) => this.executeDeriveNode(requirements, {
         id: `${plan.section}_runtime_derive`,

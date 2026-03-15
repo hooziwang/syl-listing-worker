@@ -10,6 +10,22 @@ import { withRetry } from "../utils/retry.js";
 
 const llmRequestTimeoutMs = 90_000;
 
+export class SectionAgentTeamValidationError extends Error {
+  constructor(
+    message: string,
+    readonly normalizedContent: string,
+    readonly errors: string[],
+    readonly repairGuidance = ""
+  ) {
+    super(message);
+    this.name = "SectionAgentTeamValidationError";
+  }
+}
+
+function maxRepairFallbackRounds(section: string): number {
+  return section === "bullets" ? 3 : 2;
+}
+
 function safeSnippet(input: string, max = 600): string {
   const s = input.trim();
   if (!s) {
@@ -32,16 +48,25 @@ function outputToText(output: unknown): string {
 }
 
 function buildFailedCandidatePayload(section: string, normalizedContent: string): Record<string, unknown> {
-  if (section !== "bullets") {
-    return {};
+  if (section === "bullets") {
+    const lines = normalizedContent
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(0, 8)
+      .map((line) => safeSnippet(line, 220));
+    return lines.length > 0 ? { candidate_lines: lines } : {};
   }
-  const lines = normalizedContent
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .slice(0, 8)
-    .map((line) => safeSnippet(line, 220));
-  return lines.length > 0 ? { candidate_lines: lines } : {};
+  if (section === "description") {
+    const paragraphs = normalizedContent
+      .split(/\n\s*\n/g)
+      .map((paragraph) => paragraph.trim())
+      .filter(Boolean)
+      .slice(0, 4)
+      .map((paragraph) => safeSnippet(paragraph, 320));
+    return paragraphs.length > 0 ? { candidate_paragraphs: paragraphs } : {};
+  }
+  return {};
 }
 
 function isAbortLikeError(error: Error): boolean {
@@ -66,6 +91,129 @@ function buildRetryUserPrompt(basePrompt: string, errors: string[], repairGuidan
     normalizedErrors.join("\n"),
     normalizedGuidance ? `\n优先执行这份修复指导：\n${normalizedGuidance}` : ""
   ].join("\n");
+}
+
+const lineLengthErrorPattern = /^第(\d+)条长度不满足约束:\s*(\d+)（规则区间 \[(\d+),(\d+)\]，容差区间 \[(\d+),(\d+)\]）$/;
+const textLengthErrorPattern = /^长度不满足约束:\s*(\d+)（规则区间 \[(\d+),(\d+)\]，容差区间 \[(\d+),(\d+)\]）$/;
+
+function countVisibleChars(input: string): number {
+  return input.replace(/\*\*/g, "").length;
+}
+
+function buildOutputCharMetrics(input: string): { output_chars: number; raw_output_chars: number } {
+  return {
+    output_chars: countVisibleChars(input),
+    raw_output_chars: input.length
+  };
+}
+
+function buildRepairEditBrief(currentContent: string, errors: string[]): string {
+  const lines = [
+    "这是定量编辑任务，不是整条重写。",
+    "修复目标：尽量保留现有语义主干、关键词顺序和已通过结构，只修被指出的问题。",
+    `当前可见长度 ${countVisibleChars(currentContent)}。`
+  ];
+  for (const error of errors.slice(0, 6)) {
+    const normalized = error.replace(/\s+/g, " ").trim();
+    const lineMatched = lineLengthErrorPattern.exec(normalized);
+    if (lineMatched) {
+      const [, lineNo, actual, , , tolMin, tolMax] = lineMatched;
+      if (Number.parseInt(actual, 10) < Number.parseInt(tolMin, 10)) {
+        lines.push(`第${lineNo}条当前 ${actual}，目标至少 ${tolMin}，可接受上限 ${tolMax}；本轮优先补足差额，不要只换同义词。`);
+      } else {
+        lines.push(`第${lineNo}条当前 ${actual}，目标压回 ${tolMin}-${tolMax}；本轮优先删冗余，不要改掉核心语义。`);
+      }
+      continue;
+    }
+    const textMatched = textLengthErrorPattern.exec(normalized);
+    if (textMatched) {
+      const [, actual, , , tolMin, tolMax] = textMatched;
+      if (Number.parseInt(actual, 10) < Number.parseInt(tolMin, 10)) {
+        lines.push(`当前整体长度 ${actual}，目标至少 ${tolMin}，可接受上限 ${tolMax}；本轮只补必要信息。`);
+      } else {
+        lines.push(`当前整体长度 ${actual}，目标压回 ${tolMin}-${tolMax}；本轮只删多余信息。`);
+      }
+      continue;
+    }
+    if (normalized.includes("关键词顺序埋入不满足")) {
+      lines.push("关键词顺序错误时，优先在原句里调整或腾位，不要重写整段。");
+      continue;
+    }
+  }
+  return lines.join("\n");
+}
+
+function buildRepairUserPrompt(
+  basePrompt: string,
+  currentContent: string,
+  errors: string[],
+  repairGuidance?: string,
+  candidateLabel?: string
+): string {
+  return [
+    candidateLabel ? `${candidateLabel}` : "",
+    basePrompt,
+    "",
+    "编辑要求:",
+    buildRepairEditBrief(currentContent, errors),
+    "",
+    "当前候选内容:",
+    currentContent.trim(),
+    "",
+    "这份候选内容尚未通过校验，必须先修复以下问题，再输出最终内容：",
+    errors
+      .map((error) => error.replace(/\s+/g, " ").trim())
+      .filter(Boolean)
+      .slice(0, 6)
+      .map((error) => `- ${error}`)
+      .join("\n"),
+    repairGuidance ? `\n优先执行这份修复指导：\n${repairGuidance.trim()}` : ""
+  ].join("\n");
+}
+
+function buildRepairFallbackInstructions(baseInstructions: string): string {
+  return [
+    baseInstructions,
+    "当前是程序触发的修复兜底路径。",
+    "repair_guidance 和 errors 的约束优先级最高，尤其先解决长度、缺失项和顺序错误。",
+    "如果长度超限，先压回目标区间再润色；如果长度不足，先补足具体信息再润色。",
+    "不要调用任何工具，不要尝试 handoff。",
+    "必须直接重写并输出最终内容。",
+    "只输出修复后的最终内容，不要解释。"
+  ].join("\n");
+}
+
+function scoreRepairValidation(normalizedContent: string, errors: string[]): number {
+  if (errors.length === 0) {
+    return 0;
+  }
+  let penalty = errors.length * 10_000;
+  for (const error of errors.slice(0, 8)) {
+    const normalized = error.replace(/\s+/g, " ").trim();
+    const lineMatched = lineLengthErrorPattern.exec(normalized);
+    if (lineMatched) {
+      const actual = Number.parseInt(lineMatched[2] ?? "0", 10);
+      const tolMin = Number.parseInt(lineMatched[5] ?? "0", 10);
+      const tolMax = Number.parseInt(lineMatched[6] ?? "0", 10);
+      penalty += actual < tolMin ? tolMin - actual : Math.max(0, actual - tolMax);
+      continue;
+    }
+    const textMatched = textLengthErrorPattern.exec(normalized);
+    if (textMatched) {
+      const actual = Number.parseInt(textMatched[1] ?? "0", 10);
+      const tolMin = Number.parseInt(textMatched[4] ?? "0", 10);
+      const tolMax = Number.parseInt(textMatched[5] ?? "0", 10);
+      penalty += actual < tolMin ? tolMin - actual : Math.max(0, actual - tolMax);
+      continue;
+    }
+    if (normalized.includes("关键词顺序埋入不满足")) {
+      penalty += 5_000;
+      continue;
+    }
+    penalty += 1_000;
+  }
+  penalty += Math.max(0, countVisibleChars(normalizedContent) / 1000);
+  return penalty;
 }
 
 function linkAbortSignals(...signals: Array<AbortSignal | undefined>): { signal?: AbortSignal; cleanup: () => void } {
@@ -260,7 +408,7 @@ export class LLMClient {
           turn_index: currentTurnByAgent.get(agent.name) ?? nextTurnIndex,
           agent_name: agent.name,
           agent_role: role,
-          output_chars: outputToText(output).length
+          ...buildOutputCharMetrics(outputToText(output))
         });
       });
 
@@ -388,7 +536,7 @@ export class LLMClient {
             url: requestURL,
             status_code: 200,
             latency_ms: latencyMs,
-            output_chars: text.length
+            ...buildOutputCharMetrics(text)
           });
           this.logger.info(
             {
@@ -399,7 +547,7 @@ export class LLMClient {
               url: requestURL,
               status_code: 200,
               latency_ms: latencyMs,
-              output_chars: text.length
+              ...buildOutputCharMetrics(text)
             },
             "api ok"
           );
@@ -566,23 +714,119 @@ export class LLMClient {
             ? buildRetryUserPrompt(input.userPrompt, retryValidationErrors, retryRepairGuidance)
             : input.userPrompt;
           const entryAgent = input.reviewerInstructions ? team.plannerAgent : team.writerAgent;
-          const result = await runner.run(entryAgent, prompt, {
-            maxTurns: input.maxTurns ?? 8,
-            session,
-            signal: linkedAbort.signal
-          });
-          await lifecycleTrace.flush();
-          const text = outputToText(result.finalOutput);
+          const runAgent = async (agent: Agent, agentPrompt: string): Promise<string> => {
+            const result = await runner.run(agent, agentPrompt, {
+              maxTurns: input.maxTurns ?? 8,
+              session: new MemorySession(),
+              signal: linkedAbort.signal
+            });
+            return outputToText(result.finalOutput);
+          };
+          let text = await runAgent(entryAgent, prompt);
           if (!text) {
             throw new Error("section agent team output empty");
           }
-          const validation = input.validateContent(text);
+          let validation = input.validateContent(text);
+          if (!validation.ok && team.repairerAgent) {
+            const repairFallbackAgent = new Agent({
+              name: team.repairerAgent.name,
+              instructions: buildRepairFallbackInstructions(input.repairInstructions ?? input.writerInstructions),
+              model: repairerRuntime?.model ?? writerRuntime.model,
+              modelSettings: repairerRuntime?.modelSettings ?? writerRuntime.modelSettings
+            });
+            for (let repairRound = 1; repairRound <= maxRepairFallbackRounds(input.section) && !validation.ok; repairRound += 1) {
+              await this.appendTrace("agent_team_repair_fallback_start", "warn", {
+                provider: generationProvider,
+                section: input.section,
+                step: input.step,
+                attempt,
+                repair_round: repairRound,
+                error_count: validation.errors.length,
+                errors: validation.errors.slice(0, 6),
+                ...buildOutputCharMetrics(validation.normalizedContent || text)
+              });
+              const repairPrompt = buildRepairUserPrompt(
+                input.userPrompt,
+                validation.normalizedContent || text,
+                validation.errors,
+                validation.repairGuidance
+              );
+              const candidateRuns = await Promise.allSettled(
+                [1, 2].map(async (candidateIndex) => {
+                  const repairedText = await runAgent(
+                    repairFallbackAgent,
+                    buildRepairUserPrompt(
+                      input.userPrompt,
+                      validation.normalizedContent || text,
+                      validation.errors,
+                      validation.repairGuidance,
+                      candidateIndex === 1
+                        ? "修复候选#1：优先最小改动，先保留原句结构。"
+                        : "修复候选#2：允许更积极地补足或压缩长度，但不要改变语义主干。"
+                    )
+                  );
+                  if (!repairedText) {
+                    throw new Error("section agent team repair output empty");
+                  }
+                  const candidateValidation = input.validateContent(repairedText);
+                  return {
+                    candidateIndex,
+                    repairedText,
+                    validation: candidateValidation,
+                    score: scoreRepairValidation(candidateValidation.normalizedContent, candidateValidation.errors)
+                  };
+                })
+              );
+              const successfulCandidates = candidateRuns
+                .filter((result): result is PromiseFulfilledResult<{
+                  candidateIndex: number;
+                  repairedText: string;
+                  validation: ReturnType<typeof input.validateContent>;
+                  score: number;
+                }> => result.status === "fulfilled")
+                .map((result) => result.value)
+                .sort((left, right) => left.score - right.score || left.candidateIndex - right.candidateIndex);
+              if (successfulCandidates.length === 0) {
+                throw new Error("section agent team repair output empty");
+              }
+              const chosen = successfulCandidates[0];
+              text = chosen.repairedText;
+              validation = chosen.validation;
+              await this.appendTrace(
+                validation.ok ? "agent_team_repair_fallback_ok" : "agent_team_repair_fallback_failed",
+                validation.ok ? "info" : "warn",
+                {
+                  provider: generationProvider,
+                  section: input.section,
+                  step: input.step,
+                  attempt,
+                  repair_round: repairRound,
+                  repair_candidate_count: successfulCandidates.length,
+                  repair_candidates: successfulCandidates.map((candidate) => ({
+                    candidate_index: candidate.candidateIndex,
+                    score: candidate.score,
+                    error_count: candidate.validation.errors.length,
+                    selected: candidate.candidateIndex === chosen.candidateIndex
+                  })),
+                  error_count: validation.errors.length,
+                  errors: validation.errors.slice(0, 6),
+                  ...buildOutputCharMetrics(validation.normalizedContent)
+                }
+              );
+            }
+          }
           if (!validation.ok) {
             retryValidationErrors = validation.errors;
             retryRepairGuidance = validation.repairGuidance ?? "";
             failedCandidatePayload = buildFailedCandidatePayload(input.section, validation.normalizedContent);
-            throw new Error(`section agent team validation failed: ${validation.errors.join("; ")}`);
+            throw new SectionAgentTeamValidationError(
+              `section agent team validation failed: ${validation.errors.join("; ")}`,
+              validation.normalizedContent,
+              validation.errors,
+              validation.repairGuidance ?? ""
+            );
           }
+          await lifecycleTrace.flush();
           retryValidationErrors = [];
           retryRepairGuidance = "";
           await this.appendTrace("agent_team_ok", "info", {
@@ -592,7 +836,7 @@ export class LLMClient {
             attempt,
             url: requestURL,
             latency_ms: Date.now() - started,
-            output_chars: validation.normalizedContent.length
+            ...buildOutputCharMetrics(validation.normalizedContent)
           });
           return validation.normalizedContent;
         } catch (error) {
@@ -675,7 +919,7 @@ export class LLMClient {
             url: requestURL,
             status_code: 200,
             latency_ms: latencyMs,
-            output_chars: text.length
+            ...buildOutputCharMetrics(text)
           });
           this.logger.info(
             {
@@ -686,7 +930,7 @@ export class LLMClient {
               url: requestURL,
               status_code: 200,
               latency_ms: latencyMs,
-              output_chars: text.length
+              ...buildOutputCharMetrics(text)
             },
             "api ok"
           );
