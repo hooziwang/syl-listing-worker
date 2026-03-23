@@ -93,6 +93,9 @@ function createTenantRules(): TenantRules {
   };
 }
 
+const schoolScenePattern =
+  /\b(?:classroom|school|teacher|teachers|student|students|lesson|lessons|homeroom|hallway|hallways|bulletin board|reading corner|welcome board)\b/i;
+
 test("formatJSONArrayContent emits the required JSON object shape for bullets output", () => {
   const result = formatJSONArrayContent(
     [
@@ -619,6 +622,21 @@ test("buildFallbackBulletLineForTest keeps every underlength bullet fallback abo
   }
 });
 
+test("buildFallbackBulletLineForTest does not inject classroom scenes for unrelated products", () => {
+  const line =
+    "Package Value: Includes 6 **bath towels** in 27x54 inches with soft cotton comfort. **bath towel set** keeps daily rotation simple, and **bathroom towels** add reliable drying value for guest baths, master baths, apartments, hotels, spas, travel kits, backup storage, and everyday family routines with easy restocking.";
+
+  const fallback = buildFallbackBulletLineForTest(line, 0);
+  const visible = fallback.replace(/\*\*/g, "").length;
+
+  assert.match(fallback, /\*\*bath towels\*\*/);
+  assert.match(fallback, /\*\*bath towel set\*\*/);
+  assert.match(fallback, /\*\*bathroom towels\*\*/);
+  assert.doesNotMatch(fallback, schoolScenePattern);
+  assert.ok(visible >= 240, `fallback too short: ${visible} chars, line=${fallback}`);
+  assert.ok(visible <= 300, `fallback too long: ${visible} chars, line=${fallback}`);
+});
+
 test("scoreRuntimeCandidateForTest ignores bold wrappers when validating title length", () => {
   const title = "Colorful **paper lanterns** decor set";
   const visibleLength = title.replace(/\*\*/g, "").length;
@@ -959,6 +977,95 @@ test("scoreRuntimeCandidateForTest rebuilds severely overlong runtime-style desc
   assert.ok(normalizedVisibleLength <= 740, `description still too long after fallback rebuild: ${normalizedVisibleLength}`);
   assert.match(result.normalizedContent, /\*\*Paper Lanterns\*\*/);
   assert.match(result.normalizedContent, /\*\*summer party decorations\*\*/);
+});
+
+test("scoreRuntimeCandidateForTest rebuilds overlong bathroom description without injecting classroom scenes", () => {
+  const rule: SectionRule = {
+    section: "description",
+    language: "en",
+    instruction: "generate description",
+    constraints: {
+      min_paragraphs: 2,
+      max_paragraphs: 2,
+      min_chars: 700,
+      max_chars: 740,
+      tolerance_chars: 0,
+      require_complete_sentence_end: true,
+      forbid_dangling_tail: true,
+      keyword_embedding: {
+        enabled: true,
+        min_total: 15,
+        enforce_order: true,
+        exact_match: true,
+        no_split: true,
+        bold_wrapper: true
+      }
+    },
+    execution: {
+      retries: 3,
+      repair_mode: "whole",
+      generation_mode: "sentence",
+      sentence_count: 5,
+      paragraph_count: 2
+    },
+    output: {
+      format: "markdown"
+    }
+  };
+
+  const raw = [
+    "These **bath towels** bring soft comfort and thick coverage to bathrooms, guest spaces, apartments, shared homes, travel bags, gym lockers, pool days, beach trips, cabin stays, daily family routines, and every kind of indoor and outdoor cleanup you can imagine with long lasting convenience and decorative styling that keeps sounding fuller and fuller for testing.",
+    "",
+    "The **bath towel set** gives households flexible rotation, and **bathroom towels** support drying after showers, baths, hand washing, sink splashes, countertop cleanup, mirror wipe downs, vanity touchups, hair care, skincare, kids cleanup, pet cleanup, guest refreshes, and endless daily household moments with more and more filler added to keep this paragraph overly long for the fallback path.",
+    "",
+    "These **cotton bath towels**, **soft bath towels**, **absorbent towels**, **quick dry towels**, **guest bathroom towels**, **luxury bath towels**, **spa towels**, **hotel towels**, **large bath towels**, **bath sheet towels**, **family bath towels**, and **plush towels** stay useful for bathrooms, showers, tubs, vanities, counters, closets, laundry rooms, weekend hosting, and routine restocking while this intentionally oversized paragraph keeps going far beyond the configured limit so the repair fallback has to intervene instead of simply validating the original text as acceptable."
+  ].join("\n");
+
+  const result = scoreRuntimeCandidateForTest(
+    {
+      brand: "SoftHome",
+      category: "Home & Kitchen > Bath > Towels > Bath Towels",
+      keywords: [
+        "bath towels",
+        "bath towel set",
+        "bathroom towels",
+        "cotton bath towels",
+        "soft bath towels",
+        "absorbent towels",
+        "quick dry towels",
+        "guest bathroom towels",
+        "luxury bath towels",
+        "spa towels",
+        "hotel towels",
+        "large bath towels",
+        "bath sheet towels",
+        "family bath towels",
+        "plush towels"
+      ],
+      raw: [
+        "# 基础信息",
+        "品牌名: SoftHome",
+        "",
+        "# 分类",
+        "Home & Kitchen > Bath > Towels > Bath Towels",
+        "",
+        "# 特殊关键要求",
+        "主要用于浴室、淋浴后擦干和日常家用，不要出现学校、教室、派对场景"
+      ].join("\n"),
+      values: {}
+    },
+    rule,
+    raw
+  );
+
+  const normalizedVisibleLength = result.normalizedContent.replace(/\*\*/g, "").length;
+  assert.equal(result.errors.filter((item) => item.includes("长度不满足约束")).length, 0);
+  assert.equal(result.errors.filter((item) => item.includes("关键词顺序埋入不满足")).length, 0);
+  assert.ok(normalizedVisibleLength >= 700, `description too short after fallback rebuild: ${normalizedVisibleLength}`);
+  assert.ok(normalizedVisibleLength <= 740, `description still too long after fallback rebuild: ${normalizedVisibleLength}`);
+  assert.doesNotMatch(result.normalizedContent, schoolScenePattern);
+  assert.match(result.normalizedContent, /\*\*bath towels\*\*/);
+  assert.match(result.normalizedContent, /\*\*plush towels\*\*/);
 });
 
 test("scoreRuntimeCandidateForTest reports visible length without bold wrappers in errors", () => {

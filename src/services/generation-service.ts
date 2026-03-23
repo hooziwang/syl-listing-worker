@@ -600,27 +600,27 @@ function buildFallbackBulletLine(line: string, lineIndex: number): string | null
   switch (lineIndex) {
     case 0:
       return normalizeLine(
-        `${heading}: Includes ${quantity || "12"} ${keywords[0]}${size ? ` in ${size.replace(/\s+/g, "")}` : ""} for fast classroom setup. ${keywords[1]} keeps the set ready, and ${keywords[2]} add bright color for welcome days, school themes, DIY room decor, and classroom party backdrops.`
+        `${heading}: Includes ${quantity || "12"} ${keywords[0]}${size ? ` in ${size.replace(/\s+/g, "")}` : ""} for daily use and restocking. ${keywords[1]} keeps the set easy to compare, and ${keywords[2]} adds practical value for home setups, guest spaces, backup storage, gift prep, and replacements without guesswork.`
       );
     case 1:
       return normalizeLine(
-        `${heading}: ${keywords[0]} open fast for ceilings and walls in busy classrooms. ${keywords[1]} needs no tools, and ${keywords[2]} add layered color for welcome days, reading corners, party tables, and bulletin board backdrops.`
+        `${heading}: ${keywords[0]} keeps setup simple and daily handling easier when details need to stay clear and usable. ${keywords[1]} supports quick decisions, and ${keywords[2]} adds flexible value for shared spaces, cabinets, travel prep, backup sets, and neat routine organization with less effort.`
       );
     case 2:
       return normalizeLine(
-        `${heading}: ${keywords[0]} store flat and reuse across lessons, holidays, and school events. ${keywords[1]} fold down after use, and ${keywords[2]} help keep displays neat for the next celebration, lesson display, and school event setup.`
+        `${heading}: ${keywords[0]} stays ready for repeat use, orderly storage, and steady replacement planning between busy routines. ${keywords[1]} helps maintain a clean setup, and ${keywords[2]} adds dependable value for home refreshes, guest areas, spare supplies, and everyday organization without extra clutter or wasted space.`
       );
     case 3:
       return normalizeLine(
-        `${heading}: ${keywords[0]} bring plaid color that brightens displays without crowding rooms. ${keywords[1]} adds clear focus, and ${keywords[2]} fit class parties, teacher tables, craft stations, and entry corners with a neat look.`
+        `${heading}: ${keywords[0]} adds a clear finished look without making the setup feel crowded or hard to manage. ${keywords[1]} keeps details easy to notice, and ${keywords[2]} fits gifting plans, shared rooms, display shelves, backup storage, and practical day-to-day arrangements with a tidy result.`
       );
     case 4:
       return normalizeLine(
-        `${heading}: ${keywords[0]} suit classroom celebrations, bulletin boards, and themed activities. ${keywords[1]} add soft impact, and ${keywords[2]} support school parties, hallway displays, and quick seasonal refreshes each term.`
+        `${heading}: ${keywords[0]} works across everyday routines, guest prep, seasonal refreshes, and well-organized backup plans with flexible use. ${keywords[1]} adds visible value, and ${keywords[2]} helps the set stay easy to place, easy to rotate, and useful in homes, apartments, travel kits, and shared spaces.`
       );
     default:
       return normalizeLine(
-        `${heading}: ${keywords[0]} keep the display practical and easy to place in classroom scenes. ${keywords[1]} add clear decorative value, and ${keywords[2]} support neat seasonal setups without extra clutter.`
+        `${heading}: ${keywords[0]} keeps the setup practical and easy to place in everyday spaces. ${keywords[1]} adds clear value, and ${keywords[2]} supports tidy storage, repeat use, and steady organization without unnecessary clutter.`
       );
   }
 }
@@ -809,7 +809,7 @@ function buildDescriptionFallbackVariant(
   quantity: string,
   size: string,
   style: string,
-  expanded: boolean
+  mode: "expanded" | "standard" | "compact"
 ): string | null {
   const first = keywords[0] ?? [];
   const second = keywords[1] ?? [];
@@ -818,19 +818,47 @@ function buildDescriptionFallbackVariant(
   }
   const wrapped = (value: string): string => `**${value}**`;
   const sizeText = size ? ` in ${size} size` : "";
-  const styleText = style ? `${style} style` : "bright style";
-  const firstSentence = expanded
-    ? `Set of ${quantity} ${wrapped(first[0])}${sizeText} brings ${styleText} to classroom ceilings, walls, reading corners, and welcome boards.`
-    : `Set of ${quantity} ${wrapped(first[0])}${sizeText} brings ${styleText} to classroom ceilings, walls, and reading corners.`;
-  const firstTail = expanded
-    ? `These ${wrapped(first[1])} and ${wrapped(first[2])} pieces work as ${wrapped(first[3])} and ${wrapped(first[4])}, while ${wrapped(first[5])} open fast, fold flat, and hang as ${wrapped(first[6])} or ${wrapped(first[7])} for repeat school decor.`
-    : `These ${wrapped(first[1])} and ${wrapped(first[2])} pieces work as ${wrapped(first[3])} and ${wrapped(first[4])}, while ${wrapped(first[5])} open fast, fold flat, and hang as ${wrapped(first[6])} or ${wrapped(first[7])} for repeat decor.`;
-  const secondSentence = expanded
-    ? `Use them as ${wrapped(second[0])}, ${wrapped(second[1])}, and ${wrapped(second[2])} for teacher displays, DIY backdrops, photo corners, and room refreshes.`
-    : `Use them as ${wrapped(second[0])}, ${wrapped(second[1])}, and ${wrapped(second[2])} for teacher displays, DIY backdrops, and refreshes.`;
-  const secondTail = expanded
-    ? `They also fit ${wrapped(second[3])}, ${wrapped(second[4])}, and ${wrapped(second[5])}, while ${wrapped(second[6])} keeps parties and celebration spaces bright without complex setup.`
-    : `They also fit ${wrapped(second[3])}, ${wrapped(second[4])}, and ${wrapped(second[5])}, while ${wrapped(second[6])} keeps parties bright without complex setup.`;
+  const styleText = style ? style : "versatile";
+  const firstSentence = (() => {
+    switch (mode) {
+      case "expanded":
+        return `Set of ${quantity} ${wrapped(first[0])}${sizeText} brings ${styleText} style and practical value to daily use, gift prep, organized storage, and routine refreshes without overcomplicating the setup.`;
+      case "compact":
+        return `Set of ${quantity} ${wrapped(first[0])}${sizeText} brings ${styleText} style and practical value to everyday use, storage, and backup planning.`;
+      default:
+        return `Set of ${quantity} ${wrapped(first[0])}${sizeText} brings ${styleText} style and practical value to daily use, organized storage, routine refreshes, and steady replacement planning.`;
+    }
+  })();
+  const firstTail = (() => {
+    switch (mode) {
+      case "expanded":
+        return `These ${wrapped(first[1])} and ${wrapped(first[2])} details support ${wrapped(first[3])} and ${wrapped(first[4])}, while ${wrapped(first[5])}, ${wrapped(first[6])}, and ${wrapped(first[7])} keep the product easy to compare, easy to place, and ready for repeat use across different spaces and everyday routines.`;
+      case "compact":
+        return `${wrapped(first[1])}, ${wrapped(first[2])}, ${wrapped(first[3])}, ${wrapped(first[4])}, ${wrapped(first[5])}, ${wrapped(first[6])}, and ${wrapped(first[7])} keep the listing clear, easy to compare, and ready for repeat use across different setups.`;
+      default:
+        return `These ${wrapped(first[1])} and ${wrapped(first[2])} details support ${wrapped(first[3])} and ${wrapped(first[4])}, while ${wrapped(first[5])}, ${wrapped(first[6])}, and ${wrapped(first[7])} keep the product easy to compare and ready for repeat use.`;
+    }
+  })();
+  const secondSentence = (() => {
+    switch (mode) {
+      case "expanded":
+        return `It also works with ${wrapped(second[0])}, ${wrapped(second[1])}, and ${wrapped(second[2])} when shoppers want more ways to match size, finish, function, or presentation.`;
+      case "compact":
+        return `${wrapped(second[0])}, ${wrapped(second[1])}, and ${wrapped(second[2])} extend the range for shoppers comparing finish, fit, function, or presentation in one listing.`;
+      default:
+        return `It also works with ${wrapped(second[0])}, ${wrapped(second[1])}, and ${wrapped(second[2])} when shoppers want more ways to match size, finish, or function in one listing.`;
+    }
+  })();
+  const secondTail = (() => {
+    switch (mode) {
+      case "expanded":
+        return `${wrapped(second[3])}, ${wrapped(second[4])}, and ${wrapped(second[5])} broaden the use coverage, while ${wrapped(second[6])} helps the listing stay specific, flexible, and useful for home routines, backup sets, gifting plans, and well-organized spaces.`;
+      case "compact":
+        return `${wrapped(second[3])}, ${wrapped(second[4])}, and ${wrapped(second[5])} broaden coverage, while ${wrapped(second[6])} keeps the set specific for daily routines, backup storage, gifting plans, and organized spaces without extra clutter.`;
+      default:
+        return `${wrapped(second[3])}, ${wrapped(second[4])}, and ${wrapped(second[5])} broaden the use coverage, while ${wrapped(second[6])} keeps the listing specific and useful for backup sets, gifting plans, organized spaces, and daily routines.`;
+    }
+  })();
   return `${firstSentence} ${firstTail}\n\n${secondSentence} ${secondTail}`;
 }
 
@@ -849,8 +877,9 @@ function buildDescriptionFallbackContent(
   const size = extractDescriptionSizeHint(requirements.raw, content);
   const style = extractDescriptionStyleHint(requirements.raw, content);
   const variants = [
-    buildDescriptionFallbackVariant(keywordPlan, quantity, size, style, true),
-    buildDescriptionFallbackVariant(keywordPlan, quantity, size, style, false)
+    buildDescriptionFallbackVariant(keywordPlan, quantity, size, style, "expanded"),
+    buildDescriptionFallbackVariant(keywordPlan, quantity, size, style, "standard"),
+    buildDescriptionFallbackVariant(keywordPlan, quantity, size, style, "compact")
   ].filter((value): value is string => Boolean(value));
   const normalizedVariants = variants
     .map((variant) => cleanupCompressedDescriptionContent(variant))
