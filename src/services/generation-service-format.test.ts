@@ -817,6 +817,133 @@ test("scoreRuntimeCandidateForTest trims strongly overlong description content w
   assert.match(result.normalizedContent, /\*\*paper hanging decorations\*\*\s+[A-Za-z]/);
 });
 
+test("scoreRuntimeCandidateForTest accepts descriptions that cover the first six keywords without enforcing paragraph position", () => {
+  const rule: SectionRule = {
+    section: "description",
+    language: "en",
+    instruction: "generate description",
+    constraints: {
+      min_paragraphs: 2,
+      max_paragraphs: 2,
+      min_chars: 700,
+      max_chars: 740,
+      tolerance_chars: 0,
+      require_complete_sentence_end: true,
+      forbid_dangling_tail: true,
+      keyword_embedding: {
+        enabled: true,
+        min_total: 6,
+        enforce_order: false,
+        exact_match: true,
+        no_split: true,
+        bold_wrapper: true
+      }
+    },
+    execution: {
+      retries: 3,
+      repair_mode: "whole",
+      generation_mode: "sentence",
+      sentence_count: 5,
+      paragraph_count: 2
+    },
+    output: {
+      format: "markdown"
+    }
+  };
+
+  const raw = [
+    "These **hanging paper lanterns** give classrooms a bright plaid focal point for welcome walls, bulletin boards, reading corners, seasonal craft tables, and first week displays. The **paper lanterns decorative** finish keeps displays cheerful and photo ready, while **paper hanging decorations** spread coordinated color through daily lessons, themed parties, teacher prepared event corners, and seasonal hallway displays.",
+    "",
+    "Lightweight frames open quickly and fold flat after use, so **paper lanterns** stay practical for repeated school decorating. **colorful paper lanterns** helps teachers refresh ceilings and doorways without extra tools, and **hanging decor** keep party areas, hallway displays, classroom celebrations, reading stations, and entry corners neat, colorful, and easy to reset."
+  ].join("\n");
+
+  const result = scoreRuntimeCandidateForTest(
+    {
+      brand: "gisgfim",
+      category: "Paper Lanterns",
+      keywords: [
+        "paper lanterns",
+        "paper lanterns decorative",
+        "colorful paper lanterns",
+        "hanging paper lanterns",
+        "hanging decor",
+        "paper hanging decorations"
+      ],
+      raw: "# raw",
+      values: {}
+    },
+    rule,
+    raw
+  );
+
+  assert.equal(result.errors.filter((item) => item.includes("缺少关键词")).length, 0);
+  assert.equal(result.errors.filter((item) => item.includes("关键词顺序埋入不满足")).length, 0);
+  assert.equal(result.errors.filter((item) => item.includes("关键词埋入数量不足")).length, 0);
+});
+
+test("scoreRuntimeCandidateForTest requires the first six description keywords even when later keywords are present", () => {
+  const rule: SectionRule = {
+    section: "description",
+    language: "en",
+    instruction: "generate description",
+    constraints: {
+      min_paragraphs: 2,
+      max_paragraphs: 2,
+      min_chars: 700,
+      max_chars: 740,
+      tolerance_chars: 0,
+      require_complete_sentence_end: true,
+      forbid_dangling_tail: true,
+      keyword_embedding: {
+        enabled: true,
+        min_total: 6,
+        enforce_order: false,
+        exact_match: true,
+        no_split: true,
+        bold_wrapper: true
+      }
+    },
+    execution: {
+      retries: 3,
+      repair_mode: "whole",
+      generation_mode: "sentence",
+      sentence_count: 5,
+      paragraph_count: 2
+    },
+    output: {
+      format: "markdown"
+    }
+  };
+
+  const raw = [
+    "These **ceiling hanging decor** pieces give classrooms a bright plaid focal point for welcome walls, bulletin boards, reading corners, seasonal craft tables, and first week displays. The **paper lanterns decorative** finish keeps displays cheerful and photo ready, while **paper hanging decorations** spread coordinated color through daily lessons, themed parties, teacher prepared event corners, and seasonal hallway displays.",
+    "",
+    "Lightweight frames open quickly and fold flat after use, so **hanging paper lanterns** stay practical for repeated school decorating. **colorful paper lanterns** help teachers refresh ceilings and doorways without extra tools, and **hanging decor** keep party areas, hallway displays, classroom celebrations, reading stations, and entry corners neat, colorful, and easy to reset."
+  ].join("\n");
+
+  const result = scoreRuntimeCandidateForTest(
+    {
+      brand: "gisgfim",
+      category: "Paper Lanterns",
+      keywords: [
+        "paper lanterns",
+        "paper lanterns decorative",
+        "colorful paper lanterns",
+        "hanging paper lanterns",
+        "hanging decor",
+        "paper hanging decorations",
+        "ceiling hanging decor"
+      ],
+      raw: "# raw",
+      values: {}
+    },
+    rule,
+    raw
+  );
+
+  assert.match(result.errors.join("\n"), /缺少关键词 #1: paper lanterns/i);
+});
+
 test("scoreRuntimeCandidateForTest compresses runtime-style generic description boilerplate with dense keyword coverage", () => {
   const rule: SectionRule = {
     section: "description",
@@ -977,6 +1104,73 @@ test("scoreRuntimeCandidateForTest rebuilds severely overlong runtime-style desc
   assert.ok(normalizedVisibleLength <= 740, `description still too long after fallback rebuild: ${normalizedVisibleLength}`);
   assert.match(result.normalizedContent, /\*\*Paper Lanterns\*\*/);
   assert.match(result.normalizedContent, /\*\*summer party decorations\*\*/);
+});
+
+test("scoreRuntimeCandidateForTest rebuilds overlong descriptions when only the first six keywords are required", () => {
+  const rule: SectionRule = {
+    section: "description",
+    language: "en",
+    instruction: "generate description",
+    constraints: {
+      min_paragraphs: 2,
+      max_paragraphs: 2,
+      min_chars: 700,
+      max_chars: 740,
+      tolerance_chars: 0,
+      require_complete_sentence_end: true,
+      forbid_dangling_tail: true,
+      keyword_embedding: {
+        enabled: true,
+        min_total: 6,
+        enforce_order: false,
+        exact_match: true,
+        no_split: true,
+        bold_wrapper: true
+      }
+    },
+    execution: {
+      retries: 3,
+      repair_mode: "whole",
+      generation_mode: "sentence",
+      sentence_count: 5,
+      paragraph_count: 2
+    },
+    output: {
+      format: "markdown"
+    }
+  };
+
+  const raw = [
+    "Brighten any room with this versatile set of twelve **paper lanterns**, perfect for creating a festive atmosphere across classrooms, offices, reading corners, welcome walls, bulletin boards, and event tables. Each **paper lanterns decorative** piece measures 10 inches and adds a plaid visual accent that helps displays look coordinated from every angle during school events, family gatherings, birthday celebrations, teacher welcome projects, and seasonal setups. These vibrant **colorful paper lanterns** also work as **hanging paper lanterns** for layered ceiling styling, while **hanging decor** and **paper hanging decorations** help fill larger spaces with photo-ready coverage, reusable setup options, and practical storage value after repeated use.",
+    "",
+    "The lightweight frame opens quickly, folds flat after use, and keeps classroom decorating simple for teachers, staff, and families planning repeat displays throughout the year. This long description intentionally keeps adding extra filler about setup ease, storage convenience, display flexibility, and decorative impact so the runtime fallback path must fully rebuild the content instead of relying on minor trimming alone for compliance."
+  ].join("\n");
+
+  const result = scoreRuntimeCandidateForTest(
+    {
+      brand: "gisgfim",
+      category: "Paper Lanterns",
+      keywords: [
+        "paper lanterns",
+        "paper lanterns decorative",
+        "colorful paper lanterns",
+        "hanging paper lanterns",
+        "hanging decor",
+        "paper hanging decorations"
+      ],
+      raw: "# raw",
+      values: {}
+    },
+    rule,
+    raw
+  );
+
+  const normalizedVisibleLength = result.normalizedContent.replace(/\*\*/g, "").length;
+  assert.equal(result.errors.filter((item) => item.includes("长度不满足约束")).length, 0);
+  assert.equal(result.errors.filter((item) => item.includes("缺少关键词")).length, 0);
+  assert.ok(normalizedVisibleLength >= 700, `description too short after fallback rebuild: ${normalizedVisibleLength}`);
+  assert.ok(normalizedVisibleLength <= 740, `description still too long after fallback rebuild: ${normalizedVisibleLength}`);
+  assert.equal(result.normalizedContent.split(/\n\s*\n/g).length, 2);
 });
 
 test("scoreRuntimeCandidateForTest rebuilds overlong bathroom description without injecting classroom scenes", () => {

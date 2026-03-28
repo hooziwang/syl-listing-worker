@@ -4,6 +4,7 @@ import type { SectionRule } from "./rules-loader.js";
 type KeywordEmbeddingConfig = {
   enabled: boolean;
   minTotal: number;
+  enforceOrder: boolean;
   lowercase: boolean;
 };
 
@@ -33,6 +34,7 @@ function readKeywordEmbeddingConfig(constraints: Record<string, unknown>): Keywo
   return {
     enabled: node.enabled === true,
     minTotal: Math.max(0, Math.floor(minTotalRaw)),
+    enforceOrder: node.enforce_order !== false,
     lowercase: node.lowercase === true
   };
 }
@@ -306,12 +308,17 @@ export function buildSectionKeywordPlan(requirements: ListingRequirements, rule:
 
 export function buildSectionExecutionGuidance(requirements: ListingRequirements, rule: SectionRule): string {
   const plan = buildSectionKeywordPlan(requirements, rule);
-  if (plan.length === 0) {
-    return "";
-  }
   const slotCount = resolveSectionSlotCount(rule);
   const tolerance = getNumber(rule.constraints, "tolerance_chars", 0);
+  const keywordEmbedding = readKeywordEmbeddingConfig(rule.constraints);
+  const requiredKeywordCount = Math.min(
+    keywordEmbedding.minTotal,
+    requirements.keywords.map((item) => normalizeLine(item)).filter(Boolean).length
+  );
   if (rule.section === "bullets") {
+    if (plan.length === 0) {
+      return "";
+    }
     const minChars = getNumber(rule.constraints, "min_chars_per_line", 0);
     const maxChars = getNumber(rule.constraints, "max_chars_per_line", 0);
     const preferred = resolvePreferredPerLineRange(rule);
@@ -350,20 +357,33 @@ export function buildSectionExecutionGuidance(requirements: ListingRequirements,
     const perParagraphMin = slotCount > 0 && minChars > 0 ? Math.floor(minChars / slotCount) : 0;
     const perParagraphMax = slotCount > 0 && maxChars > 0 ? Math.ceil(maxChars / slotCount) : 0;
     const budgets = buildDescriptionParagraphBudgets(rule, slotCount, plan);
+    const paragraphBudgetLines = keywordEmbedding.enforceOrder
+      ? budgets
+          .map((budget, index) => {
+            const note = describeBudgetNote("段", budget);
+            return `- 第${index + 1}段建议长度 ${budget.min}-${budget.max} 字符${note ? `；${note}` : "。"} `;
+          })
+          .map((line) => line.trim())
+      : Array.from({ length: slotCount }, (_value, index) =>
+          perParagraphMin > 0 && perParagraphMax > 0
+            ? `- 第${index + 1}段建议长度 ${perParagraphMin}-${perParagraphMax} 字符。`
+            : ""
+        ).filter(Boolean);
     return [
       "Description 结构化执行要求:",
       `- 固定输出 ${plan.length} 段，仅保留 1 个空行分段；每段聚焦不同价值点。`,
       "- 每段控制 2-3 句，句末必须带标点，不要拆成第 3 段。",
       "- 字符数按最终文本逐字符计算，空格和标点都计入长度；连续的 2 个星号 ** 不计入字符数。",
       perParagraphMin > 0 && perParagraphMax > 0 ? `- 每段建议控制在 ${perParagraphMin}-${perParagraphMax} 字符，优先均匀分配篇幅。` : "",
-      "- 严格按以下段落批次消化关键词，不要把第 2 段关键词提前到第 1 段。",
-      ...plan.map((keywords, index) => `- 第${index + 1}段关键词批次: ${keywords.map((item) => `**${item}**`).join(" -> ")}`),
-      ...budgets
-        .map((budget, index) => {
-          const note = describeBudgetNote("段", budget);
-          return `- 第${index + 1}段建议长度 ${budget.min}-${budget.max} 字符${note ? `；${note}` : "。"} `;
-        })
-        .map((line) => line.trim()),
+      keywordEmbedding.enabled && requiredKeywordCount > 0
+        ? keywordEmbedding.enforceOrder
+          ? "- 严格按以下段落批次消化关键词，不要把第 2 段关键词提前到第 1 段。"
+          : `- 全文自然覆盖前 ${requiredKeywordCount} 个关键词即可，不限制所在段落；关键词保持原样并使用 Markdown 粗体。`
+        : "",
+      ...(keywordEmbedding.enforceOrder
+        ? plan.map((keywords, index) => `- 第${index + 1}段关键词批次: ${keywords.map((item) => `**${item}**`).join(" -> ")}`)
+        : []),
+      ...paragraphBudgetLines,
       minChars > 0 && maxChars > 0 ? `- 整体目标长度 ${minChars}-${maxChars} 字符。` : "",
       hardMax > 0 ? `- 整体绝对上限 ${hardMax} 字符，超出就整段重写，不要只砍尾巴。` : ""
     ].filter(Boolean).join("\n");
@@ -390,6 +410,7 @@ export function buildSectionRepairGuidance(
   const tolerance = getNumber(rule.constraints, "tolerance_chars", 0);
   const hardMax = maxChars > 0 ? maxChars + tolerance : 0;
   const hardTotalMax = maxTotalChars > 0 ? maxTotalChars + tolerance : 0;
+  const keywordEmbedding = readKeywordEmbeddingConfig(rule.constraints);
   const keywordPlan = buildSectionKeywordPlan(requirements, rule);
   const slotBudgets = buildSlotLengthBudgets(rule, keywordPlan);
   const paragraphBudgets = buildDescriptionParagraphBudgets(rule, slotCount, keywordPlan);
@@ -416,6 +437,10 @@ export function buildSectionRepairGuidance(
     .find((value): value is number => value !== null);
   const keywordLineIndex = keywordErrorIndex === undefined ? null : keywordIndexToLine(counts, keywordErrorIndex);
   const hasParagraphCountError = errors.some((error) => error.startsWith("段落数量不满足约束:"));
+  const missingKeywords = errors
+    .map((error) => extractMissingKeyword(error))
+    .filter((value): value is { index: number; keyword: string } => value !== null)
+    .sort((left, right) => left.index - right.index);
 
   if (rule.section === "title") {
     const lines = ["修复指导:", "- 标题必须保持单行，只输出标题文本。"];
@@ -456,6 +481,10 @@ export function buildSectionRepairGuidance(
 
   if (rule.section === "description") {
     const lines = ["修复指导:"];
+    const requiredKeywordCount = Math.min(
+      keywordEmbedding.minTotal,
+      requirements.keywords.map((item) => normalizeLine(item)).filter(Boolean).length
+    );
     if (slotCount > 0) {
       lines.push(`- 固定输出 ${slotCount} 段，仅保留 1 个空行分段，不要拆成额外段落。`);
     }
@@ -473,15 +502,21 @@ export function buildSectionRepairGuidance(
       lines.push(`- ${describeLengthDelta(totalViolation)}。`);
       if (totalViolation.actual > totalViolation.tolMax && slotCount > 0) {
         lines.push("- 当前整体超长，先压缩再润色，不要只微调几个词。");
-        lines.push("- 优先删除重复场景串、同义复述和空泛修饰；每段最多保留 2 个场景例子。");
-        const targetBudget = paragraphBudgets[slotCount - 1];
-        if (targetBudget) {
+        lines.push("- 优先删除重复场景串、同义复述和空泛修饰，不要删品牌词和已满足的核心关键词。");
+        const targetBudget = keywordEmbedding.enforceOrder ? paragraphBudgets[slotCount - 1] : null;
+        if (targetBudget && keywordEmbedding.enforceOrder) {
           const note = describeBudgetNote("段", targetBudget);
           lines.push(
             `- 第${slotCount}段优先收敛到建议长度 ${targetBudget.min}-${targetBudget.max} 字符；${note || "正文保持紧凑。"}`
           );
         } else {
-          lines.push(`- 优先把第${slotCount}段压缩到建议长度，删除重复修饰、同义复述和非关键信息。`);
+          const perParagraphMin = slotCount > 0 && minTotalChars > 0 ? Math.floor(minTotalChars / slotCount) : 0;
+          const perParagraphMax = slotCount > 0 && maxTotalChars > 0 ? Math.ceil(maxTotalChars / slotCount) : 0;
+          if (perParagraphMin > 0 && perParagraphMax > 0) {
+            lines.push(`- 优先把第${slotCount}段压缩到建议长度 ${perParagraphMin}-${perParagraphMax} 字符，删除重复修饰、同义复述和非关键信息。`);
+          } else {
+            lines.push(`- 优先把第${slotCount}段压缩到建议长度，删除重复修饰、同义复述和非关键信息。`);
+          }
         }
       } else if (totalViolation.actual < totalViolation.tolMin) {
         lines.push("- 当前整体偏短，优先补足具体产品细节、使用收益或安装体验，不要补空话。");
@@ -493,10 +528,13 @@ export function buildSectionRepairGuidance(
     for (const paragraphIndex of paragraphIndexes) {
       lines.push(`- 第${paragraphIndex + 1}段必须以完整句和句末标点收尾。`);
     }
-    if (keywordLineIndex !== null) {
+    if (!keywordEmbedding.enforceOrder && missingKeywords.length > 0) {
+      lines.push(`- 必须补回缺失的前 ${requiredKeywordCount} 个关键词：${missingKeywords.map((item) => item.keyword).join(" -> ")}。`);
+    }
+    if (keywordEmbedding.enforceOrder && keywordLineIndex !== null) {
       lines.push(`- 从第${keywordLineIndex + 1}段开始按既定关键词批次重写，前面已满足顺序的段落尽量不动。`);
     }
-    if (keywordPlan.length > 0) {
+    if (keywordEmbedding.enforceOrder && keywordPlan.length > 0) {
       const startParagraph = keywordLineIndex ?? 0;
       for (let index = startParagraph; index < keywordPlan.length; index += 1) {
         const keywords = keywordPlan[index];

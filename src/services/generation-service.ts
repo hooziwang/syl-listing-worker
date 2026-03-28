@@ -813,50 +813,93 @@ function buildDescriptionFallbackVariant(
 ): string | null {
   const first = keywords[0] ?? [];
   const second = keywords[1] ?? [];
-  if (first.length < 8 || second.length < 7) {
-    return null;
-  }
   const wrapped = (value: string): string => `**${value}**`;
   const sizeText = size ? ` in ${size} size` : "";
   const styleText = style ? style : "versatile";
+  if (first.length >= 8 && second.length >= 7) {
+    const firstSentence = (() => {
+      switch (mode) {
+        case "expanded":
+          return `Set of ${quantity} ${wrapped(first[0])}${sizeText} brings ${styleText} style and practical value to daily use, gift prep, organized storage, and routine refreshes without overcomplicating the setup.`;
+        case "compact":
+          return `Set of ${quantity} ${wrapped(first[0])}${sizeText} brings ${styleText} style and practical value to everyday use, storage, and backup planning.`;
+        default:
+          return `Set of ${quantity} ${wrapped(first[0])}${sizeText} brings ${styleText} style and practical value to daily use, organized storage, routine refreshes, and steady replacement planning.`;
+      }
+    })();
+    const firstTail = (() => {
+      switch (mode) {
+        case "expanded":
+          return `These ${wrapped(first[1])} and ${wrapped(first[2])} details support ${wrapped(first[3])} and ${wrapped(first[4])}, while ${wrapped(first[5])}, ${wrapped(first[6])}, and ${wrapped(first[7])} keep the product easy to compare, easy to place, and ready for repeat use across different spaces and everyday routines.`;
+        case "compact":
+          return `${wrapped(first[1])}, ${wrapped(first[2])}, ${wrapped(first[3])}, ${wrapped(first[4])}, ${wrapped(first[5])}, ${wrapped(first[6])}, and ${wrapped(first[7])} keep the listing clear, easy to compare, and ready for repeat use across different setups.`;
+        default:
+          return `These ${wrapped(first[1])} and ${wrapped(first[2])} details support ${wrapped(first[3])} and ${wrapped(first[4])}, while ${wrapped(first[5])}, ${wrapped(first[6])}, and ${wrapped(first[7])} keep the product easy to compare and ready for repeat use.`;
+      }
+    })();
+    const secondSentence = (() => {
+      switch (mode) {
+        case "expanded":
+          return `It also works with ${wrapped(second[0])}, ${wrapped(second[1])}, and ${wrapped(second[2])} when shoppers want more ways to match size, finish, function, or presentation.`;
+        case "compact":
+          return `${wrapped(second[0])}, ${wrapped(second[1])}, and ${wrapped(second[2])} extend the range for shoppers comparing finish, fit, function, or presentation in one listing.`;
+        default:
+          return `It also works with ${wrapped(second[0])}, ${wrapped(second[1])}, and ${wrapped(second[2])} when shoppers want more ways to match size, finish, or function in one listing.`;
+      }
+    })();
+    const secondTail = (() => {
+      switch (mode) {
+        case "expanded":
+          return `${wrapped(second[3])}, ${wrapped(second[4])}, and ${wrapped(second[5])} broaden the use coverage, while ${wrapped(second[6])} helps the listing stay specific, flexible, and useful for home routines, backup sets, gifting plans, and well-organized spaces.`;
+        case "compact":
+          return `${wrapped(second[3])}, ${wrapped(second[4])}, and ${wrapped(second[5])} broaden coverage, while ${wrapped(second[6])} keeps the set specific for daily routines, backup storage, gifting plans, and organized spaces without extra clutter.`;
+        default:
+          return `${wrapped(second[3])}, ${wrapped(second[4])}, and ${wrapped(second[5])} broaden the use coverage, while ${wrapped(second[6])} keeps the listing specific and useful for backup sets, gifting plans, organized spaces, and daily routines.`;
+      }
+    })();
+    return `${firstSentence} ${firstTail}\n\n${secondSentence} ${secondTail}`;
+  }
+  if (first.length < 3 || second.length < 3) {
+    return null;
+  }
   const firstSentence = (() => {
     switch (mode) {
       case "expanded":
-        return `Set of ${quantity} ${wrapped(first[0])}${sizeText} brings ${styleText} style and practical value to daily use, gift prep, organized storage, and routine refreshes without overcomplicating the setup.`;
+        return `Set of ${quantity} ${wrapped(first[0])}${sizeText} brings ${styleText} style and practical value to daily displays, organized storage, backup planning, and repeat use without making setup feel cluttered or complicated.`;
       case "compact":
-        return `Set of ${quantity} ${wrapped(first[0])}${sizeText} brings ${styleText} style and practical value to everyday use, storage, and backup planning.`;
+        return `Set of ${quantity} ${wrapped(first[0])}${sizeText} brings ${styleText} style and practical value to daily displays, storage, and repeat use.`;
       default:
-        return `Set of ${quantity} ${wrapped(first[0])}${sizeText} brings ${styleText} style and practical value to daily use, organized storage, routine refreshes, and steady replacement planning.`;
+        return `Set of ${quantity} ${wrapped(first[0])}${sizeText} brings ${styleText} style and practical value to daily displays, organized storage, refreshes, and replacement planning.`;
     }
   })();
   const firstTail = (() => {
     switch (mode) {
       case "expanded":
-        return `These ${wrapped(first[1])} and ${wrapped(first[2])} details support ${wrapped(first[3])} and ${wrapped(first[4])}, while ${wrapped(first[5])}, ${wrapped(first[6])}, and ${wrapped(first[7])} keep the product easy to compare, easy to place, and ready for repeat use across different spaces and everyday routines.`;
+        return `These ${wrapped(first[1])} and ${wrapped(first[2])} details keep the listing specific, easy to compare, and useful for shoppers who want ready-to-use decor with clear coverage across classrooms, home corners, event tables, teacher displays, and seasonal refreshes.`;
       case "compact":
-        return `${wrapped(first[1])}, ${wrapped(first[2])}, ${wrapped(first[3])}, ${wrapped(first[4])}, ${wrapped(first[5])}, ${wrapped(first[6])}, and ${wrapped(first[7])} keep the listing clear, easy to compare, and ready for repeat use across different setups.`;
+        return `${wrapped(first[1])} and ${wrapped(first[2])} keep the listing clear, practical, and easy to compare for repeat use, backup sets, and neat storage.`;
       default:
-        return `These ${wrapped(first[1])} and ${wrapped(first[2])} details support ${wrapped(first[3])} and ${wrapped(first[4])}, while ${wrapped(first[5])}, ${wrapped(first[6])}, and ${wrapped(first[7])} keep the product easy to compare and ready for repeat use.`;
+        return `These ${wrapped(first[1])} and ${wrapped(first[2])} details keep the listing specific, easy to compare, and ready for repeat use across common setups, teacher projects, and planned seasonal resets.`;
     }
   })();
   const secondSentence = (() => {
     switch (mode) {
       case "expanded":
-        return `It also works with ${wrapped(second[0])}, ${wrapped(second[1])}, and ${wrapped(second[2])} when shoppers want more ways to match size, finish, function, or presentation.`;
+        return `It also works with ${wrapped(second[0])}, ${wrapped(second[1])}, and ${wrapped(second[2])} when buyers need flexible options for ceilings, welcome walls, reading corners, party tables, or quick room updates that still look coordinated and intentional.`;
       case "compact":
-        return `${wrapped(second[0])}, ${wrapped(second[1])}, and ${wrapped(second[2])} extend the range for shoppers comparing finish, fit, function, or presentation in one listing.`;
+        return `${wrapped(second[0])}, ${wrapped(second[1])}, and ${wrapped(second[2])} extend the range for shoppers comparing finish, fit, and function in one listing.`;
       default:
-        return `It also works with ${wrapped(second[0])}, ${wrapped(second[1])}, and ${wrapped(second[2])} when shoppers want more ways to match size, finish, or function in one listing.`;
+        return `It also works with ${wrapped(second[0])}, ${wrapped(second[1])}, and ${wrapped(second[2])} when shoppers want flexible ways to match finish, function, and presentation in one listing.`;
     }
   })();
   const secondTail = (() => {
     switch (mode) {
       case "expanded":
-        return `${wrapped(second[3])}, ${wrapped(second[4])}, and ${wrapped(second[5])} broaden the use coverage, while ${wrapped(second[6])} helps the listing stay specific, flexible, and useful for home routines, backup sets, gifting plans, and well-organized spaces.`;
+        return `The fold-flat structure supports fast setup, tidy storage, repeat placement, gifting plans, dependable backup coverage, and organized event prep, so the description stays useful and natural instead of padded with empty claims.`;
       case "compact":
-        return `${wrapped(second[3])}, ${wrapped(second[4])}, and ${wrapped(second[5])} broaden coverage, while ${wrapped(second[6])} keeps the set specific for daily routines, backup storage, gifting plans, and organized spaces without extra clutter.`;
+        return `The fold-flat structure supports fast setup, tidy storage, repeat placement, and organized resets without extra clutter.`;
       default:
-        return `${wrapped(second[3])}, ${wrapped(second[4])}, and ${wrapped(second[5])} broaden the use coverage, while ${wrapped(second[6])} keeps the listing specific and useful for backup sets, gifting plans, organized spaces, and daily routines.`;
+        return `The fold-flat structure supports fast setup, tidy storage, repeat placement, dependable backup planning, and organized event prep, so the description stays specific and useful for daily routines.`;
     }
   })();
   return `${firstSentence} ${firstTail}\n\n${secondSentence} ${secondTail}`;
@@ -917,10 +960,16 @@ function normalizeDescriptionContentForValidation(
   const hardMax = rawMaxChars + getTolerance(rule.constraints);
   const maxChars = hardMax > 0 ? hardMax : rawMaxChars;
   const compressed = compressDescriptionToLimit(content, minChars, maxChars);
-  if (requirements && maxChars > 0 && countLengthForValidation(compressed) > maxChars) {
-    const fallback = buildDescriptionFallbackContent(requirements, rule, compressed, minChars, maxChars);
-    if (fallback) {
-      return fallback;
+  if (requirements) {
+    const compressedErrors = validateSectionContent(compressed, requirements, rule);
+    const needsFallback =
+      (maxChars > 0 && countLengthForValidation(compressed) > maxChars) ||
+      compressedErrors.some((error) => error.startsWith("段落数量不满足约束:"));
+    if (needsFallback) {
+      const fallback = buildDescriptionFallbackContent(requirements, rule, compressed, minChars, maxChars);
+      if (fallback) {
+        return fallback;
+      }
     }
   }
   return compressed;
@@ -1758,14 +1807,11 @@ function validateSectionContent(content: string, requirements: ListingRequiremen
           cursor = found.end;
         }
       } else {
-        let hits = 0;
-        for (let i = 0; i < keywords.length; i += 1) {
-          if (findKeywordOccurrence(text, keywords[i], 0, keywordEmbedding)) {
-            hits += 1;
+        for (let i = 0; i < target; i += 1) {
+          const kw = keywords[i];
+          if (!findKeywordOccurrence(text, kw, 0, keywordEmbedding)) {
+            errors.push(`缺少关键词 #${i + 1}: ${kw}`);
           }
-        }
-        if (hits < target) {
-          errors.push(`关键词埋入数量不足: ${hits} < ${target}`);
         }
       }
     }

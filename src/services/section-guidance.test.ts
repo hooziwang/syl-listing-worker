@@ -113,8 +113,8 @@ function makeDescriptionRule(): SectionRule {
       require_complete_sentence_end: true,
       keyword_embedding: {
         enabled: true,
-        min_total: 15,
-        enforce_order: true,
+        min_total: 6,
+        enforce_order: false,
         exact_match: true,
         no_split: true,
         bold_wrapper: true
@@ -252,18 +252,22 @@ test("buildSectionExecutionGuidance includes paragraph guidance for description"
   assert.match(guidance, /固定输出 2 段/);
   assert.match(guidance, /整体目标长度 700-740 字符/);
   assert.match(guidance, /每段建议控制在 350-370 字符/);
-  assert.match(guidance, /第1段关键词批次: \*\*Paper Lanterns\*\*/);
-  assert.match(guidance, /第2段关键词批次: \*\*Classroom Decoration\*\*/);
+  assert.match(guidance, /全文自然覆盖前 6 个关键词即可，不限制所在段落/);
+  assert.doesNotMatch(guidance, /第1段关键词批次/);
+  assert.doesNotMatch(guidance, /第2段关键词批次/);
+  assert.doesNotMatch(guidance, /不要把第 2 段关键词提前到第 1 段/);
 });
 
-test("buildSectionExecutionGuidance includes per-paragraph budgets for heavier description keyword batches", () => {
+test("buildSectionExecutionGuidance keeps description paragraph budgets without paragraph keyword batches", () => {
   const guidance = buildSectionExecutionGuidance(makeDescriptionHeavyRequirements(), makeDescriptionRule());
 
-  assert.match(guidance, /第1段建议长度 \d+-\d+ 字符；本段关键词较短，可补足细节/);
-  assert.match(guidance, /第2段建议长度 \d+-\d+ 字符；本段关键词较长，正文更紧凑/);
+  assert.match(guidance, /第1段建议长度 350-370 字符/);
+  assert.match(guidance, /第2段建议长度 350-370 字符/);
+  assert.doesNotMatch(guidance, /本段关键词较短/);
+  assert.doesNotMatch(guidance, /本段关键词较长/);
 });
 
-test("buildSectionRepairGuidance maps paragraph and keyword-order failures back to description paragraphs", () => {
+test("buildSectionRepairGuidance keeps description fixes global when keyword position is unrestricted", () => {
   const guidance = buildSectionRepairGuidance(
     makeRequirements(),
     makeDescriptionRule(),
@@ -271,16 +275,17 @@ test("buildSectionRepairGuidance maps paragraph and keyword-order failures back 
       "长度不满足约束: 764（规则区间 [700,740]，容差区间 [700,740]）",
       "段落数量不满足约束: 3（规则区间 [2,2]）",
       "第1段结尾不是完整句子（缺少句末标点）",
-      "关键词顺序埋入不满足: 第9个关键词未按顺序原样出现: Classroom Decoration"
+      "缺少关键词 #6: Paper Hanging Decorations"
     ]
   );
 
   assert.match(guidance, /固定输出 2 段/);
   assert.match(guidance, /当前超出上限 24 字符/);
-  assert.match(guidance, /第2段优先收敛到建议长度 \d+-\d+ 字符/);
+  assert.match(guidance, /优先把第2段压缩到建议长度/);
   assert.match(guidance, /第1段必须以完整句和句末标点收尾/);
-  assert.match(guidance, /从第2段开始按既定关键词批次重写/);
-  assert.match(guidance, /第2段关键词批次: \*\*Classroom Decoration\*\* -> \*\*Hanging Classroom Decoration\*\*/);
+  assert.match(guidance, /必须补回缺失的前 6 个关键词：Paper Hanging Decorations/);
+  assert.doesNotMatch(guidance, /按既定关键词批次重写/);
+  assert.doesNotMatch(guidance, /关键词批次/);
 });
 
 test("buildSectionRepairGuidance gives title-specific guidance instead of bullet instructions", () => {
@@ -303,7 +308,7 @@ test("buildSectionRepairGuidance gives title-specific guidance instead of bullet
   assert.doesNotMatch(guidance, /第1条重写到/);
 });
 
-test("buildSectionRepairGuidance highlights tighter paragraph target for heavier description keyword batches", () => {
+test("buildSectionRepairGuidance keeps heavy description rewrites generic when keyword positions are unrestricted", () => {
   const guidance = buildSectionRepairGuidance(
     makeDescriptionHeavyRequirements(),
     makeDescriptionRule(),
@@ -313,5 +318,6 @@ test("buildSectionRepairGuidance highlights tighter paragraph target for heavier
   );
 
   assert.match(guidance, /当前超出上限 18 字符/);
-  assert.match(guidance, /第2段优先收敛到建议长度 \d+-\d+ 字符；本段关键词较长，正文更紧凑/);
+  assert.match(guidance, /优先把第2段压缩到建议长度/);
+  assert.doesNotMatch(guidance, /本段关键词较长/);
 });
