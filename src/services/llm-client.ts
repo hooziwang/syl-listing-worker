@@ -107,12 +107,68 @@ function buildOutputCharMetrics(input: string): { output_chars: number; raw_outp
   };
 }
 
-function buildRepairEditBrief(currentContent: string, errors: string[]): string {
+type TextLengthErrorDetails = {
+  actual: number;
+  ruleMin: number;
+  ruleMax: number;
+  tolMin: number;
+  tolMax: number;
+};
+
+function parseTextLengthErrorDetails(error: string): TextLengthErrorDetails | null {
+  const matched = textLengthErrorPattern.exec(error.replace(/\s+/g, " ").trim());
+  if (!matched) {
+    return null;
+  }
+  return {
+    actual: Number.parseInt(matched[1] ?? "0", 10),
+    ruleMin: Number.parseInt(matched[2] ?? "0", 10),
+    ruleMax: Number.parseInt(matched[3] ?? "0", 10),
+    tolMin: Number.parseInt(matched[4] ?? "0", 10),
+    tolMax: Number.parseInt(matched[5] ?? "0", 10)
+  };
+}
+
+function getSeverelyOverlongDescriptionRepairTarget(
+  section: string,
+  errors: string[]
+): { overflow: number; tolMin: number; tolMax: number } | null {
+  if (section !== "description") {
+    return null;
+  }
+  for (const error of errors) {
+    const details = parseTextLengthErrorDetails(error);
+    if (!details || details.actual <= details.tolMax) {
+      continue;
+    }
+    const overflow = details.actual - details.tolMax;
+    if (overflow >= 120) {
+      return {
+        overflow,
+        tolMin: details.tolMin,
+        tolMax: details.tolMax
+      };
+    }
+  }
+  return null;
+}
+
+function buildRepairEditBrief(section: string, currentContent: string, errors: string[]): string {
+  const severeDescriptionTarget = getSeverelyOverlongDescriptionRepairTarget(section, errors);
   const lines = [
-    "这是定量编辑任务，不是整条重写。",
-    "修复目标：尽量保留现有语义主干、关键词顺序和已通过结构，只修被指出的问题。",
+    severeDescriptionTarget
+      ? "这是结构化压缩任务，必要时允许重写整段，但必须保留核心商品语义和已满足的硬性约束。"
+      : "这是定量编辑任务，不是整条重写。",
+    severeDescriptionTarget
+      ? "修复目标：优先把整体长度压回目标区间，再收敛到要求的段落结构、关键词与可读性。"
+      : "修复目标：尽量保留现有语义主干、关键词顺序和已通过结构，只修被指出的问题。",
     `当前可见长度 ${countVisibleChars(currentContent)}。`
   ];
+  if (severeDescriptionTarget) {
+    lines.push(
+      `当前整体超长 ${severeDescriptionTarget.overflow} 字符，不能只删几个词；目标压回 ${severeDescriptionTarget.tolMin}-${severeDescriptionTarget.tolMax}，必要时合并、改写或重组段落。`
+    );
+  }
   for (const error of errors.slice(0, 6)) {
     const normalized = error.replace(/\s+/g, " ").trim();
     const lineMatched = lineLengthErrorPattern.exec(normalized);
@@ -125,10 +181,13 @@ function buildRepairEditBrief(currentContent: string, errors: string[]): string 
       }
       continue;
     }
-    const textMatched = textLengthErrorPattern.exec(normalized);
+    const textMatched = parseTextLengthErrorDetails(normalized);
     if (textMatched) {
-      const [, actual, , , tolMin, tolMax] = textMatched;
-      if (Number.parseInt(actual, 10) < Number.parseInt(tolMin, 10)) {
+      const { actual, tolMin, tolMax } = textMatched;
+      if (severeDescriptionTarget && actual > tolMax) {
+        continue;
+      }
+      if (actual < tolMin) {
         lines.push(`当前整体长度 ${actual}，目标至少 ${tolMin}，可接受上限 ${tolMax}；本轮只补必要信息。`);
       } else {
         lines.push(`当前整体长度 ${actual}，目标压回 ${tolMin}-${tolMax}；本轮只删多余信息。`);
@@ -143,7 +202,20 @@ function buildRepairEditBrief(currentContent: string, errors: string[]): string 
   return lines.join("\n");
 }
 
+function buildRepairCandidateLabel(section: string, errors: string[], candidateIndex: number): string {
+  const severeDescriptionTarget = getSeverelyOverlongDescriptionRepairTarget(section, errors);
+  if (severeDescriptionTarget) {
+    return candidateIndex === 1
+      ? "修复候选#1：先按目标段落结构做高密度压缩，尽量保留现有信息骨架。"
+      : "修复候选#2：必要时重组整段并删除冗余表达，但不要改变语义主干。";
+  }
+  return candidateIndex === 1
+    ? "修复候选#1：优先最小改动，先保留原句结构。"
+    : "修复候选#2：允许更积极地补足或压缩长度，但不要改变语义主干。";
+}
+
 function buildRepairUserPrompt(
+  section: string,
   basePrompt: string,
   currentContent: string,
   errors: string[],
@@ -155,7 +227,7 @@ function buildRepairUserPrompt(
     basePrompt,
     "",
     "编辑要求:",
-    buildRepairEditBrief(currentContent, errors),
+    buildRepairEditBrief(section, currentContent, errors),
     "",
     "当前候选内容:",
     currentContent.trim(),
@@ -746,6 +818,7 @@ export class LLMClient {
                 ...buildOutputCharMetrics(validation.normalizedContent || text)
               });
               const repairPrompt = buildRepairUserPrompt(
+                input.section,
                 input.userPrompt,
                 validation.normalizedContent || text,
                 validation.errors,
@@ -756,13 +829,12 @@ export class LLMClient {
                   const repairedText = await runAgent(
                     repairFallbackAgent,
                     buildRepairUserPrompt(
+                      input.section,
                       input.userPrompt,
                       validation.normalizedContent || text,
                       validation.errors,
                       validation.repairGuidance,
-                      candidateIndex === 1
-                        ? "修复候选#1：优先最小改动，先保留原句结构。"
-                        : "修复候选#2：允许更积极地补足或压缩长度，但不要改变语义主干。"
+                      buildRepairCandidateLabel(input.section, validation.errors, candidateIndex)
                     )
                   );
                   if (!repairedText) {

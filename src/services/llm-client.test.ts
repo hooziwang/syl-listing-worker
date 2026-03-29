@@ -440,6 +440,69 @@ test("generateSectionWithAgentTeam feeds paragraph compression guidance into des
   assert.match(prompts[1] ?? "", /第2段优先收敛到建议长度 340-370 字符/);
 });
 
+test("generateSectionWithAgentTeam allows paragraph-level rewrite for severely overlong descriptions", async () => {
+  const prompts: string[] = [];
+  const client = new LLMClient(createEnv(), {
+    info() {},
+    warn() {},
+    error() {}
+  } as any);
+  (client as any).resolveGenerationRuntime = () => ({
+    generationProvider: "deepseek",
+    runner: {
+      run: async (agent: { name?: string }, input: string) => {
+        prompts.push(input);
+        if (String(agent?.name ?? "").startsWith("repairer_")) {
+          return {
+            finalOutput: "fixed description"
+          };
+        }
+        return {
+          finalOutput: "too long description"
+        };
+      }
+    },
+    model: "deepseek-chat",
+    requestURL: "https://api.deepseek.com/chat/completions",
+    modelSettings: { temperature: 1.1 }
+  });
+
+  const result = await client.generateSectionWithAgentTeam({
+    section: "description",
+    step: "description_runtime_team_candidate_2",
+    userPrompt: "原始任务提示",
+    writerInstructions: "writer",
+    repairInstructions: "repair",
+    attempts: 1,
+    validateContent: (content) => {
+      if (content === "fixed description") {
+        return {
+          ok: true,
+          normalizedContent: content,
+          errors: []
+        };
+      }
+      return {
+        ok: false,
+        normalizedContent: content,
+        errors: ["长度不满足约束: 1060（规则区间 [700,740]，容差区间 [700,740]）"],
+        repairGuidance: [
+          "修复指导:",
+          "- 固定输出 2 段，仅保留 1 个空行分段，不要拆成额外段落。",
+          "- 整体长度控制在 700-740 字符，绝不超过 740 字符。",
+          "- 当前超出上限 320 字符。",
+          "- 当前整体超长，先压缩再润色，不要只微调几个词。"
+        ].join("\n")
+      };
+    }
+  });
+
+  assert.equal(result, "fixed description");
+  assert.match(prompts[1] ?? "", /这是结构化压缩任务，必要时允许重写整段/);
+  assert.match(prompts[1] ?? "", /当前整体超长 320 字符，不能只删几个词/);
+  assert.doesNotMatch(prompts[1] ?? "", /这是定量编辑任务，不是整条重写/);
+});
+
 test("generateSectionWithAgentTeam can run a second repair fallback round before failing the whole section", async () => {
   const prompts: string[] = [];
   let repairRuns = 0;
