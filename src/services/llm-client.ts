@@ -269,33 +269,6 @@ function buildRepairEditBrief(section: string, currentContent: string, errors: s
 
 function buildRepairCandidateLabel(section: string, errors: string[], candidateIndex: number): string {
   const descriptionTarget = getDescriptionTextLengthTarget(section, errors);
-  if (descriptionTarget?.landingRange) {
-    const preferredRange = (() => {
-      if (descriptionTarget.overflow > 0) {
-        return candidateIndex === 1
-          ? formatNumericRange(descriptionTarget.landingRange.upperMin, descriptionTarget.landingRange.upperMax)
-          : formatNumericRange(descriptionTarget.landingRange.lowerMin, descriptionTarget.landingRange.lowerMax);
-      }
-      return candidateIndex === 1
-        ? formatNumericRange(descriptionTarget.landingRange.lowerMin, descriptionTarget.landingRange.lowerMax)
-        : formatNumericRange(descriptionTarget.landingRange.upperMin, descriptionTarget.landingRange.upperMax);
-    })();
-    if (descriptionTarget.overflow >= 120) {
-      return candidateIndex === 1
-        ? `修复候选#1：先按目标段落结构做高密度压缩，优先落在 ${preferredRange}，尽量保留现有信息骨架。`
-        : `修复候选#2：必要时重组整段并删除冗余表达，优先落在 ${preferredRange}，但不要改变语义主干。`;
-    }
-    if (descriptionTarget.overflow > 0) {
-      return candidateIndex === 1
-        ? `修复候选#1：做定量压缩，优先落在 ${preferredRange}，不要再次贴着上限停下。`
-        : `修复候选#2：保留结构前提下压缩到 ${preferredRange}，必要时微调段落内部句序。`;
-    }
-    if (descriptionTarget.shortfall > 0) {
-      return candidateIndex === 1
-        ? `修复候选#1：补足必要细节，优先落在 ${preferredRange}，不要刚到下限就停。`
-        : `修复候选#2：在保留结构的前提下补强信息密度，优先落在 ${preferredRange}。`;
-    }
-  }
   const severeDescriptionTarget = descriptionTarget && descriptionTarget.overflow >= 120 ? descriptionTarget : null;
   if (severeDescriptionTarget) {
     return candidateIndex === 1

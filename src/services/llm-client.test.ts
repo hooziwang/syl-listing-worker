@@ -501,8 +501,6 @@ test("generateSectionWithAgentTeam allows paragraph-level rewrite for severely o
   assert.match(prompts[1] ?? "", /这是结构化压缩任务，必要时允许重写整段/);
   assert.match(prompts[1] ?? "", /当前整体超长 320 字符，不能只删几个词/);
   assert.match(prompts[1] ?? "", /优先落在 710-730/);
-  assert.match(prompts[1] ?? "", /修复候选#1：.*720-730/);
-  assert.match(prompts[2] ?? "", /修复候选#2：.*710-720/);
   assert.doesNotMatch(prompts[1] ?? "", /这是定量编辑任务，不是整条重写/);
 });
 
@@ -566,8 +564,6 @@ test("generateSectionWithAgentTeam steers slightly short descriptions toward the
   assert.equal(result, "fixed description");
   assert.match(prompts[1] ?? "", /当前只差 1 字符/);
   assert.match(prompts[1] ?? "", /优先落在 710-730/);
-  assert.match(prompts[1] ?? "", /修复候选#1：.*710-720/);
-  assert.match(prompts[2] ?? "", /修复候选#2：.*720-730/);
 });
 
 test("generateSectionWithAgentTeam can run a second repair fallback round before failing the whole section", async () => {
