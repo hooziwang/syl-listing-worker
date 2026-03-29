@@ -3,7 +3,6 @@ import test from "node:test";
 import type { AppEnv } from "../config/env.js";
 import {
   adaptMarkdownContentForValidation,
-  buildFallbackBulletLineForTest,
   buildTranslationReusePlanForTest,
   compactSectionRequirementsRawForPromptForTest,
   formatJSONArrayContent,
@@ -95,6 +94,164 @@ function createTenantRules(): TenantRules {
 
 const schoolScenePattern =
   /\b(?:classroom|school|teacher|teachers|student|students|lesson|lessons|homeroom|hallway|hallways|bulletin board|reading corner|welcome board)\b/i;
+
+test("scoreRuntimeCandidateForTest does not fabricate quantity for overlong bullet lines", () => {
+  const rule: SectionRule = {
+    section: "bullets",
+    language: "en",
+    instruction: "generate bullets",
+    constraints: {
+      line_count: 1,
+      min_chars_per_line: 240,
+      max_chars_per_line: 250,
+      tolerance_chars: 50,
+      heading_min_words: 2,
+      heading_max_words: 4,
+      require_complete_sentence_end: true,
+      forbid_dangling_tail: true,
+      keyword_embedding: {
+        enabled: true,
+        min_total: 3,
+        enforce_order: true,
+        exact_match: true,
+        no_split: true,
+        bold_wrapper: true,
+        lowercase: true
+      }
+    },
+    execution: {
+      retries: 3,
+      repair_mode: "item",
+      generation_mode: "sentence",
+      sentence_count: 1
+    },
+    output: {
+      format: "json",
+      json_array_field: "bullets"
+    }
+  };
+
+  const rawLine =
+    "Complete Boho Set: This **crayon organizer** keeps desks tidy with coordinated boho styling for classrooms, craft corners, teacher tables, home offices, shared supply stations, spare storage, backup organization, gift prep, and repeated daily resets while the **pencil cup** format stays easy to compare and the **pen holder** layout keeps accessories visible across mixed-use spaces.";
+
+  const result = scoreRuntimeCandidateForTest(
+    {
+      brand: "gisgfim",
+      category: "Pencil Holders",
+      keywords: ["crayon organizer", "pencil cup", "pen holder"],
+      raw: ["# 基础信息", "数量/包装:8个boho配色的笔筒"].join("\n"),
+      values: {}
+    },
+    rule,
+    JSON.stringify({ bullets: [rawLine] })
+  );
+
+  assert.match(result.errors.join("\n"), /长度不满足约束/);
+  assert.doesNotMatch(result.normalizedContent, /\bIncludes 12\b/i);
+});
+
+test("scoreRuntimeCandidateForTest does not shorten overlong titles with hardcoded phrase maps", () => {
+  const rule: SectionRule = {
+    section: "title",
+    language: "en",
+    instruction: "generate title",
+    constraints: {
+      min_chars: 100,
+      max_chars: 200,
+      tolerance_chars: 20,
+      must_contain: ["brand", "top_keywords"]
+    },
+    execution: {
+      retries: 3,
+      repair_mode: "whole",
+      generation_mode: "whole"
+    },
+    output: {
+      format: "text"
+    }
+  };
+
+  const rawTitle =
+    "gisgfim Paper Lanterns Paper Lanterns Decorative Colorful Paper Lanterns, 12 Pack 10x10 Inch Colorful Plaid Classroom Hanging Decor, DIY Ceiling Decorations for Wedding Baby Shower Summer Party Classroom Events and Back to School Decor";
+
+  const result = scoreRuntimeCandidateForTest(
+    {
+      brand: "gisgfim",
+      category: "Paper Lanterns",
+      keywords: ["Paper Lanterns", "Paper Lanterns Decorative", "Colorful Paper Lanterns"],
+      raw: "# raw",
+      values: {}
+    },
+    rule,
+    rawTitle
+  );
+
+  assert.match(result.errors.join("\n"), /长度不满足约束/);
+  assert.equal(result.normalizedContent, rawTitle);
+});
+
+test("scoreRuntimeCandidateForTest does not rebuild overlong descriptions with local fallback copy", () => {
+  const rule: SectionRule = {
+    section: "description",
+    language: "en",
+    instruction: "generate description",
+    constraints: {
+      min_paragraphs: 2,
+      max_paragraphs: 2,
+      min_chars: 700,
+      max_chars: 740,
+      tolerance_chars: 0,
+      require_complete_sentence_end: true,
+      forbid_dangling_tail: true,
+      keyword_embedding: {
+        enabled: true,
+        min_total: 6,
+        enforce_order: false,
+        exact_match: true,
+        no_split: true,
+        bold_wrapper: true
+      }
+    },
+    execution: {
+      retries: 3,
+      repair_mode: "whole",
+      generation_mode: "sentence",
+      sentence_count: 5,
+      paragraph_count: 2
+    },
+    output: {
+      format: "markdown"
+    }
+  };
+
+  const raw = [
+    "Brighten any room with this versatile set of twelve **paper lanterns**, perfect for creating a festive atmosphere across classrooms, offices, reading corners, welcome walls, bulletin boards, and event tables. Each **paper lanterns decorative** piece measures 10 inches and adds a plaid visual accent that helps displays look coordinated from every angle during school events, family gatherings, birthday celebrations, teacher welcome projects, and seasonal setups. These vibrant **colorful paper lanterns** also work as **hanging paper lanterns** for layered ceiling styling, while **hanging decor** and **paper hanging decorations** help fill larger spaces with photo-ready coverage, reusable setup options, and practical storage value after repeated use.",
+    "",
+    "The lightweight frame opens quickly, folds flat after use, and keeps classroom decorating simple for teachers, staff, and families planning repeat displays throughout the year. This long description intentionally keeps adding extra filler about setup ease, storage convenience, display flexibility, and decorative impact so the runtime fallback path must fully rebuild the content instead of relying on minor trimming alone for compliance."
+  ].join("\n");
+
+  const result = scoreRuntimeCandidateForTest(
+    {
+      brand: "gisgfim",
+      category: "Paper Lanterns",
+      keywords: [
+        "paper lanterns",
+        "paper lanterns decorative",
+        "colorful paper lanterns",
+        "hanging paper lanterns",
+        "hanging decor",
+        "paper hanging decorations"
+      ],
+      raw: ["# 基础信息", "数量/包装:8个", "颜色:boho配色"].join("\n"),
+      values: {}
+    },
+    rule,
+    raw
+  );
+
+  assert.match(result.errors.join("\n"), /长度不满足约束/);
+  assert.doesNotMatch(result.normalizedContent, /\bSet of 8\b/i);
+});
 
 test("formatJSONArrayContent emits the required JSON object shape for bullets output", () => {
   const result = formatJSONArrayContent(
@@ -420,7 +577,7 @@ test("scoreRuntimeCandidateForTest tolerates trailing prose after bullets JSON o
   assert.equal(result.normalizedContent, "Package Contents: line one.\nDimensions: line two.");
 });
 
-test("scoreRuntimeCandidateForTest lightly compresses borderline overlong bullet lines before validation", () => {
+test("scoreRuntimeCandidateForTest leaves borderline overlong bullet lines unchanged and reports validation errors", () => {
   const rule: SectionRule = {
     section: "bullets",
     language: "en",
@@ -462,8 +619,8 @@ test("scoreRuntimeCandidateForTest lightly compresses borderline overlong bullet
     })
   );
 
-  assert.equal(result.errors.filter((item) => item.includes("长度不满足约束")).length, 0);
-  assert.ok(result.normalizedContent.length <= 300);
+  assert.match(result.errors.join("\n"), /第1条长度不满足约束/);
+  assert.equal(result.normalizedContent, rawLine);
   assert.match(result.normalizedContent, /\*\*Paper Lanterns\*\*/);
   assert.match(result.normalizedContent, /\*\*Paper Lanterns Decorative\*\*/);
   assert.match(result.normalizedContent, /\*\*Colorful Paper Lanterns\*\*/);
@@ -606,35 +763,63 @@ test("pickSingleLineRepairCandidateForTest ignores echoed short line and picks t
   assert.deepEqual(picked.relevantErrors, []);
 });
 
-test("buildFallbackBulletLineForTest keeps every underlength bullet fallback above the hard 240-char floor", () => {
-  const sourceLines = [
-    "Package Contents: This package includes 12 **paper lanterns** in 10x10 inches for classroom displays and party decor. **paper lanterns decorative** keep setup simple, and **colorful paper lanterns** brighten welcome walls, tables, and reading corners with plaid color and reusable style for daily school use.",
-    "Installation Ready: These **hanging paper lanterns** open quickly for ceilings and walls in busy classrooms with easy setup and no tools. **hanging decor** saves teacher time, and **paper hanging decorations** add layered color for welcome days, party tables, reading corners, and bulletin board backdrops.",
-    "Reusable Storage: These **ceiling hanging decor** pieces fold flat for storage and reuse after lessons, school events, and seasonal decorating. **hanging ceiling decor** keeps setup practical, and **classroom decoration** helps displays stay neat for the next celebration.",
-    "Plaid Classroom Style: This **hanging classroom decoration** adds plaid color that brightens school spaces during welcome weeks, class parties, and craft days. **ceiling hanging classroom decor** keeps focal points clear, and **wedding decorations** styling helps tables, doors, and corners look neat in shared spaces.",
-    "Versatile Decor Uses: These **chinese lanterns** fit classroom celebrations, reading corners, bulletin boards, and themed tables while staying light and easy to move. **ball lanterns lamps** add soft impact, and **summer party decorations** support seasonal refreshes and reusable school events."
-  ];
+test("scoreRuntimeCandidateForTest does not rebuild unrelated short bullets with local templates", () => {
+  const rule: SectionRule = {
+    section: "bullets",
+    language: "en",
+    instruction: "generate bullets",
+    constraints: {
+      line_count: 1,
+      min_chars_per_line: 240,
+      max_chars_per_line: 250,
+      tolerance_chars: 50,
+      heading_min_words: 2,
+      heading_max_words: 4,
+      require_complete_sentence_end: true,
+      forbid_dangling_tail: true,
+      keyword_embedding: {
+        enabled: true,
+        min_total: 3,
+        enforce_order: true,
+        exact_match: true,
+        no_split: true,
+        bold_wrapper: true,
+        lowercase: true
+      }
+    },
+    execution: {
+      retries: 3,
+      repair_mode: "item",
+      generation_mode: "sentence",
+      sentence_count: 1
+    },
+    output: {
+      format: "json",
+      json_array_field: "bullets"
+    }
+  };
 
-  for (const [index, line] of sourceLines.entries()) {
-    const fallback = buildFallbackBulletLineForTest(line, index);
-    const visible = fallback.replace(/\*\*/g, "").length;
-    assert.ok(visible >= 240, `fallback ${index + 1} too short: ${visible} chars, line=${fallback}`);
-  }
-});
+  const rawLine =
+    "Package Value: Includes 6 **bath towels** for daily drying at home. The **bath towel set** keeps guest spaces ready, and **bathroom towels** support everyday showers and quick refreshes.";
 
-test("buildFallbackBulletLineForTest does not inject classroom scenes for unrelated products", () => {
-  const line =
-    "Package Value: Includes 6 **bath towels** in 27x54 inches with soft cotton comfort. **bath towel set** keeps daily rotation simple, and **bathroom towels** add reliable drying value for guest baths, master baths, apartments, hotels, spas, travel kits, backup storage, and everyday family routines with easy restocking.";
+  const result = scoreRuntimeCandidateForTest(
+    {
+      brand: "SoftHome",
+      category: "Bath Towels",
+      keywords: ["bath towels", "bath towel set", "bathroom towels"],
+      raw: "# raw",
+      values: {}
+    },
+    rule,
+    JSON.stringify({ bullets: [rawLine] })
+  );
 
-  const fallback = buildFallbackBulletLineForTest(line, 0);
-  const visible = fallback.replace(/\*\*/g, "").length;
-
-  assert.match(fallback, /\*\*bath towels\*\*/);
-  assert.match(fallback, /\*\*bath towel set\*\*/);
-  assert.match(fallback, /\*\*bathroom towels\*\*/);
-  assert.doesNotMatch(fallback, schoolScenePattern);
-  assert.ok(visible >= 240, `fallback too short: ${visible} chars, line=${fallback}`);
-  assert.ok(visible <= 300, `fallback too long: ${visible} chars, line=${fallback}`);
+  assert.match(result.errors.join("\n"), /第1条长度不满足约束/);
+  assert.equal(result.normalizedContent, rawLine);
+  assert.match(result.normalizedContent, /\*\*bath towels\*\*/);
+  assert.match(result.normalizedContent, /\*\*bath towel set\*\*/);
+  assert.match(result.normalizedContent, /\*\*bathroom towels\*\*/);
+  assert.doesNotMatch(result.normalizedContent, schoolScenePattern);
 });
 
 test("scoreRuntimeCandidateForTest ignores bold wrappers when validating title length", () => {
@@ -674,7 +859,7 @@ test("scoreRuntimeCandidateForTest ignores bold wrappers when validating title l
   assert.equal(result.errors.filter((item) => item.includes("长度不满足约束")).length, 0);
 });
 
-test("scoreRuntimeCandidateForTest compresses borderline overlong description content before validation", () => {
+test("scoreRuntimeCandidateForTest leaves borderline overlong description content unchanged before validation", () => {
   const rule: SectionRule = {
     section: "description",
     language: "en",
@@ -737,9 +922,9 @@ test("scoreRuntimeCandidateForTest compresses borderline overlong description co
   );
 
   const normalizedVisibleLength = result.normalizedContent.replace(/\*\*/g, "").length;
-  assert.equal(result.errors.filter((item) => item.includes("长度不满足约束")).length, 0);
-  assert.ok(normalizedVisibleLength >= 700, `description too short after compression: ${normalizedVisibleLength}`);
-  assert.ok(normalizedVisibleLength <= 740, `description still too long after compression: ${normalizedVisibleLength}`);
+  assert.match(result.errors.join("\n"), /长度不满足约束/);
+  assert.equal(normalizedVisibleLength, rawVisibleLength);
+  assert.equal(result.normalizedContent, raw);
   assert.match(result.normalizedContent, /\*\*paper lanterns\*\*/i);
   assert.match(result.normalizedContent, /\*\*paper lanterns decorative\*\*/i);
   assert.match(result.normalizedContent, /\*\*colorful paper lanterns\*\*/i);
@@ -748,7 +933,7 @@ test("scoreRuntimeCandidateForTest compresses borderline overlong description co
   assert.match(result.normalizedContent, /\*\*paper hanging decorations\*\*/i);
 });
 
-test("scoreRuntimeCandidateForTest trims strongly overlong description content without breaking bold keyword spacing", () => {
+test("scoreRuntimeCandidateForTest leaves strongly overlong description content unchanged without breaking bold keyword spacing", () => {
   const rule: SectionRule = {
     section: "description",
     language: "en",
@@ -808,10 +993,10 @@ test("scoreRuntimeCandidateForTest trims strongly overlong description content w
   );
 
   const normalizedVisibleLength = result.normalizedContent.replace(/\*\*/g, "").length;
-  assert.equal(result.errors.filter((item) => item.includes("长度不满足约束")).length, 0);
+  assert.match(result.errors.join("\n"), /长度不满足约束/);
   assert.equal(result.errors.filter((item) => item.includes("关键词顺序埋入不满足")).length, 0);
-  assert.ok(normalizedVisibleLength >= 700, `description too short after stronger compression: ${normalizedVisibleLength}`);
-  assert.ok(normalizedVisibleLength <= 740, `description still too long after stronger compression: ${normalizedVisibleLength}`);
+  assert.equal(normalizedVisibleLength, raw.replace(/\*\*/g, "").length);
+  assert.equal(result.normalizedContent, raw);
   assert.match(result.normalizedContent, /\*\*paper lanterns\*\*\s+[A-Za-z]/);
   assert.match(result.normalizedContent, /\*\*colorful paper lanterns\*\*\s+[A-Za-z]/);
   assert.match(result.normalizedContent, /\*\*paper hanging decorations\*\*\s+[A-Za-z]/);
@@ -944,7 +1129,7 @@ test("scoreRuntimeCandidateForTest requires the first six description keywords e
   assert.match(result.errors.join("\n"), /缺少关键词 #1: paper lanterns/i);
 });
 
-test("scoreRuntimeCandidateForTest compresses runtime-style generic description boilerplate with dense keyword coverage", () => {
+test("scoreRuntimeCandidateForTest leaves runtime-style generic description boilerplate untouched when overlong", () => {
   const rule: SectionRule = {
     section: "description",
     language: "en",
@@ -1013,15 +1198,15 @@ test("scoreRuntimeCandidateForTest compresses runtime-style generic description 
   );
 
   const normalizedVisibleLength = result.normalizedContent.replace(/\*\*/g, "").length;
-  assert.equal(result.errors.filter((item) => item.includes("长度不满足约束")).length, 0);
+  assert.match(result.errors.join("\n"), /长度不满足约束/);
   assert.equal(result.errors.filter((item) => item.includes("关键词顺序埋入不满足")).length, 0);
-  assert.ok(normalizedVisibleLength >= 700, `runtime-style description too short after compression: ${normalizedVisibleLength}`);
-  assert.ok(normalizedVisibleLength <= 740, `runtime-style description still too long after compression: ${normalizedVisibleLength}`);
+  assert.equal(normalizedVisibleLength, raw.replace(/\*\*/g, "").length);
+  assert.equal(result.normalizedContent, raw);
   assert.match(result.normalizedContent, /\*\*Paper Lanterns\*\*/);
   assert.match(result.normalizedContent, /\*\*baby shower decorations\*\*/);
 });
 
-test("scoreRuntimeCandidateForTest rebuilds severely overlong runtime-style description into a valid fallback", () => {
+test("scoreRuntimeCandidateForTest does not rebuild severely overlong runtime-style descriptions locally", () => {
   const rule: SectionRule = {
     section: "description",
     language: "en",
@@ -1098,15 +1283,15 @@ test("scoreRuntimeCandidateForTest rebuilds severely overlong runtime-style desc
   );
 
   const normalizedVisibleLength = result.normalizedContent.replace(/\*\*/g, "").length;
-  assert.equal(result.errors.filter((item) => item.includes("长度不满足约束")).length, 0);
+  assert.match(result.errors.join("\n"), /长度不满足约束/);
   assert.equal(result.errors.filter((item) => item.includes("关键词顺序埋入不满足")).length, 0);
-  assert.ok(normalizedVisibleLength >= 700, `description too short after fallback rebuild: ${normalizedVisibleLength}`);
-  assert.ok(normalizedVisibleLength <= 740, `description still too long after fallback rebuild: ${normalizedVisibleLength}`);
+  assert.equal(normalizedVisibleLength, raw.replace(/\*\*/g, "").length);
+  assert.equal(result.normalizedContent, raw);
   assert.match(result.normalizedContent, /\*\*Paper Lanterns\*\*/);
   assert.match(result.normalizedContent, /\*\*summer party decorations\*\*/);
 });
 
-test("scoreRuntimeCandidateForTest rebuilds overlong descriptions when only the first six keywords are required", () => {
+test("scoreRuntimeCandidateForTest does not rebuild overlong descriptions when only the first six keywords are required", () => {
   const rule: SectionRule = {
     section: "description",
     language: "en",
@@ -1166,14 +1351,14 @@ test("scoreRuntimeCandidateForTest rebuilds overlong descriptions when only the 
   );
 
   const normalizedVisibleLength = result.normalizedContent.replace(/\*\*/g, "").length;
-  assert.equal(result.errors.filter((item) => item.includes("长度不满足约束")).length, 0);
+  assert.match(result.errors.join("\n"), /长度不满足约束/);
   assert.equal(result.errors.filter((item) => item.includes("缺少关键词")).length, 0);
-  assert.ok(normalizedVisibleLength >= 700, `description too short after fallback rebuild: ${normalizedVisibleLength}`);
-  assert.ok(normalizedVisibleLength <= 740, `description still too long after fallback rebuild: ${normalizedVisibleLength}`);
+  assert.equal(normalizedVisibleLength, raw.replace(/\*\*/g, "").length);
+  assert.equal(result.normalizedContent, raw);
   assert.equal(result.normalizedContent.split(/\n\s*\n/g).length, 2);
 });
 
-test("scoreRuntimeCandidateForTest rebuilds overlong bathroom description without injecting classroom scenes", () => {
+test("scoreRuntimeCandidateForTest does not inject classroom scenes into unrelated overlong bathroom descriptions", () => {
   const rule: SectionRule = {
     section: "description",
     language: "en",
@@ -1253,13 +1438,13 @@ test("scoreRuntimeCandidateForTest rebuilds overlong bathroom description withou
   );
 
   const normalizedVisibleLength = result.normalizedContent.replace(/\*\*/g, "").length;
-  assert.equal(result.errors.filter((item) => item.includes("长度不满足约束")).length, 0);
+  assert.match(result.errors.join("\n"), /长度不满足约束/);
   assert.equal(result.errors.filter((item) => item.includes("关键词顺序埋入不满足")).length, 0);
-  assert.ok(normalizedVisibleLength >= 700, `description too short after fallback rebuild: ${normalizedVisibleLength}`);
-  assert.ok(normalizedVisibleLength <= 740, `description still too long after fallback rebuild: ${normalizedVisibleLength}`);
+  assert.ok(normalizedVisibleLength > 740, `description unexpectedly shrank to ${normalizedVisibleLength}`);
   assert.doesNotMatch(result.normalizedContent, schoolScenePattern);
   assert.match(result.normalizedContent, /\*\*bath towels\*\*/);
   assert.match(result.normalizedContent, /\*\*plush towels\*\*/);
+  assert.equal(result.normalizedContent.split(/\n\s*\n/g).length, 2);
 });
 
 test("scoreRuntimeCandidateForTest reports visible length without bold wrappers in errors", () => {
@@ -1299,7 +1484,7 @@ test("scoreRuntimeCandidateForTest reports visible length without bold wrappers 
   assert.ok(result.errors.some((item) => item.includes(`长度不满足约束: ${visibleLength}`)));
 });
 
-test("scoreRuntimeCandidateForTest compresses real-world filler phrases in slightly overlong classroom bullet lines", () => {
+test("scoreRuntimeCandidateForTest leaves slightly overlong classroom bullet lines unchanged", () => {
   const rule: SectionRule = {
     section: "bullets",
     language: "en",
@@ -1341,14 +1526,14 @@ test("scoreRuntimeCandidateForTest compresses real-world filler phrases in sligh
     })
   );
 
-  assert.equal(result.errors.filter((item) => item.includes("长度不满足约束")).length, 0);
-  assert.ok(result.normalizedContent.length <= 300);
+  assert.match(result.errors.join("\n"), /第1条长度不满足约束/);
+  assert.equal(result.normalizedContent, rawLine);
   assert.match(result.normalizedContent, /\*\*Hanging Classroom Decoration\*\*/);
   assert.match(result.normalizedContent, /\*\*ceiling hanging Classroom decor\*\*/);
   assert.match(result.normalizedContent, /\*\*wedding decorations\*\*/);
 });
 
-test("scoreRuntimeCandidateForTest compresses package and dimensions bullet patterns seen in runtime failure logs", () => {
+test("scoreRuntimeCandidateForTest keeps package and dimensions bullet patterns unchanged while surfacing only real length errors", () => {
   const rule: SectionRule = {
     section: "bullets",
     language: "en",
@@ -1406,10 +1591,10 @@ test("scoreRuntimeCandidateForTest compresses package and dimensions bullet patt
     })
   );
 
-  assert.equal(packageResult.errors.filter((item) => item.includes("长度不满足约束")).length, 0);
-  assert.equal(dimensionsResult.errors.filter((item) => item.includes("长度不满足约束")).length, 0);
-  assert.ok(packageResult.normalizedContent.length <= 300);
-  assert.ok(dimensionsResult.normalizedContent.length <= 300);
+  assert.match(packageResult.errors.join("\n"), /第1条长度不满足约束/);
+  assert.equal(dimensionsResult.errors.length, 0);
+  assert.equal(packageResult.normalizedContent, packageLine);
+  assert.equal(dimensionsResult.normalizedContent, dimensionsLine);
   assert.match(packageResult.normalizedContent, /\*\*Paper Lanterns\*\*/);
   assert.match(packageResult.normalizedContent, /\*\*Paper Lanterns Decorative\*\*/);
   assert.match(packageResult.normalizedContent, /\*\*Colorful Paper Lanterns\*\*/);
@@ -1418,7 +1603,7 @@ test("scoreRuntimeCandidateForTest compresses package and dimensions bullet patt
   assert.match(dimensionsResult.normalizedContent, /\*\*Paper Hanging Decorations\*\*/);
 });
 
-test("scoreRuntimeCandidateForTest compresses borderline overlong keyword-order classroom bullet lines", () => {
+test("scoreRuntimeCandidateForTest keeps keyword-order classroom bullet lines unchanged when visible length already passes", () => {
   const rule: SectionRule = {
     section: "bullets",
     language: "en",
@@ -1460,14 +1645,14 @@ test("scoreRuntimeCandidateForTest compresses borderline overlong keyword-order 
     })
   );
 
-  assert.equal(result.errors.filter((item) => item.includes("长度不满足约束")).length, 0);
-  assert.ok(result.normalizedContent.length <= 300);
+  assert.equal(result.errors.length, 0);
+  assert.equal(result.normalizedContent, rawLine);
   assert.match(result.normalizedContent, /\*\*ceiling hanging decor\*\*/);
   assert.match(result.normalizedContent, /\*\*hanging ceiling decor\*\*/);
   assert.match(result.normalizedContent, /\*\*Classroom Decoration\*\*/);
 });
 
-test("scoreRuntimeCandidateForTest compresses first-attempt bullets patterns seen in latest runtime retries", () => {
+test("scoreRuntimeCandidateForTest keeps first-attempt retry bullet patterns unchanged and only reports the truly overlong ones", () => {
   const rule: SectionRule = {
     section: "bullets",
     language: "en",
@@ -1501,7 +1686,11 @@ test("scoreRuntimeCandidateForTest compresses first-attempt bullets patterns see
   assert.equal(dimensionsLine.length, 304);
   assert.equal(usageLine.length, 319);
 
-  for (const line of [packageLine, dimensionsLine, usageLine]) {
+  for (const [line, shouldHaveLengthError] of [
+    [packageLine, true],
+    [dimensionsLine, false],
+    [usageLine, true]
+  ] as const) {
     const result = scoreRuntimeCandidateForTest(
       {
         brand: "gisgfim",
@@ -1516,8 +1705,12 @@ test("scoreRuntimeCandidateForTest compresses first-attempt bullets patterns see
       })
     );
 
-    assert.equal(result.errors.filter((item) => item.includes("长度不满足约束")).length, 0);
-    assert.ok(result.normalizedContent.length <= 300);
+    if (shouldHaveLengthError) {
+      assert.match(result.errors.join("\n"), /第1条长度不满足约束/);
+    } else {
+      assert.equal(result.errors.length, 0);
+    }
+    assert.equal(result.normalizedContent, line);
   }
 });
 
@@ -1591,7 +1784,7 @@ test("scoreRuntimeCandidateForTest strips title meta variants seen in real e2e o
   assert.equal(result.normalizedContent, "gisgfim Paper Lanterns Decorative Title");
 });
 
-test("scoreRuntimeCandidateForTest lightly compresses borderline overlong runtime title candidates", () => {
+test("scoreRuntimeCandidateForTest leaves borderline overlong runtime title candidates unchanged", () => {
   const rule: SectionRule = {
     section: "title",
     language: "en",
@@ -1634,14 +1827,14 @@ test("scoreRuntimeCandidateForTest lightly compresses borderline overlong runtim
     rawTitle
   );
 
-  assert.equal(result.errors.filter((item) => item.includes("长度不满足约束")).length, 0);
-  assert.ok(result.normalizedContent.length <= 220);
+  assert.match(result.errors.join("\n"), /长度不满足约束/);
+  assert.equal(result.normalizedContent, rawTitle);
   assert.match(result.normalizedContent, /\bPaper Lanterns\b/);
   assert.match(result.normalizedContent, /\bPaper Lanterns Decorative\b/);
   assert.match(result.normalizedContent, /\bColorful Paper Lanterns\b/);
 });
 
-test("scoreRuntimeCandidateForTest compresses runtime package bullet phrasing seen in failure logs", () => {
+test("scoreRuntimeCandidateForTest keeps runtime package bullet phrasing unchanged when visible length already passes", () => {
   const rule: SectionRule = {
     section: "bullets",
     language: "en",
@@ -1695,8 +1888,8 @@ test("scoreRuntimeCandidateForTest compresses runtime package bullet phrasing se
     })
   );
 
-  assert.equal(result.errors.filter((item) => item.includes("长度不满足约束")).length, 0);
-  assert.ok(result.normalizedContent.length <= 300);
+  assert.equal(result.errors.length, 0);
+  assert.equal(result.normalizedContent, rawLine);
   assert.match(result.normalizedContent, /\*\*Paper Lanterns\*\*/);
   assert.match(result.normalizedContent, /\*\*Paper Lanterns Decorative\*\*/);
   assert.match(result.normalizedContent, /\*\*Colorful Paper Lanterns\*\*/);
@@ -1814,7 +2007,7 @@ test("scoreRuntimeCandidateForTest validates bullet heading word count", () => {
   assert.match(result.errors.join("\n"), /小标题词数不满足约束/);
 });
 
-test("scoreRuntimeCandidateForTest can fall back to a valid bullet template above the hard minimum", () => {
+test("scoreRuntimeCandidateForTest reports short bullets instead of falling back to a local template", () => {
   const rule: SectionRule = {
     section: "bullets",
     language: "en",
@@ -1851,7 +2044,7 @@ test("scoreRuntimeCandidateForTest can fall back to a valid bullet template abov
   };
 
   const rawLine =
-    "Complete Set Ready: This package includes 12 ready-to-use **paper lanterns** measuring 10x10 inches each, offering immediate classroom transformation with **paper lanterns decorative** appeal. The **colorful paper lanterns** add bright seasonal energy for school displays, welcome walls, reading corners, themed parties, and everyday classroom decorating.";
+    "Complete Set Ready: This **paper lanterns** bundle is easy to hang. The **paper lanterns decorative** finish keeps displays bright, and **colorful paper lanterns** add cheerful color.";
 
   const result = scoreRuntimeCandidateForTest(
     {
@@ -1872,10 +2065,10 @@ test("scoreRuntimeCandidateForTest can fall back to a valid bullet template abov
   );
 
   const visibleLength = result.normalizedContent.replace(/\*\*/g, "").length;
-  assert.equal(result.errors.filter((item) => item.includes("长度不满足约束")).length, 0);
+  assert.match(result.errors.join("\n"), /第1条长度不满足约束/);
   assert.equal(result.errors.filter((item) => item.includes("关键词顺序埋入不满足")).length, 0);
-  assert.ok(visibleLength >= 240, `visible length too short: ${visibleLength}`);
-  assert.ok(visibleLength <= 300, `visible length too long: ${visibleLength}`);
+  assert.ok(visibleLength < 240, `visible length unexpectedly met hard minimum: ${visibleLength}`);
+  assert.equal(result.normalizedContent, rawLine);
 });
 
 test("scoreRuntimeCandidateForTest rejects bullet lines below hard minimum even when tolerance exists", () => {
@@ -1942,7 +2135,7 @@ test("scoreRuntimeCandidateForTest rejects bullet lines below hard minimum even 
   assert.match(result.errors.join("\n"), /第2条长度不满足约束/);
 });
 
-test("scoreRuntimeCandidateForTest keeps fallback bullet lines above hard minimum for later slots", () => {
+test("scoreRuntimeCandidateForTest reports later short bullet slots without padding them locally", () => {
   const rule: SectionRule = {
     section: "bullets",
     language: "en",
@@ -2007,17 +2200,19 @@ test("scoreRuntimeCandidateForTest keeps fallback bullet lines above hard minimu
       bullets: [
         "Complete Set Ready: This package includes 12 ready-to-use **paper lanterns** measuring 10x10 inches each, offering immediate classroom transformation with **paper lanterns decorative** appeal. The **colorful paper lanterns** add bright seasonal energy for school displays, welcome walls, reading corners, themed parties, and everyday classroom decorating.",
         "installation Process: These **hanging paper lanterns** open quickly for ceilings and walls across busy classrooms with simple setup steps and no special tools needed at all. The **hanging decor** saves time for teachers, and **paper hanging decorations** create layered color for welcome days, reading corners, party tables, and photo backdrops across the room.",
-        "Reusable Material: These **ceiling hanging decor** pieces stay easy to fold, easy to store, and easy to reuse after lessons, parties, and seasonal decorating changes throughout the year. The **hanging ceiling decor** supports repeated classroom refreshes, and **classroom decoration** keeps displays organized with practical color and visible themed structure for students.",
+        "Reusable Material: **ceiling hanging decor** store flat. **hanging ceiling decor** stay easy to reuse, and **classroom decoration** keeps displays neat.",
         "Plaid Design: The **hanging classroom decoration** adds bright plaid color for school spaces while keeping displays tidy, visible, and cheerful during welcome weeks, class parties, and craft activities. The **ceiling hanging classroom decor** helps anchor focal points, and **wedding decorations** styling keeps tables, doors, and corners looking neat from every angle.",
-        "Classroom Application: These **chinese lanterns** work across classroom celebrations, bulletin boards, reading corners, and themed activity tables while still staying light, easy to move, and easy to hang for teachers. The **ball lanterns lamps** add soft visual impact, and **summer party decorations** support seasonal refreshes, school events, and reusable party setups across indoor spaces."
+        "Classroom Application: **chinese lanterns** brighten events. **ball lanterns lamps** add soft impact, and **summer party decorations** help seasonal refreshes."
       ]
     })
   );
 
   const lines = result.normalizedContent.split("\n");
   assert.equal(lines.length, 5);
-  assert.ok(lines[2]!.length >= 240, `line 3 too short: ${lines[2]!.length}`);
-  assert.ok(lines[4]!.length >= 240, `line 5 too short: ${lines[4]!.length}`);
+  assert.match(result.errors.join("\n"), /第3条长度不满足约束/);
+  assert.match(result.errors.join("\n"), /第5条长度不满足约束/);
+  assert.equal(lines[2], "Reusable Material: **ceiling hanging decor** store flat. **hanging ceiling decor** stay easy to reuse, and **classroom decoration** keeps displays neat.");
+  assert.equal(lines[4], "Classroom Application: **chinese lanterns** brighten events. **ball lanterns lamps** add soft impact, and **summer party decorations** help seasonal refreshes.");
 });
 
 test("buildTranslationReusePlanForTest reuses unchanged runtime translations and only marks repaired sections for re-translation", () => {
