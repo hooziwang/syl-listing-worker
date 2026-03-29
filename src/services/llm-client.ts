@@ -23,7 +23,13 @@ export class SectionAgentTeamValidationError extends Error {
 }
 
 function maxRepairFallbackRounds(section: string): number {
-  return section === "bullets" ? 3 : 2;
+  if (section === "bullets") {
+    return 3;
+  }
+  if (section === "description") {
+    return 3;
+  }
+  return 2;
 }
 
 function safeSnippet(input: string, max = 600): string {
@@ -239,6 +245,7 @@ function buildRepairEditBrief(section: string, currentContent: string, errors: s
             lines.push(
               `当前只超出上限 ${target.overflow} 字符，目标压回 ${tolMin}-${tolMax}${landingText}，避免贴着边界停下。`
             );
+            lines.push("前 6 个关键词满足后不要继续追加更多关键词，优先删掉长场景串、赠礼句和重复铺陈。");
             continue;
           }
           if (target.shortfall > 0) {

@@ -376,6 +376,8 @@ export function buildSectionExecutionGuidance(requirements: ListingRequirements,
       "Description 结构化执行要求:",
       `- 固定输出 ${plan.length} 段，仅保留 1 个空行分段；每段聚焦不同价值点。`,
       "- 每段控制 2-3 句，句末必须带标点，不要拆成第 3 段。",
+      "- 默认先写 4 句：每段 2 句；只有确有必要且仍能守住长度上限时，才允许某一段补第 3 句。",
+      "- 只挑最重要的 4-6 个事实或收益，不要把输入里的全部细节、场景、礼品语和参考素材一次性塞满。",
       "- 字符数按最终文本逐字符计算，空格和标点都计入长度；连续的 2 个星号 ** 不计入字符数。",
       perParagraphMin > 0 && perParagraphMax > 0 ? `- 每段建议控制在 ${perParagraphMin}-${perParagraphMax} 字符，优先均匀分配篇幅。` : "",
       keywordEmbedding.enabled && requiredKeywordCount > 0
@@ -389,7 +391,8 @@ export function buildSectionExecutionGuidance(requirements: ListingRequirements,
               .slice(0, requiredKeywordCount)
               .map((item) => `**${item}**`)
               .join(" -> ")}`,
-            `- 开写前先确认这 ${requiredKeywordCount} 个关键词都已排进正文，少一个都不要提交。`
+            `- 开写前先确认这 ${requiredKeywordCount} 个关键词都已排进正文，少一个都不要提交。`,
+            `- 前 ${requiredKeywordCount} 个关键词满足后就停止追加更多关键词；每段最多保留 1 个用途或结果句，不要连续枚举长场景串。`
           ]
         : []),
       ...(keywordEmbedding.enforceOrder

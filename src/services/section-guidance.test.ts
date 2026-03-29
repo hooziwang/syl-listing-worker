@@ -252,11 +252,14 @@ test("buildSectionExecutionGuidance includes paragraph guidance for description"
   assert.match(guidance, /固定输出 2 段/);
   assert.match(guidance, /整体目标长度 700-740 字符/);
   assert.match(guidance, /每段建议控制在 350-370 字符/);
+  assert.match(guidance, /默认先写 4 句：每段 2 句/);
+  assert.match(guidance, /只挑最重要的 4-6 个事实或收益/);
   assert.match(guidance, /全文自然覆盖前 6 个关键词即可，不限制所在段落/);
   assert.match(
     guidance,
     /前 6 个必带关键词: \*\*Paper Lanterns\*\* -> \*\*Paper Lanterns Decorative\*\* -> \*\*Colorful Paper Lanterns\*\* -> \*\*hanging paper lanterns\*\* -> \*\*Hanging Decor\*\* -> \*\*Paper Hanging Decorations\*\*/
   );
+  assert.match(guidance, /前 6 个关键词满足后就停止追加更多关键词/);
   assert.doesNotMatch(guidance, /第1段关键词批次/);
   assert.doesNotMatch(guidance, /第2段关键词批次/);
   assert.doesNotMatch(guidance, /不要把第 2 段关键词提前到第 1 段/);

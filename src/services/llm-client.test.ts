@@ -634,6 +634,72 @@ test("generateSectionWithAgentTeam can run a second repair fallback round before
   assert.ok(prompts.some((prompt) => /第2段继续压缩/.test(prompt)));
 });
 
+test("generateSectionWithAgentTeam can run a third repair fallback round for description before succeeding", async () => {
+  const prompts: string[] = [];
+  let repairRuns = 0;
+  const client = new LLMClient(createEnv(), {
+    info() {},
+    warn() {},
+    error() {}
+  } as any);
+  (client as any).resolveGenerationRuntime = () => ({
+    generationProvider: "deepseek",
+    runner: {
+      run: async (agent: { name?: string }, input: string) => {
+        prompts.push(input);
+        if (String(agent?.name ?? "").startsWith("repairer_")) {
+          repairRuns += 1;
+          return {
+            finalOutput: repairRuns <= 4 ? "still-too-long" : "fixed description"
+          };
+        }
+        return {
+          finalOutput: "too long description"
+        };
+      }
+    },
+    model: "deepseek-chat",
+    requestURL: "https://api.deepseek.com/chat/completions",
+    modelSettings: { temperature: 1.1 }
+  });
+
+  const result = await client.generateSectionWithAgentTeam({
+    section: "description",
+    step: "description_runtime_team_candidate_4",
+    userPrompt: "原始任务提示",
+    writerInstructions: "writer",
+    repairInstructions: "repair",
+    attempts: 1,
+    validateContent: (content) => {
+      if (content === "fixed description") {
+        return {
+          ok: true,
+          normalizedContent: content,
+          errors: []
+        };
+      }
+      if (content === "still-too-long") {
+        return {
+          ok: false,
+          normalizedContent: content,
+          errors: ["长度不满足约束: 769（规则区间 [700,740]，容差区间 [700,740]）"],
+          repairGuidance: "修复指导:\n- 当前超出上限 29 字符。\n- 前 6 个关键词满足后停止追加更多关键词。\n- 第2段继续压缩，删掉长场景串。"
+        };
+      }
+      return {
+        ok: false,
+        normalizedContent: content,
+        errors: ["长度不满足约束: 962（规则区间 [700,740]，容差区间 [700,740]）"],
+        repairGuidance: "修复指导:\n- 当前整体超长，先压缩再润色。"
+      };
+    }
+  });
+
+  assert.equal(result, "fixed description");
+  assert.equal(repairRuns, 6);
+  assert.ok(prompts.some((prompt) => /前 6 个关键词满足后停止追加更多关键词/.test(prompt)));
+});
+
 test("generateSectionWithAgentTeam logs normalized bullet lines for failed candidates", async () => {
   const traces: Array<{ event: string; payload?: Record<string, unknown> }> = [];
   const warnings: Array<Record<string, unknown>> = [];
