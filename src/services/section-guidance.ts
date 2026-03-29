@@ -311,9 +311,12 @@ export function buildSectionExecutionGuidance(requirements: ListingRequirements,
   const slotCount = resolveSectionSlotCount(rule);
   const tolerance = getNumber(rule.constraints, "tolerance_chars", 0);
   const keywordEmbedding = readKeywordEmbeddingConfig(rule.constraints);
+  const normalizedKeywords = requirements.keywords
+    .map((item) => formatGuidanceKeyword(item, keywordEmbedding.lowercase))
+    .filter(Boolean);
   const requiredKeywordCount = Math.min(
     keywordEmbedding.minTotal,
-    requirements.keywords.map((item) => normalizeLine(item)).filter(Boolean).length
+    normalizedKeywords.length
   );
   if (rule.section === "bullets") {
     if (plan.length === 0) {
@@ -380,6 +383,15 @@ export function buildSectionExecutionGuidance(requirements: ListingRequirements,
           ? "- 严格按以下段落批次消化关键词，不要把第 2 段关键词提前到第 1 段。"
           : `- 全文自然覆盖前 ${requiredKeywordCount} 个关键词即可，不限制所在段落；关键词保持原样并使用 Markdown 粗体。`
         : "",
+      ...(!keywordEmbedding.enforceOrder && requiredKeywordCount > 0
+        ? [
+            `- 前 ${requiredKeywordCount} 个必带关键词: ${normalizedKeywords
+              .slice(0, requiredKeywordCount)
+              .map((item) => `**${item}**`)
+              .join(" -> ")}`,
+            `- 开写前先确认这 ${requiredKeywordCount} 个关键词都已排进正文，少一个都不要提交。`
+          ]
+        : []),
       ...(keywordEmbedding.enforceOrder
         ? plan.map((keywords, index) => `- 第${index + 1}段关键词批次: ${keywords.map((item) => `**${item}**`).join(" -> ")}`)
         : []),
