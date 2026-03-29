@@ -115,6 +115,21 @@ type TextLengthErrorDetails = {
   tolMax: number;
 };
 
+type InteriorLandingRange = {
+  aimMin: number;
+  aimMax: number;
+  lowerMin: number;
+  lowerMax: number;
+  upperMin: number;
+  upperMax: number;
+};
+
+type DescriptionTextLengthTarget = TextLengthErrorDetails & {
+  overflow: number;
+  shortfall: number;
+  landingRange: InteriorLandingRange | null;
+};
+
 function parseTextLengthErrorDetails(error: string): TextLengthErrorDetails | null {
   const matched = textLengthErrorPattern.exec(error.replace(/\s+/g, " ").trim());
   if (!matched) {
@@ -129,32 +144,56 @@ function parseTextLengthErrorDetails(error: string): TextLengthErrorDetails | nu
   };
 }
 
-function getSeverelyOverlongDescriptionRepairTarget(
+function formatNumericRange(min: number, max: number): string {
+  return min >= max ? `${Math.max(min, max)}` : `${min}-${max}`;
+}
+
+function buildInteriorLandingRange(tolMin: number, tolMax: number): InteriorLandingRange | null {
+  if (tolMin <= 0 || tolMax <= 0 || tolMax < tolMin) {
+    return null;
+  }
+  const width = tolMax - tolMin;
+  const buffer = Math.min(10, Math.max(0, Math.floor(width / 4)));
+  const aimMin = tolMin + buffer;
+  const aimMax = tolMax - buffer;
+  const safeMin = aimMin <= aimMax ? aimMin : tolMin;
+  const safeMax = aimMin <= aimMax ? aimMax : tolMax;
+  const midpoint = Math.floor((safeMin + safeMax) / 2);
+  return {
+    aimMin: safeMin,
+    aimMax: safeMax,
+    lowerMin: safeMin,
+    lowerMax: midpoint,
+    upperMin: midpoint,
+    upperMax: safeMax
+  };
+}
+
+function getDescriptionTextLengthTarget(
   section: string,
   errors: string[]
-): { overflow: number; tolMin: number; tolMax: number } | null {
+): DescriptionTextLengthTarget | null {
   if (section !== "description") {
     return null;
   }
   for (const error of errors) {
     const details = parseTextLengthErrorDetails(error);
-    if (!details || details.actual <= details.tolMax) {
+    if (!details) {
       continue;
     }
-    const overflow = details.actual - details.tolMax;
-    if (overflow >= 120) {
-      return {
-        overflow,
-        tolMin: details.tolMin,
-        tolMax: details.tolMax
-      };
-    }
+    return {
+      ...details,
+      overflow: Math.max(0, details.actual - details.tolMax),
+      shortfall: Math.max(0, details.tolMin - details.actual),
+      landingRange: buildInteriorLandingRange(details.tolMin, details.tolMax)
+    };
   }
   return null;
 }
 
 function buildRepairEditBrief(section: string, currentContent: string, errors: string[]): string {
-  const severeDescriptionTarget = getSeverelyOverlongDescriptionRepairTarget(section, errors);
+  const descriptionTarget = getDescriptionTextLengthTarget(section, errors);
+  const severeDescriptionTarget = descriptionTarget && descriptionTarget.overflow >= 120 ? descriptionTarget : null;
   const lines = [
     severeDescriptionTarget
       ? "这是结构化压缩任务，必要时允许重写整段，但必须保留核心商品语义和已满足的硬性约束。"
@@ -165,8 +204,11 @@ function buildRepairEditBrief(section: string, currentContent: string, errors: s
     `当前可见长度 ${countVisibleChars(currentContent)}。`
   ];
   if (severeDescriptionTarget) {
+    const landingText = severeDescriptionTarget.landingRange
+      ? `，优先落在 ${formatNumericRange(severeDescriptionTarget.landingRange.aimMin, severeDescriptionTarget.landingRange.aimMax)}`
+      : "";
     lines.push(
-      `当前整体超长 ${severeDescriptionTarget.overflow} 字符，不能只删几个词；目标压回 ${severeDescriptionTarget.tolMin}-${severeDescriptionTarget.tolMax}，必要时合并、改写或重组段落。`
+      `当前整体超长 ${severeDescriptionTarget.overflow} 字符，不能只删几个词；目标压回 ${severeDescriptionTarget.tolMin}-${severeDescriptionTarget.tolMax}${landingText}，必要时合并、改写或重组段落。`
     );
   }
   for (const error of errors.slice(0, 6)) {
@@ -184,6 +226,29 @@ function buildRepairEditBrief(section: string, currentContent: string, errors: s
     const textMatched = parseTextLengthErrorDetails(normalized);
     if (textMatched) {
       const { actual, tolMin, tolMax } = textMatched;
+      if (section === "description") {
+        const target = getDescriptionTextLengthTarget(section, [normalized]);
+        if (target) {
+          const landingText = target.landingRange
+            ? `，优先落在 ${formatNumericRange(target.landingRange.aimMin, target.landingRange.aimMax)}`
+            : "";
+          if (target.overflow >= 120) {
+            continue;
+          }
+          if (target.overflow > 0) {
+            lines.push(
+              `当前只超出上限 ${target.overflow} 字符，目标压回 ${tolMin}-${tolMax}${landingText}，避免贴着边界停下。`
+            );
+            continue;
+          }
+          if (target.shortfall > 0) {
+            lines.push(
+              `当前只差 ${target.shortfall} 字符，目标补到 ${tolMin}-${tolMax}${landingText}，不要刚到下限就停。`
+            );
+            continue;
+          }
+        }
+      }
       if (severeDescriptionTarget && actual > tolMax) {
         continue;
       }
@@ -203,7 +268,35 @@ function buildRepairEditBrief(section: string, currentContent: string, errors: s
 }
 
 function buildRepairCandidateLabel(section: string, errors: string[], candidateIndex: number): string {
-  const severeDescriptionTarget = getSeverelyOverlongDescriptionRepairTarget(section, errors);
+  const descriptionTarget = getDescriptionTextLengthTarget(section, errors);
+  if (descriptionTarget?.landingRange) {
+    const preferredRange = (() => {
+      if (descriptionTarget.overflow > 0) {
+        return candidateIndex === 1
+          ? formatNumericRange(descriptionTarget.landingRange.upperMin, descriptionTarget.landingRange.upperMax)
+          : formatNumericRange(descriptionTarget.landingRange.lowerMin, descriptionTarget.landingRange.lowerMax);
+      }
+      return candidateIndex === 1
+        ? formatNumericRange(descriptionTarget.landingRange.lowerMin, descriptionTarget.landingRange.lowerMax)
+        : formatNumericRange(descriptionTarget.landingRange.upperMin, descriptionTarget.landingRange.upperMax);
+    })();
+    if (descriptionTarget.overflow >= 120) {
+      return candidateIndex === 1
+        ? `修复候选#1：先按目标段落结构做高密度压缩，优先落在 ${preferredRange}，尽量保留现有信息骨架。`
+        : `修复候选#2：必要时重组整段并删除冗余表达，优先落在 ${preferredRange}，但不要改变语义主干。`;
+    }
+    if (descriptionTarget.overflow > 0) {
+      return candidateIndex === 1
+        ? `修复候选#1：做定量压缩，优先落在 ${preferredRange}，不要再次贴着上限停下。`
+        : `修复候选#2：保留结构前提下压缩到 ${preferredRange}，必要时微调段落内部句序。`;
+    }
+    if (descriptionTarget.shortfall > 0) {
+      return candidateIndex === 1
+        ? `修复候选#1：补足必要细节，优先落在 ${preferredRange}，不要刚到下限就停。`
+        : `修复候选#2：在保留结构的前提下补强信息密度，优先落在 ${preferredRange}。`;
+    }
+  }
+  const severeDescriptionTarget = descriptionTarget && descriptionTarget.overflow >= 120 ? descriptionTarget : null;
   if (severeDescriptionTarget) {
     return candidateIndex === 1
       ? "修复候选#1：先按目标段落结构做高密度压缩，尽量保留现有信息骨架。"
