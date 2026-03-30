@@ -103,6 +103,7 @@ test("scoreRuntimeCandidateForTest does not fabricate quantity for overlong bull
     constraints: {
       line_count: 1,
       min_chars_per_line: 240,
+      hard_min_chars_per_line: true,
       max_chars_per_line: 250,
       tolerance_chars: 50,
       heading_min_words: 2,
@@ -673,6 +674,7 @@ test("scoreRuntimeCandidateForTest prefers bullets candidates slightly above 250
     constraints: {
       line_count: 1,
       min_chars_per_line: 240,
+      hard_min_chars_per_line: true,
       max_chars_per_line: 250,
       tolerance_chars: 50,
       preferred_min_chars_per_line: 255,
@@ -726,6 +728,7 @@ test("pickSingleLineRepairCandidateForTest ignores echoed short line and picks t
     constraints: {
       line_count: 1,
       min_chars_per_line: 240,
+      hard_min_chars_per_line: true,
       max_chars_per_line: 250,
       tolerance_chars: 50,
       preferred_min_chars_per_line: 255,
@@ -771,6 +774,7 @@ test("scoreRuntimeCandidateForTest does not rebuild unrelated short bullets with
     constraints: {
       line_count: 1,
       min_chars_per_line: 240,
+      hard_min_chars_per_line: true,
       max_chars_per_line: 250,
       tolerance_chars: 50,
       heading_min_words: 2,
@@ -1903,6 +1907,7 @@ test("scoreRuntimeCandidateForTest requires lowercase embedded bullet keywords w
     constraints: {
       line_count: 1,
       min_chars_per_line: 240,
+      hard_min_chars_per_line: true,
       max_chars_per_line: 250,
       tolerance_chars: 50,
       heading_min_words: 2,
@@ -1959,6 +1964,7 @@ test("scoreRuntimeCandidateForTest validates bullet heading word count", () => {
     constraints: {
       line_count: 1,
       min_chars_per_line: 240,
+      hard_min_chars_per_line: true,
       max_chars_per_line: 250,
       tolerance_chars: 50,
       heading_min_words: 2,
@@ -2015,6 +2021,7 @@ test("scoreRuntimeCandidateForTest reports short bullets instead of falling back
     constraints: {
       line_count: 1,
       min_chars_per_line: 240,
+      hard_min_chars_per_line: true,
       max_chars_per_line: 250,
       tolerance_chars: 50,
       heading_min_words: 2,
@@ -2071,7 +2078,7 @@ test("scoreRuntimeCandidateForTest reports short bullets instead of falling back
   assert.equal(result.normalizedContent, rawLine);
 });
 
-test("scoreRuntimeCandidateForTest rejects bullet lines below hard minimum even when tolerance exists", () => {
+test("scoreRuntimeCandidateForTest honors a rule-driven hard minimum for bullet lines", () => {
   const rule: SectionRule = {
     section: "bullets",
     language: "en",
@@ -2079,6 +2086,7 @@ test("scoreRuntimeCandidateForTest rejects bullet lines below hard minimum even 
     constraints: {
       line_count: 2,
       min_chars_per_line: 240,
+      hard_min_chars_per_line: true,
       max_chars_per_line: 250,
       tolerance_chars: 50,
       heading_min_words: 2,
@@ -2143,6 +2151,7 @@ test("scoreRuntimeCandidateForTest reports later short bullet slots without padd
     constraints: {
       line_count: 5,
       min_chars_per_line: 240,
+      hard_min_chars_per_line: true,
       max_chars_per_line: 250,
       tolerance_chars: 50,
       heading_min_words: 2,

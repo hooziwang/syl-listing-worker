@@ -92,6 +92,15 @@ function extractMissingKeyword(error: string): { index: number; keyword: string 
   return { index, keyword };
 }
 
+function extractMissingBrand(error: string): string | null {
+  const matched = /^缺少品牌词:\s*(.+)$/.exec(error.trim());
+  if (!matched) {
+    return null;
+  }
+  const brand = normalizeLine(matched[1] ?? "");
+  return brand || null;
+}
+
 function extractLineLengthViolation(error: string): { index: number; violation: LengthViolation } | null {
   const matched = lineLengthErrorPattern.exec(error.trim());
   if (!matched) {
@@ -174,18 +183,17 @@ function resolvePreferredPerLineRange(rule: SectionRule): { min: number; max: nu
 }
 
 function resolveBulletRepairTargetRange(rule: SectionRule): { min: number; max: number } {
-  if (rule.section !== "bullets") {
-    return resolvePreferredPerLineRange(rule);
+  const preferred = resolvePreferredPerLineRange(rule);
+  if (preferred.min > 0 || preferred.max > 0) {
+    return preferred;
   }
-  const rawMax = getNumber(rule.constraints, "max_chars_per_line", 0);
   const tolerance = getNumber(rule.constraints, "tolerance_chars", 0);
-  if (rawMax > 0) {
-    const min = rawMax + 2;
-    const hardMax = rawMax + tolerance;
-    const max = hardMax > 0 ? Math.min(rawMax + 8, hardMax) : rawMax + 8;
-    return { min, max: Math.max(min, max) };
-  }
-  return resolvePreferredPerLineRange(rule);
+  const min = getNumber(rule.constraints, "min_chars_per_line", 0);
+  const rawMax = getNumber(rule.constraints, "max_chars_per_line", 0);
+  return {
+    min,
+    max: rawMax > 0 ? rawMax + tolerance : 0
+  };
 }
 
 function buildSlotLengthBudgets(rule: SectionRule, keywordPlan: string[][]): SlotLengthBudget[] {
@@ -226,21 +234,24 @@ function describeBudgetNote(scope: "条" | "段", budget: SlotLengthBudget): str
   return "";
 }
 
-function buildBulletLineRoleGuidance(index: number): string {
-  switch (index) {
-    case 0:
-      return "第1条围绕套装内容、数量和拿来即用，自拟 2-4 个单词小标题。";
-    case 1:
-      return "第2条不要固定写尺寸，自拟 2-4 个单词小标题，优先发掘最强产品优势。";
-    case 2:
-      return "第3条不要固定写材质，自拟 2-4 个单词小标题，继续补最有说服力的产品优势。";
-    case 3:
-      return "第4条不要固定写颜色，自拟 2-4 个单词小标题，优先补足差异化优势和视觉卖点。";
-    case 4:
-      return "第5条围绕适用场景与用途收束，自拟 2-4 个单词小标题，不要回头重讲前面优势。";
-    default:
-      return `第${index + 1}条先定小标题，再只讲本条核心信息。`;
+function formatRangeText(min: number, max: number): string {
+  if (min > 0 && max > 0) {
+    return `${min}-${max}`;
   }
+  if (min > 0) {
+    return `至少 ${min}`;
+  }
+  if (max > 0) {
+    return `不超过 ${max}`;
+  }
+  return "不限制";
+}
+
+function readHeadingWordRange(rule: SectionRule): { min: number; max: number } {
+  return {
+    min: getNumber(rule.constraints, "heading_min_words", 0),
+    max: getNumber(rule.constraints, "heading_max_words", 0)
+  };
 }
 
 function keywordCountsBySlot(total: number, slotCount: number): number[] {
@@ -309,82 +320,81 @@ export function buildSectionKeywordPlan(requirements: ListingRequirements, rule:
 export function buildSectionExecutionGuidance(requirements: ListingRequirements, rule: SectionRule): string {
   const plan = buildSectionKeywordPlan(requirements, rule);
   const slotCount = resolveSectionSlotCount(rule);
-  const tolerance = getNumber(rule.constraints, "tolerance_chars", 0);
   const keywordEmbedding = readKeywordEmbeddingConfig(rule.constraints);
-  if (rule.section === "bullets") {
-    if (plan.length === 0) {
-      return "";
+  const tolerance = getNumber(rule.constraints, "tolerance_chars", 0);
+  const headingWords = readHeadingWordRange(rule);
+  const lineMin = getNumber(rule.constraints, "min_chars_per_line", 0);
+  const rawLineMax = getNumber(rule.constraints, "max_chars_per_line", 0);
+  const lineMax = rawLineMax > 0 ? rawLineMax + tolerance : 0;
+  const totalMin = getNumber(rule.constraints, "min_chars", 0);
+  const rawTotalMax = getNumber(rule.constraints, "max_chars", 0);
+  const totalMax = rawTotalMax > 0 ? rawTotalMax + tolerance : 0;
+  const sentenceCount = typeof rule.execution.sentence_count === "number" && Number.isFinite(rule.execution.sentence_count)
+    ? Math.floor(rule.execution.sentence_count)
+    : 0;
+  const slotLabel = rule.section === "description" ? "段" : "条";
+  const lines = [`${rule.section} 结构化执行要求:`];
+
+  if (slotCount > 0) {
+    if (rule.section === "description") {
+      lines.push(`- 固定输出 ${slotCount} 段，仅保留 1 个空行分段。`);
+    } else {
+      lines.push(`- 固定输出 ${slotCount} 条。`);
     }
-    const minChars = getNumber(rule.constraints, "min_chars_per_line", 0);
-    const maxChars = getNumber(rule.constraints, "max_chars_per_line", 0);
-    const preferred = resolvePreferredPerLineRange(rule);
-    const hardMax = maxChars > 0 ? maxChars + tolerance : 0;
-    const budgets = buildSlotLengthBudgets(rule, plan);
-    return [
-      "Bullets 结构化执行要求:",
-      "- 先写 2-4 个英文单词的小标题，再写正文；正文保持紧凑完整，不要空泛铺陈。",
-      "- 每条优先 1 个主句 + 1 个短结果句；没有必要就只写 1 句，但必须写成完整句。",
-      "- 每条首个关键词必须在小标题后尽快出现，再按批次顺序带入后续关键词。",
-      "- 关键词一律使用小写并加粗，格式示例：**paper lanterns**。",
-      "- 第2、3、4条不要套固定模版，优先发掘产品最强优点，不要机械重复尺寸/材质/颜色。",
-      "- 字符数按最终文本逐字符计算，空格和标点都计入长度；连续的 2 个星号 ** 不计入字符数。",
-      "- 第二句只补 1 个结果或用途，不要继续枚举多个场景、并列多个空泛卖点。",
-      "- 禁止 that/which/while/allowing/providing/making/ensuring 这类拖尾扩写。",
-      "- 禁止 ideal、perfect、transform、create、bring、enhance 这类空泛词。",
-      "- 同一条最多保留 1 个结果或场景，不要并列 events、parties、classrooms 这类场景串。",
-      "- 严格按以下批次消化关键词，不要把后续条目的关键词提前，不要跨条目打乱顺序。",
-      ...plan.map((_keywords, index) => `- ${buildBulletLineRoleGuidance(index)}`),
-      ...plan.map((keywords, index) => `- 第${index + 1}条关键词批次: ${keywords.map((item) => `**${item}**`).join(" -> ")}`),
-      ...budgets
-        .map((budget, index) => {
-          const note = describeBudgetNote("条", budget);
-          return `- 第${index + 1}条建议长度 ${budget.min}-${budget.max} 字符${note ? `；${note}` : "。"} `;
-        })
-        .map((line) => line.trim()),
-      preferred.min > 0 && preferred.max > 0 ? `- 每条最佳落点 ${preferred.min}-${preferred.max} 字符，略高于 250 字符更稳妥。` : "",
-      minChars > 0 ? `- 每条不得少于 ${minChars} 字符。` : "",
-      hardMax > 0 ? `- 每条绝对上限 ${hardMax} 字符，超出就整条重写，不要只砍尾巴。` : ""
-    ].filter(Boolean).join("\n");
   }
-  if (rule.section === "description") {
-    const minChars = getNumber(rule.constraints, "min_chars", 0);
-    const maxChars = getNumber(rule.constraints, "max_chars", 0);
-    const hardMax = maxChars > 0 ? maxChars + tolerance : 0;
-    const perParagraphMin = slotCount > 0 && minChars > 0 ? Math.floor(minChars / slotCount) : 0;
-    const perParagraphMax = slotCount > 0 && maxChars > 0 ? Math.ceil(maxChars / slotCount) : 0;
-    const budgets = buildDescriptionParagraphBudgets(rule, slotCount, plan);
-    const paragraphBudgetLines = keywordEmbedding.enforceOrder
-      ? budgets
-          .map((budget, index) => {
-            const note = describeBudgetNote("段", budget);
-            return `- 第${index + 1}段建议长度 ${budget.min}-${budget.max} 字符${note ? `；${note}` : "。"} `;
-          })
-          .map((line) => line.trim())
-      : Array.from({ length: slotCount }, (_value, index) =>
-          perParagraphMin > 0 && perParagraphMax > 0
-            ? `- 第${index + 1}段建议长度 ${perParagraphMin}-${perParagraphMax} 字符。`
-            : ""
-        ).filter(Boolean);
-    return [
-      "Description 结构化执行要求:",
-      `- 固定输出 ${plan.length} 段，仅保留 1 个空行分段；每段聚焦不同价值点。`,
-      "- 每段控制 2-3 句，句末必须带标点，不要拆成第 3 段。",
-      "- 默认先写 4 句：每段 2 句；只有确有必要且仍能守住长度上限时，才允许某一段补第 3 句。",
-      "- 只挑最重要的 4-6 个事实或收益，不要把输入里的全部细节、场景、礼品语和参考素材一次性塞满。",
-      "- 字符数按最终文本逐字符计算，空格和标点都计入长度；连续的 2 个星号 ** 不计入字符数。",
-      perParagraphMin > 0 && perParagraphMax > 0 ? `- 每段建议控制在 ${perParagraphMin}-${perParagraphMax} 字符，优先均匀分配篇幅。` : "",
-      keywordEmbedding.enabled && keywordEmbedding.enforceOrder && plan.length > 0
-        ? "- 严格按以下段落批次消化关键词，不要把第 2 段关键词提前到第 1 段。"
-        : "",
-      ...(keywordEmbedding.enforceOrder
-        ? plan.map((keywords, index) => `- 第${index + 1}段关键词批次: ${keywords.map((item) => `**${item}**`).join(" -> ")}`)
-        : []),
-      ...paragraphBudgetLines,
-      minChars > 0 && maxChars > 0 ? `- 整体目标长度 ${minChars}-${maxChars} 字符。` : "",
-      hardMax > 0 ? `- 整体绝对上限 ${hardMax} 字符，超出就整段重写，不要只砍尾巴。` : ""
-    ].filter(Boolean).join("\n");
+  if (rule.section === "title") {
+    lines.push("- 输出单行标题文本。");
   }
-  return "";
+  if (headingWords.min > 0 || headingWords.max > 0) {
+    lines.push(`- 每条小标题词数控制在 ${formatRangeText(headingWords.min, headingWords.max)} 个英文单词。`);
+  }
+  if (sentenceCount > 0 && slotCount > 0) {
+    lines.push(`- 当前 execution 配置总句数 ${sentenceCount}，请按 ${slotCount} 个输出槽位均匀分配。`);
+  }
+  if (lineMin > 0 || lineMax > 0) {
+    lines.push(`- 每条长度控制在 ${formatRangeText(lineMin, lineMax)} 字符。`);
+  }
+  if (totalMin > 0 || totalMax > 0) {
+    lines.push(`- 整体长度控制在 ${formatRangeText(totalMin, totalMax)} 字符。`);
+  }
+  if (rule.constraints.require_complete_sentence_end === true) {
+    lines.push(`- 每${slotLabel}必须以完整句和句末标点收尾。`);
+  }
+  if (rule.constraints.forbid_dangling_tail === true) {
+    lines.push(`- 每${slotLabel}禁止半截句尾词。`);
+  }
+  if (keywordEmbedding.enabled && keywordEmbedding.minTotal > 0) {
+    lines.push(
+      keywordEmbedding.enforceOrder
+        ? `- 前 ${keywordEmbedding.minTotal} 个关键词必须按关键词库顺序出现。`
+        : `- 前 ${keywordEmbedding.minTotal} 个关键词必须全部出现。`
+    );
+    if (keywordEmbedding.lowercase) {
+      lines.push("- 关键词出现时必须保持小写。");
+    }
+    if ((rule.constraints.keyword_embedding as Record<string, unknown> | undefined)?.bold_wrapper === true) {
+      lines.push("- 关键词必须使用 Markdown 粗体包裹。");
+      lines.push("- 长度统计时，连续的 2 个星号 ** 不计入字符数。");
+    }
+    if (keywordEmbedding.enforceOrder && plan.length > 0) {
+      lines.push(`- 按以下${slotLabel}级关键词批次依次消化，不要打乱顺序。`);
+      lines.push(
+        ...plan
+          .filter((keywords) => keywords.length > 0)
+          .map((keywords, index) => `- 第${index + 1}${slotLabel}关键词批次: ${keywords.map((item) => `**${item}**`).join(" -> ")}`)
+      );
+    }
+  }
+
+  const budgets = rule.section === "description"
+    ? buildDescriptionParagraphBudgets(rule, slotCount, plan)
+    : buildSlotLengthBudgets(rule, plan);
+  for (const [index, budget] of budgets.entries()) {
+    const note = describeBudgetNote(slotLabel, budget);
+    lines.push(`- 第${index + 1}${slotLabel}建议长度 ${budget.min}-${budget.max} 字符${note ? `；${note}` : "。"} `);
+  }
+
+  return lines.filter(Boolean).map((line) => line.trim()).join("\n");
 }
 
 export function buildSectionRepairGuidance(
@@ -397,19 +407,16 @@ export function buildSectionRepairGuidance(
   }
   const slotCount = resolveSectionSlotCount(rule);
   const lineCount = getNumber(rule.constraints, "line_count", 0);
-  const minChars = getNumber(rule.constraints, "min_chars_per_line", 0);
-  const maxChars = getNumber(rule.constraints, "max_chars_per_line", 0);
-  const preferred = resolvePreferredPerLineRange(rule);
   const repairTarget = resolveBulletRepairTargetRange(rule);
   const minTotalChars = getNumber(rule.constraints, "min_chars", 0);
   const maxTotalChars = getNumber(rule.constraints, "max_chars", 0);
   const tolerance = getNumber(rule.constraints, "tolerance_chars", 0);
-  const hardMax = maxChars > 0 ? maxChars + tolerance : 0;
   const hardTotalMax = maxTotalChars > 0 ? maxTotalChars + tolerance : 0;
   const keywordEmbedding = readKeywordEmbeddingConfig(rule.constraints);
   const keywordPlan = buildSectionKeywordPlan(requirements, rule);
   const slotBudgets = buildSlotLengthBudgets(rule, keywordPlan);
   const paragraphBudgets = buildDescriptionParagraphBudgets(rule, slotCount, keywordPlan);
+  const headingWords = readHeadingWordRange(rule);
   const lineViolations = new Map<number, LengthViolation>(
     errors
       .map((error) => extractLineLengthViolation(error))
@@ -437,158 +444,88 @@ export function buildSectionRepairGuidance(
     .map((error) => extractMissingKeyword(error))
     .filter((value): value is { index: number; keyword: string } => value !== null)
     .sort((left, right) => left.index - right.index);
+  const missingBrand = errors
+    .map((error) => extractMissingBrand(error))
+    .find((value): value is string => value !== null);
+  const slotLabel = rule.section === "description" ? "段" : "条";
+  const lines = ["修复指导:", "- 只修复被报错的约束；未报错内容尽量保持不变。"];
 
+  if (lineCount > 0) {
+    lines.push(`- 固定输出 ${lineCount} 条。`);
+  }
+  if (rule.section === "description" && slotCount > 0) {
+    lines.push(`- 固定输出 ${slotCount} 段，仅保留 1 个空行分段。`);
+  }
   if (rule.section === "title") {
-    const lines = ["修复指导:", "- 标题必须保持单行，只输出标题文本。"];
-    if (minTotalChars > 0 && maxTotalChars > 0) {
-      lines.push(
-        `- 总长度控制在 ${minTotalChars}-${maxTotalChars} 字符，${hardTotalMax > 0 ? `绝不超过 ${hardTotalMax} 字符。` : "保持长度稳定。"}`
-      );
-    }
-    if (totalViolation) {
-      lines.push(`- ${describeLengthDelta(totalViolation)}。`);
-      if (totalViolation.actual > totalViolation.tolMax) {
-        lines.push("- 超长时先删重复场景词、并列同义修饰和空泛形容词，不要删品牌词与前 3 条核心关键词。");
-        lines.push("- 保留 1 个核心使用场景和必要规格信息，不要并列堆多个节日、场景或近义短语。");
-      } else if (totalViolation.actual < totalViolation.tolMin) {
-        lines.push("- 过短时优先补 1 个核心使用场景或规格信息，不要堆空泛形容词。");
-      }
-    }
-    if (requirements.brand && errors.some((error) => error === `缺少品牌词: ${requirements.brand}`)) {
-      lines.push(`- 必须补回品牌词 ${requirements.brand}，且保持自然可读。`);
-    }
-    const missingTopKeywords = errors
-      .map((error) => extractMissingKeyword(error))
-      .filter((value): value is { index: number; keyword: string } => value !== null)
-      .sort((left, right) => left.index - right.index);
-    const topKeywords = requirements.keywords
-      .slice(0, 3)
-      .map((keyword) => normalizeLine(keyword))
-      .filter(Boolean);
-    if (topKeywords.length > 0) {
-      lines.push(`- 前 3 条核心关键词必须保持原词序自然出现：${topKeywords.join(" -> ")}。`);
-    }
-    if (missingTopKeywords.length > 0) {
-      lines.push(`- 必须补回前 3 条核心关键词中缺失的短语：${missingTopKeywords.map((item) => item.keyword).join(" -> ")}。`);
-    }
-    lines.push("- 优先结构：品牌 + 核心产品词 + 关键使用场景 + 规格信息。");
-    return lines.join("\n");
+    lines.push("- 输出单行标题文本。");
   }
-
-  if (rule.section === "description") {
-    const lines = ["修复指导:"];
-    if (slotCount > 0) {
-      lines.push(`- 固定输出 ${slotCount} 段，仅保留 1 个空行分段，不要拆成额外段落。`);
-    }
-    if (minTotalChars > 0 && maxTotalChars > 0) {
-      lines.push(
-        `- 整体长度控制在 ${minTotalChars}-${maxTotalChars} 字符，${hardTotalMax > 0 ? `绝不超过 ${hardTotalMax} 字符。` : "保持总长度稳定。"}`
-      );
-    }
-    if (slotCount > 0 && minTotalChars > 0 && maxTotalChars > 0) {
-      const perParagraphMin = Math.floor(minTotalChars / slotCount);
-      const perParagraphMax = Math.ceil(maxTotalChars / slotCount);
-      lines.push(`- 每段建议长度 ${perParagraphMin}-${perParagraphMax} 字符。`);
-    }
-    if (totalViolation) {
-      lines.push(`- ${describeLengthDelta(totalViolation)}。`);
-      if (totalViolation.actual > totalViolation.tolMax && slotCount > 0) {
-        lines.push("- 当前整体超长，先压缩再润色，不要只微调几个词。");
-        lines.push("- 优先删除重复场景串、同义复述和空泛修饰，不要删品牌词和已满足的核心关键词。");
-        const targetBudget = keywordEmbedding.enforceOrder ? paragraphBudgets[slotCount - 1] : null;
-        if (targetBudget && keywordEmbedding.enforceOrder) {
-          const note = describeBudgetNote("段", targetBudget);
-          lines.push(
-            `- 第${slotCount}段优先收敛到建议长度 ${targetBudget.min}-${targetBudget.max} 字符；${note || "正文保持紧凑。"}`
-          );
-        } else {
-          const perParagraphMin = slotCount > 0 && minTotalChars > 0 ? Math.floor(minTotalChars / slotCount) : 0;
-          const perParagraphMax = slotCount > 0 && maxTotalChars > 0 ? Math.ceil(maxTotalChars / slotCount) : 0;
-          if (perParagraphMin > 0 && perParagraphMax > 0) {
-            lines.push(`- 优先把第${slotCount}段压缩到建议长度 ${perParagraphMin}-${perParagraphMax} 字符，删除重复修饰、同义复述和非关键信息。`);
-          } else {
-            lines.push(`- 优先把第${slotCount}段压缩到建议长度，删除重复修饰、同义复述和非关键信息。`);
-          }
-        }
-      } else if (totalViolation.actual < totalViolation.tolMin) {
-        lines.push("- 当前整体偏短，优先补足具体产品细节、使用收益或安装体验，不要补空话。");
-      }
-    }
-    if (hasParagraphCountError) {
-      lines.push("- 先合并或重写段落结构，再细修句子和关键词，不要保留第 3 段。");
-    }
-    for (const paragraphIndex of paragraphIndexes) {
-      lines.push(`- 第${paragraphIndex + 1}段必须以完整句和句末标点收尾。`);
-    }
-    if (!keywordEmbedding.enforceOrder && missingKeywords.length > 0) {
-      lines.push(`- 必须补回缺失的关键词：${missingKeywords.map((item) => item.keyword).join(" -> ")}。`);
-    }
-    if (keywordEmbedding.enforceOrder && keywordLineIndex !== null) {
-      lines.push(`- 从第${keywordLineIndex + 1}段开始按既定关键词批次重写，前面已满足顺序的段落尽量不动。`);
-    }
-    if (keywordEmbedding.enforceOrder && keywordPlan.length > 0) {
-      const startParagraph = keywordLineIndex ?? 0;
-      for (let index = startParagraph; index < keywordPlan.length; index += 1) {
-        const keywords = keywordPlan[index];
-        if (keywords.length === 0) {
-          continue;
-        }
-        lines.push(`- 第${index + 1}段关键词批次: ${keywords.map((item) => `**${item}**`).join(" -> ")}`);
-      }
-    }
-    return lines.join("\n");
+  if (headingWords.min > 0 || headingWords.max > 0) {
+    lines.push(`- 每条小标题词数控制在 ${formatRangeText(headingWords.min, headingWords.max)} 个英文单词。`);
   }
-
-  const lines = [
-    "修复指导:",
-    "- 优先保留已通过的前序条目，只重写被点名的条目和其后的乱序条目。",
-    "- 未被点名的条目尽量逐字保持原样，不要顺手改写通过的条目。",
-    "- 每条小标题控制在 2-4 个英文单词，关键词一律使用小写加粗，空格和标点都计入字符数；连续的 2 个星号 ** 不计入字符数。"
-  ];
+  if (minTotalChars > 0 || maxTotalChars > 0) {
+    lines.push(`- 整体长度控制在 ${formatRangeText(minTotalChars, hardTotalMax > 0 ? hardTotalMax : maxTotalChars)} 字符。`);
+  }
+  if (repairTarget.min > 0 || repairTarget.max > 0) {
+    lines.push(`- 单条修复时，目标长度控制在 ${formatRangeText(repairTarget.min, repairTarget.max)} 字符。`);
+  }
+  if (rule.constraints.require_complete_sentence_end === true) {
+    lines.push(`- 每${slotLabel}必须以完整句和句末标点收尾。`);
+  }
+  if (rule.constraints.forbid_dangling_tail === true) {
+    lines.push(`- 每${slotLabel}禁止半截句尾词。`);
+  }
+  if (keywordEmbedding.lowercase) {
+    lines.push("- 关键词出现时必须保持小写。");
+  }
+  if ((rule.constraints.keyword_embedding as Record<string, unknown> | undefined)?.bold_wrapper === true) {
+    lines.push("- 关键词必须使用 Markdown 粗体包裹。");
+    lines.push("- 长度统计时，连续的 2 个星号 ** 不计入字符数。");
+  }
+  if (missingBrand) {
+    lines.push(`- 必须补回缺失品牌词：${missingBrand}。`);
+  }
+  if (totalViolation) {
+    lines.push(`- ${describeLengthDelta(totalViolation)}。`);
+    if (rule.section === "description" && paragraphBudgets.length > 0) {
+      const targetBudget = paragraphBudgets[Math.min(Math.max(slotCount - 1, 0), paragraphBudgets.length - 1)];
+      lines.push(`- 第${Math.min(slotCount, paragraphBudgets.length)}段优先收敛到建议长度 ${targetBudget.min}-${targetBudget.max} 字符。`);
+    }
+  }
+  if (hasParagraphCountError && slotCount > 0) {
+    lines.push(`- 段落数量需要调整到 ${slotCount} 段。`);
+  }
+  for (const paragraphIndex of paragraphIndexes) {
+    lines.push(`- 第${paragraphIndex + 1}段必须以完整句和句末标点收尾。`);
+  }
   for (const lineIndex of lineIndexes) {
     if (repairTarget.min > 0 && repairTarget.max > 0) {
-      lines.push(
-        `- 第${lineIndex + 1}条重写到 ${repairTarget.min}-${repairTarget.max} 字符，${hardMax > 0 ? `绝不超过 ${hardMax} 字符。` : "保持长度稳定。"}`
-      );
+      lines.push(`- 第${lineIndex + 1}条修复到 ${repairTarget.min}-${repairTarget.max} 字符。`);
     }
-    lines.push(`- ${buildBulletLineRoleGuidance(lineIndex)}`);
-    lines.push(`- 第${lineIndex + 1}条只保留 1 个主句，可选 1 个极短结果句。`);
     const budget = slotBudgets[lineIndex];
     if (budget) {
-      lines.push(
-        `- 第${lineIndex + 1}条优先收敛到建议长度 ${budget.min}-${budget.max} 字符；${describeBudgetNote("条", budget) || "正文保持紧凑。"} `
-      );
+      lines.push(`- 第${lineIndex + 1}条优先收敛到建议长度 ${budget.min}-${budget.max} 字符。`);
     }
     const violation = lineViolations.get(lineIndex);
     if (violation) {
       if (violation.actual < violation.tolMin) {
-        lines.push(`- 第${lineIndex + 1}条${describeLengthDelta(violation)}，优先补 1 个具体产品细节或结果句。`);
-        lines.push(`- 第${lineIndex + 1}条当前至少还差 ${violation.tolMin - violation.actual} 个可见字符，补完后最好落到 ${repairTarget.min}-${repairTarget.max} 字符。`);
-        lines.push(`- 第${lineIndex + 1}条不要停在 230-239 这类仍会失败的长度，至少补到 ${repairTarget.min} 字符以上再停。`);
-        lines.push(`- 第${lineIndex + 1}条不要只改几个词，至少补足缺少的长度，同时保持关键词顺序不变。`);
-        lines.push(`- 第${lineIndex + 1}条补充数量、尺寸、安装体验、可复用性或教室场景收益这类具体信息，不要补空话。`);
+        lines.push(`- 第${lineIndex + 1}条${describeLengthDelta(violation)}，请补足到目标区间。`);
       } else {
-        lines.push(`- 第${lineIndex + 1}条${describeLengthDelta(violation)}，优先删除重复修饰和泛化铺陈。`);
-        lines.push(`- 第${lineIndex + 1}条删掉 that/which/while/allowing/providing/making/ensuring 这类拖尾扩写。`);
-        lines.push(`- 第${lineIndex + 1}条不要再补 ideal、perfect、transform、create、bring、enhance 这类空泛词。`);
+        lines.push(`- 第${lineIndex + 1}条${describeLengthDelta(violation)}，请压缩到目标区间。`);
       }
     }
   }
-  if (keywordLineIndex !== null) {
-    lines.push(`- 从第${keywordLineIndex + 1}条开始按既定关键词批次重写，前面已满足顺序的条目尽量不动。`);
-    lines.push(`- 第${keywordLineIndex + 1}条中关键词必须按批次顺序首次出现，先写第1个，再写第2个，最后写第3个关键词。`);
-    for (let index = keywordLineIndex; index < keywordPlan.length; index += 1) {
-      lines.push(`- ${buildBulletLineRoleGuidance(index)}`);
-    }
+  if ((!keywordEmbedding.enabled || !keywordEmbedding.enforceOrder) && missingKeywords.length > 0) {
+    lines.push(`- 必须补回缺失关键词：${missingKeywords.map((item) => item.keyword).join(" -> ")}。`);
   }
-  if (keywordPlan.length > 0) {
+  if (keywordEmbedding.enforceOrder && keywordPlan.length > 0) {
     const startLine = keywordLineIndex ?? 0;
+    lines.push(`- 从第${startLine + 1}${slotLabel}开始按既定关键词顺序修复，前面已满足顺序的内容尽量不动。`);
     for (let index = startLine; index < keywordPlan.length; index += 1) {
       const keywords = keywordPlan[index];
       if (keywords.length === 0) {
         continue;
       }
-      lines.push(`- 第${index + 1}条关键词批次: ${keywords.map((item) => `**${item}**`).join(" -> ")}`);
+      lines.push(`- 第${index + 1}${slotLabel}关键词批次: ${keywords.map((item) => `**${item}**`).join(" -> ")}`);
     }
   }
   return lines.join("\n");

@@ -791,27 +791,32 @@ function getNumber(constraints: Record<string, unknown>, key: string, fallback =
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
+function getBoolean(constraints: Record<string, unknown>, key: string, fallback = false): boolean {
+  const value = constraints[key];
+  return typeof value === "boolean" ? value : fallback;
+}
+
 function getTolerance(constraints: Record<string, unknown>): number {
   return getNumber(constraints, "tolerance_chars", 0);
 }
 
+function resolveToleranceMin(rawMin: number, tolerance: number, hardMin: boolean): number {
+  if (rawMin <= 0) {
+    return 0;
+  }
+  return hardMin ? rawMin : Math.max(0, rawMin - tolerance);
+}
+
 function resolveBulletRepairTargetRange(rule: SectionRule): { min: number; max: number } {
-  if (rule.section !== "bullets") {
-    const preferredMin = getNumber(rule.constraints, "preferred_min_chars_per_line", 0);
-    const preferredMax = getNumber(rule.constraints, "preferred_max_chars_per_line", 0);
-    return { min: preferredMin, max: preferredMax >= preferredMin ? preferredMax : preferredMin };
-  }
-  const rawMax = getNumber(rule.constraints, "max_chars_per_line", 0);
-  const tolerance = getTolerance(rule.constraints);
-  if (rawMax > 0) {
-    const min = rawMax + 2;
-    const hardMax = rawMax + tolerance;
-    const max = hardMax > 0 ? Math.min(rawMax + 8, hardMax) : rawMax + 8;
-    return { min, max: Math.max(min, max) };
-  }
   const preferredMin = getNumber(rule.constraints, "preferred_min_chars_per_line", 0);
   const preferredMax = getNumber(rule.constraints, "preferred_max_chars_per_line", 0);
-  return { min: preferredMin, max: preferredMax >= preferredMin ? preferredMax : preferredMin };
+  if (preferredMin > 0 || preferredMax > 0) {
+    return { min: preferredMin, max: preferredMax >= preferredMin ? preferredMax : preferredMin };
+  }
+  const min = getNumber(rule.constraints, "min_chars_per_line", 0);
+  const rawMax = getNumber(rule.constraints, "max_chars_per_line", 0);
+  const tolerance = getTolerance(rule.constraints);
+  return { min, max: rawMax > 0 ? rawMax + tolerance : 0 };
 }
 
 function rangeCheck(value: number, min: number, max: number): boolean {
@@ -949,8 +954,8 @@ function validateSectionContent(content: string, requirements: ListingRequiremen
   const forbidDanglingTail = constraints.forbid_dangling_tail === true;
   const rawMinChars = getNumber(constraints, "min_chars", 0);
   const rawMaxChars = getNumber(constraints, "max_chars", 0);
-  const hardMinForBullets = rule.section === "bullets";
-  const minChars = rawMinChars > 0 ? (hardMinForBullets ? rawMinChars : rawMinChars - tolerance) : 0;
+  const hardMinChars = getBoolean(constraints, "hard_min_chars", false);
+  const minChars = resolveToleranceMin(rawMinChars, tolerance, hardMinChars);
   const maxChars = rawMaxChars > 0 ? rawMaxChars + tolerance : 0;
   const hasTextLengthConstraint = rawMinChars > 0 || rawMaxChars > 0;
   if (hasTextLengthConstraint && !rangeCheck(normalizedLength, Math.max(0, minChars), maxChars)) {
@@ -965,7 +970,8 @@ function validateSectionContent(content: string, requirements: ListingRequiremen
   const rawMaxCharsPerLine = getNumber(constraints, "max_chars_per_line", 0);
   const headingMinWords = getNumber(constraints, "heading_min_words", 0);
   const headingMaxWords = getNumber(constraints, "heading_max_words", 0);
-  const minCharsPerLine = rawMinCharsPerLine > 0 ? (hardMinForBullets ? rawMinCharsPerLine : rawMinCharsPerLine - tolerance) : 0;
+  const hardMinCharsPerLine = getBoolean(constraints, "hard_min_chars_per_line", false);
+  const minCharsPerLine = resolveToleranceMin(rawMinCharsPerLine, tolerance, hardMinCharsPerLine);
   const maxCharsPerLine = rawMaxCharsPerLine > 0 ? rawMaxCharsPerLine + tolerance : 0;
   const hasLineConstraint = expectedCount > 0 || rawMinCharsPerLine > 0 || rawMaxCharsPerLine > 0;
   if (hasLineConstraint) {
@@ -1680,16 +1686,16 @@ export class GenerationService {
       lines.push(`- 行数必须=${lineCount}`);
     }
     if (rawMinPerLine > 0 || rawMaxPerLine > 0) {
-      const hardMinPerLine = rule.section === "bullets";
-      const tolMin = rawMinPerLine > 0 ? (hardMinPerLine ? rawMinPerLine : Math.max(0, rawMinPerLine - tolerance)) : 0;
+      const hardMinPerLine = getBoolean(constraints, "hard_min_chars_per_line", false);
+      const tolMin = resolveToleranceMin(rawMinPerLine, tolerance, hardMinPerLine);
       const tolMax = rawMaxPerLine > 0 ? rawMaxPerLine + tolerance : 0;
       lines.push(`- 每行长度：规则${formatRange(rawMinPerLine, rawMaxPerLine)}，容差${formatRange(tolMin, tolMax)}`);
     }
     if (preferredMinPerLine > 0 || preferredMaxPerLine > 0) {
-      lines.push(`- 每条最佳落点 ${preferredMinPerLine}-${preferredMaxPerLine} 字符，略高于 250 字符更稳妥`);
+      lines.push(`- 每条建议长度：${preferredMinPerLine}-${preferredMaxPerLine} 字符`);
     }
     if (rawMinChars > 0 || rawMaxChars > 0) {
-      const tolMin = rawMinChars > 0 ? Math.max(0, rawMinChars - tolerance) : 0;
+      const tolMin = resolveToleranceMin(rawMinChars, tolerance, getBoolean(constraints, "hard_min_chars", false));
       const tolMax = rawMaxChars > 0 ? rawMaxChars + tolerance : 0;
       lines.push(`- 总长度：规则${formatRange(rawMinChars, rawMaxChars)}，容差${formatRange(tolMin, tolMax)}`);
     }
@@ -1729,20 +1735,6 @@ export class GenerationService {
   private buildWholeRepairSystemPrompt(rule: SectionRule, jsonOutput = false): string {
     const constraintsSummary = this.constraintsSummary(rule);
     const constraintsJSON = JSON.stringify(rule.constraints, null, 2);
-    const sectionSpecificRepairRules = (() => {
-      if (rule.section !== "bullets") {
-        return "";
-      }
-      const minCharsPerLine = getNumber(rule.constraints, "min_chars_per_line", 0);
-      const repairTarget = resolveBulletRepairTargetRange(rule);
-      return [
-        minCharsPerLine > 0 ? `低于 ${minCharsPerLine} 字符的条目直接视为失败。` : "",
-        repairTarget.min > 0 && repairTarget.max > 0 ? `偏短条目优先补到 ${repairTarget.min}-${repairTarget.max} 可见字符。` : "",
-        repairTarget.min > 0 ? `不要停在 230-239 这类仍会失败的长度，至少补到 ${repairTarget.min} 字符以上再停。` : "",
-        "未报错的条目尽量逐字保持原样，不要顺手改写已经通过的条目。",
-        "当条目偏短时，优先补 1 个具体产品细节、使用结果或安装收益，不要只换同义词。"
-      ].filter(Boolean).join("\n");
-    })();
     return [
       "你是专业亚马逊 Listing 文案专家。",
       "你正在修复一段已有文案。",
@@ -1752,9 +1744,8 @@ export class GenerationService {
       "check_section_candidate 是校验工具，不是 agent，也不是 handoff。",
       "绝不要调用任何 transfer_to_validator_* 工具。",
       "若 check_section_candidate 返回 repair_guidance，必须逐条执行其中的修复要求。",
-      "优先只改失败条目；前面已经满足顺序和长度的条目尽量保持不变。",
+      "优先只改失败条目；未报错内容尽量保持不变。",
       "严禁通过截断尾部满足长度，必须重写为完整句，并用句末标点收尾。",
-      sectionSpecificRepairRules,
       `section=${rule.section}`,
       `规则:\n${rule.instruction}`,
       `硬性约束摘要:\n${constraintsSummary}`,
@@ -1780,26 +1771,21 @@ export class GenerationService {
       const tolMax = Number.parseInt(lineViolation[6] ?? "0", 10);
       if (actual > 0 && tolMin > 0 && actual < tolMin) {
         const shortBy = tolMin - actual;
-        const addMin = shortBy <= 8 ? 12 : Math.max(shortBy + 6, 12);
-        const addMax = shortBy <= 8 ? 20 : Math.max(shortBy + 16, addMin + 4);
-        return `当前只差 ${shortBy} 个可见字符，即使差距很小也要至少净增 ${addMin}-${addMax} 个可见字符，不要只改小标题或替换同义词。`;
+        return `当前只差 ${shortBy} 个可见字符，请补足到目标区间，不要只做表面替换。`;
       }
       if (actual > tolMax && tolMax > 0) {
-        return `当前超出上限 ${actual - tolMax} 个可见字符，这一轮要压缩而不是换个更长版本。`;
+        return `当前超出上限 ${actual - tolMax} 个可见字符，这一轮要压缩到目标区间。`;
       }
       return "";
     })();
     return [
-      "你是英文 bullet 定点修复专家。",
+      "你是英文单条条目修复专家。",
       "这一轮只允许修复 1 条 bullet，只输出修复后的这一条。",
-      "本轮是补差修复，不是整条扩写。",
+      "本轮是定点修复，只处理当前这一条。",
       "长度按可见字符计算：空格和标点计入，连续的 2 个星号 ** 不计入长度。",
-      "尽量保留原句结构、已正确的关键词顺序和主要语义，只补必要差额。",
+      "尽量保留原句结构、已正确的关键词顺序和主要语义，只做必要修改。",
       targetText,
-      "不要扩写到 280 个可见字符以上；一旦超过就视为修坏。",
-      "不要新增第三个分句，不要并列多个场景串，不要堆空泛形容词。",
-      hasKeywordOrderError ? "如果缺少或乱序的是本条关键词，先删掉旧的场景串或泛化短语，给缺失关键词腾位。" : "",
-      hasKeywordOrderError ? "不要在句尾直接追加缺失关键词或额外整句；先压缩旧表达，再把缺失关键词放回原句位置。" : "",
+      hasKeywordOrderError ? "如果本条存在关键词缺失或乱序，优先调整关键词在当前条目中的位置，保持其它约束不变。" : "",
       deltaText
     ].filter(Boolean).join("\n");
   }

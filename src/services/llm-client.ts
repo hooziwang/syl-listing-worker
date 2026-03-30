@@ -202,11 +202,8 @@ function buildRepairEditBrief(section: string, currentContent: string, errors: s
   const severeDescriptionTarget = descriptionTarget && descriptionTarget.overflow >= 120 ? descriptionTarget : null;
   const lines = [
     severeDescriptionTarget
-      ? "这是结构化压缩任务，必要时允许重写整段，但必须保留核心商品语义和已满足的硬性约束。"
-      : "这是定量编辑任务，不是整条重写。",
-    severeDescriptionTarget
-      ? "修复目标：优先把整体长度压回目标区间，再收敛到要求的段落结构、关键词与可读性。"
-      : "修复目标：尽量保留现有语义主干、关键词顺序和已通过结构，只修被指出的问题。",
+      ? "这是结构化修复任务；必要时允许重写局部或整段，但必须保留已满足的硬性约束。"
+      : "这是定量修复任务；优先最小改动，只修被指出的问题。",
     `当前可见长度 ${countVisibleChars(currentContent)}。`
   ];
   if (severeDescriptionTarget) {
@@ -214,7 +211,7 @@ function buildRepairEditBrief(section: string, currentContent: string, errors: s
       ? `，优先落在 ${formatNumericRange(severeDescriptionTarget.landingRange.aimMin, severeDescriptionTarget.landingRange.aimMax)}`
       : "";
     lines.push(
-      `当前整体超长 ${severeDescriptionTarget.overflow} 字符，不能只删几个词；目标压回 ${severeDescriptionTarget.tolMin}-${severeDescriptionTarget.tolMax}${landingText}，必要时合并、改写或重组段落。`
+      `当前整体超长 ${severeDescriptionTarget.overflow} 字符；目标压回 ${severeDescriptionTarget.tolMin}-${severeDescriptionTarget.tolMax}${landingText}。`
     );
   }
   for (const error of errors.slice(0, 6)) {
@@ -223,9 +220,9 @@ function buildRepairEditBrief(section: string, currentContent: string, errors: s
     if (lineMatched) {
       const [, lineNo, actual, , , tolMin, tolMax] = lineMatched;
       if (Number.parseInt(actual, 10) < Number.parseInt(tolMin, 10)) {
-        lines.push(`第${lineNo}条当前 ${actual}，目标至少 ${tolMin}，可接受上限 ${tolMax}；本轮优先补足差额，不要只换同义词。`);
+        lines.push(`第${lineNo}条当前 ${actual}，目标至少 ${tolMin}，可接受上限 ${tolMax}；本轮优先补足差额。`);
       } else {
-        lines.push(`第${lineNo}条当前 ${actual}，目标压回 ${tolMin}-${tolMax}；本轮优先删冗余，不要改掉核心语义。`);
+        lines.push(`第${lineNo}条当前 ${actual}，目标压回 ${tolMin}-${tolMax}；本轮优先压缩长度。`);
       }
       continue;
     }
@@ -245,7 +242,6 @@ function buildRepairEditBrief(section: string, currentContent: string, errors: s
             lines.push(
               `当前只超出上限 ${target.overflow} 字符，目标压回 ${tolMin}-${tolMax}${landingText}，避免贴着边界停下。`
             );
-            lines.push("优先删掉长场景串、赠礼句和重复铺陈。");
             continue;
           }
           if (target.shortfall > 0) {
@@ -267,7 +263,7 @@ function buildRepairEditBrief(section: string, currentContent: string, errors: s
       continue;
     }
     if (normalized.includes("关键词顺序埋入不满足")) {
-      lines.push("关键词顺序错误时，优先在原句里调整或腾位，不要重写整段。");
+      lines.push("关键词顺序错误时，优先调整当前内容中的关键词位置，保持其它已通过约束不变。");
       continue;
     }
   }
@@ -279,8 +275,8 @@ function buildRepairCandidateLabel(section: string, errors: string[], candidateI
   const severeDescriptionTarget = descriptionTarget && descriptionTarget.overflow >= 120 ? descriptionTarget : null;
   if (severeDescriptionTarget) {
     return candidateIndex === 1
-      ? "修复候选#1：先按目标段落结构做高密度压缩，尽量保留现有信息骨架。"
-      : "修复候选#2：必要时重组整段并删除冗余表达，但不要改变语义主干。";
+      ? "修复候选#1：优先保留现有结构，先做最小必要重写。"
+      : "修复候选#2：允许更大幅度重写，但必须先满足硬性约束。";
   }
   return candidateIndex === 1
     ? "修复候选#1：优先最小改动，先保留原句结构。"

@@ -48,6 +48,7 @@ function makeBulletsRule(): SectionRule {
     constraints: {
       line_count: 5,
       min_chars_per_line: 240,
+      hard_min_chars_per_line: true,
       max_chars_per_line: 250,
       tolerance_chars: 50,
       preferred_min_chars_per_line: 255,
@@ -102,16 +103,18 @@ test("buildWholeRepairSystemPrompt tells LLM that bold wrappers do not count tow
   assert.match(prompt, /连续的 2 个星号 \*\* 不计入字符数/);
 });
 
-test("buildWholeRepairSystemPrompt tells bullets repairer to clear the hard 240-char floor instead of stopping in the 230s", () => {
+test("buildWholeRepairSystemPrompt keeps repair constraints rule-driven without bullet-specific hardcoded prose", () => {
   const service = makeService();
   const prompt = (service as any).buildWholeRepairSystemPrompt(makeBulletsRule(), true) as string;
 
-  assert.match(prompt, /低于 240 字符的条目直接视为失败/);
-  assert.match(prompt, /不要停在 230-239 这类仍会失败的长度/);
-  assert.match(prompt, /至少补到 252 字符以上再停/);
+  assert.match(prompt, /每行长度：规则\[240,250\]，容差\[240,300\]/);
+  assert.match(prompt, /每条建议长度：255-265 字符/);
+  assert.doesNotMatch(prompt, /低于 240 字符的条目直接视为失败/);
+  assert.doesNotMatch(prompt, /不要停在 230-239/);
+  assert.doesNotMatch(prompt, /至少补到 252 字符以上再停/);
 });
 
-test("buildBulletItemRepairSystemPrompt tells LLM to do a narrow visible-char patch instead of expanding the whole bullet", () => {
+test("buildBulletItemRepairSystemPrompt uses generic single-line repair guidance", () => {
   const service = makeService();
   const prompt = (service as any).buildBulletItemRepairSystemPrompt(
     makeBulletsRule(),
@@ -123,14 +126,16 @@ test("buildBulletItemRepairSystemPrompt tells LLM to do a narrow visible-char pa
 
   assert.match(prompt, /长度按可见字符计算/);
   assert.match(prompt, /连续的 2 个星号 \*\* 不计入长度/);
-  assert.match(prompt, /本轮是补差修复，不是整条扩写/);
-  assert.match(prompt, /把最终长度控制在 252-258 个可见字符/);
-  assert.match(prompt, /即使差距很小也要至少净增 12-20 个可见字符/);
-  assert.match(prompt, /不要只改小标题或替换同义词/);
-  assert.match(prompt, /不要扩写到 280 个可见字符以上/);
+  assert.match(prompt, /本轮是定点修复，只处理当前这一条/);
+  assert.match(prompt, /把最终长度控制在 255-265 个可见字符/);
+  assert.match(prompt, /当前只差 1 个可见字符，请补足到目标区间/);
+  assert.match(prompt, /不要只做表面替换/);
+  assert.doesNotMatch(prompt, /本轮是补差修复，不是整条扩写/);
+  assert.doesNotMatch(prompt, /12-20 个可见字符/);
+  assert.doesNotMatch(prompt, /280 个可见字符/);
 });
 
-test("buildBulletItemRepairSystemPrompt tells keyword-order repairs to make room instead of appending another clause", () => {
+test("buildBulletItemRepairSystemPrompt uses generic keyword-order repair guidance", () => {
   const service = makeService();
   const prompt = (service as any).buildBulletItemRepairSystemPrompt(
     makeBulletsRule(),
@@ -140,15 +145,17 @@ test("buildBulletItemRepairSystemPrompt tells keyword-order repairs to make room
     ]
   ) as string;
 
-  assert.match(prompt, /如果缺少或乱序的是本条关键词，先删掉旧的场景串或泛化短语，给缺失关键词腾位/);
-  assert.match(prompt, /不要在句尾直接追加缺失关键词或额外整句/);
+  assert.match(prompt, /如果本条存在关键词缺失或乱序，优先调整关键词在当前条目中的位置，保持其它约束不变/);
+  assert.doesNotMatch(prompt, /场景串/);
+  assert.doesNotMatch(prompt, /不要在句尾直接追加缺失关键词/);
 });
 
-test("buildSectionSystemPrompt keeps bullets hard minimum at 240 while exposing preferred 255-265 range", () => {
+test("buildSectionSystemPrompt exposes rule-driven bullet ranges without old landing heuristics", () => {
   const service = makeService();
   const prompt = (service as any).buildSectionSystemPrompt(makeBulletsRule(), true) as string;
 
   assert.match(prompt, /每行长度：规则\[240,250\]，容差\[240,300\]/);
-  assert.match(prompt, /每条最佳落点 255-265 字符，略高于 250 字符更稳妥/);
+  assert.match(prompt, /每条建议长度：255-265 字符/);
   assert.doesNotMatch(prompt, /容差\[190,300\]/);
+  assert.doesNotMatch(prompt, /略高于 250 字符更稳妥/);
 });

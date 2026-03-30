@@ -16,6 +16,7 @@ function makeBulletsRule(): SectionRule {
     constraints: {
       line_count: 5,
       min_chars_per_line: 240,
+      hard_min_chars_per_line: true,
       max_chars_per_line: 250,
       tolerance_chars: 50,
       preferred_min_chars_per_line: 255,
@@ -171,29 +172,26 @@ test("buildSectionKeywordPlan batches ordered keywords across bullet lines", () 
   ]);
 });
 
-test("buildSectionExecutionGuidance includes per-line keyword batches and char budgets", () => {
+test("buildSectionExecutionGuidance emits generic rule-driven bullet guidance", () => {
   const guidance = buildSectionExecutionGuidance(makeRequirements(), makeBulletsRule());
 
   assert.match(guidance, /第1条.*\*\*paper lanterns\*\* -> \*\*paper lanterns decorative\*\* -> \*\*colorful paper lanterns\*\*/);
-  assert.match(guidance, /每条最佳落点 255-265 字符，略高于 250 字符更稳妥/);
-  assert.match(guidance, /绝对上限 300 字符/);
-  assert.match(guidance, /先写 2-4 个英文单词的小标题/);
-  assert.match(guidance, /每条首个关键词必须在小标题后尽快出现/);
-  assert.match(guidance, /关键词一律使用小写并加粗/);
-  assert.match(guidance, /第2、3、4条不要套固定模版，优先发掘产品最强优点/);
-  assert.match(guidance, /字符数按最终文本逐字符计算，空格和标点都计入长度/);
+  assert.match(guidance, /固定输出 5 条/);
+  assert.match(guidance, /每条小标题词数控制在 2-4 个英文单词/);
+  assert.match(guidance, /每条长度控制在 240-300 字符/);
+  assert.match(guidance, /前 15 个关键词必须按关键词库顺序出现/);
+  assert.match(guidance, /关键词出现时必须保持小写/);
+  assert.match(guidance, /关键词必须使用 Markdown 粗体包裹/);
   assert.match(guidance, /连续的 2 个星号 \*\* 不计入字符数/);
-  assert.match(guidance, /第1条围绕套装内容、数量和拿来即用，自拟 2-4 个单词小标题/);
-  assert.match(guidance, /第4条不要固定写颜色，自拟 2-4 个单词小标题/);
-  assert.match(guidance, /第二句只补 1 个结果或用途，不要继续枚举多个场景、并列多个空泛卖点/);
-  assert.match(guidance, /禁止 that\/which\/while\/allowing\/providing\/making\/ensuring 这类拖尾扩写/);
-  assert.match(guidance, /禁止 ideal、perfect、transform、create、bring、enhance 这类空泛词/);
+  assert.match(guidance, /按以下条级关键词批次依次消化，不要打乱顺序/);
+  assert.match(guidance, /第1条建议长度 255-265 字符/);
   assert.match(guidance, /第4条建议长度 \d+-\d+ 字符；本条关键词较长，正文更紧凑/);
-  assert.doesNotMatch(guidance, /安全目标长度/);
-  assert.doesNotMatch(guidance, /正文只写 2 句短句/);
+  assert.doesNotMatch(guidance, /第2、3、4条不要套固定模版/);
+  assert.doesNotMatch(guidance, /套装内容|拿来即用|尺寸|材质|颜色/);
+  assert.doesNotMatch(guidance, /ideal|perfect|transform|create|bring|enhance/);
 });
 
-test("buildSectionRepairGuidance maps length and keyword-order failures back to bullet lines", () => {
+test("buildSectionRepairGuidance maps bullet failures back to generic rule-driven repair steps", () => {
   const guidance = buildSectionRepairGuidance(
     makeRequirements(),
     makeBulletsRule(),
@@ -203,18 +201,19 @@ test("buildSectionRepairGuidance maps length and keyword-order failures back to 
     ]
   );
 
-  assert.match(guidance, /第1条重写到 252-258 字符/);
-  assert.match(guidance, /第1条当前超出上限 31 字符/);
-  assert.match(guidance, /每条小标题控制在 2-4 个英文单词，关键词一律使用小写加粗/);
+  assert.match(guidance, /第1条修复到 255-265 字符/);
+  assert.match(guidance, /第1条当前超出上限 31 字符，请压缩到目标区间/);
+  assert.match(guidance, /每条小标题词数控制在 2-4 个英文单词/);
+  assert.match(guidance, /关键词出现时必须保持小写/);
+  assert.match(guidance, /关键词必须使用 Markdown 粗体包裹/);
   assert.match(guidance, /连续的 2 个星号 \*\* 不计入字符数/);
-  assert.match(guidance, /从第2条开始按既定关键词批次重写/);
-  assert.match(guidance, /第2条中关键词必须按批次顺序首次出现，先写第1个，再写第2个，最后写第3个关键词/);
-  assert.match(guidance, /第2条不要固定写尺寸，自拟 2-4 个单词小标题/);
+  assert.match(guidance, /从第2条开始按既定关键词顺序修复/);
   assert.match(guidance, /第2条关键词批次: \*\*hanging paper lanterns\*\* -> \*\*hanging decor\*\* -> \*\*paper hanging decorations\*\*/);
+  assert.doesNotMatch(guidance, /尺寸|材质|颜色/);
   assert.doesNotMatch(guidance, /安全目标/);
 });
 
-test("buildSectionRepairGuidance highlights tighter target for longer keyword batches", () => {
+test("buildSectionRepairGuidance keeps bullet repair guidance generic even for heavier keyword batches", () => {
   const guidance = buildSectionRepairGuidance(
     makeRequirements(),
     makeBulletsRule(),
@@ -223,14 +222,15 @@ test("buildSectionRepairGuidance highlights tighter target for longer keyword ba
     ]
   );
 
-  assert.match(guidance, /第4条重写到 252-258 字符/);
-  assert.match(guidance, /第4条不要固定写颜色，自拟 2-4 个单词小标题/);
-  assert.match(guidance, /第4条优先收敛到建议长度 \d+-\d+ 字符；本条关键词较长，正文更紧凑/);
-  assert.match(guidance, /删掉 that\/which\/while\/allowing\/providing\/making\/ensuring 这类拖尾扩写/);
-  assert.match(guidance, /不要再补 ideal、perfect、transform、create、bring、enhance 这类空泛词/);
+  assert.match(guidance, /第4条修复到 255-265 字符/);
+  assert.match(guidance, /第4条优先收敛到建议长度 255-265 字符/);
+  assert.match(guidance, /第4条当前超出上限 9 字符，请压缩到目标区间/);
+  assert.doesNotMatch(guidance, /本条关键词较长/);
+  assert.doesNotMatch(guidance, /that\/which\/while\/allowing\/providing\/making\/ensuring/);
+  assert.doesNotMatch(guidance, /ideal|perfect|transform|create|bring|enhance/);
 });
 
-test("buildSectionRepairGuidance tells underlength bullets to add concrete detail instead of trimming", () => {
+test("buildSectionRepairGuidance tells underlength bullets to fill the rule-driven target range", () => {
   const guidance = buildSectionRepairGuidance(
     makeRequirements(),
     makeBulletsRule(),
@@ -239,27 +239,28 @@ test("buildSectionRepairGuidance tells underlength bullets to add concrete detai
     ]
   );
 
-  assert.match(guidance, /第2条当前低于下限 12 字符，优先补 1 个具体产品细节或结果句/);
-  assert.match(guidance, /不要只改几个词，至少补足缺少的长度/);
-  assert.match(guidance, /补完后最好落到 252-258 字符/);
-  assert.match(guidance, /不要停在 230-239 这类仍会失败的长度，至少补到 252 字符以上再停/);
-  assert.doesNotMatch(guidance, /第2条当前低于下限 12 字符，优先删除重复修饰和泛化铺陈/);
+  assert.match(guidance, /第2条修复到 255-265 字符/);
+  assert.match(guidance, /第2条当前低于下限 12 字符，请补足到目标区间/);
+  assert.doesNotMatch(guidance, /具体产品细节或结果句/);
+  assert.doesNotMatch(guidance, /不要停在 230-239/);
+  assert.doesNotMatch(guidance, /优先删除重复修饰和泛化铺陈/);
 });
 
-test("buildSectionExecutionGuidance includes paragraph guidance for description", () => {
+test("buildSectionExecutionGuidance includes generic paragraph guidance for description", () => {
   const guidance = buildSectionExecutionGuidance(makeRequirements(), makeDescriptionRule());
 
   assert.match(guidance, /固定输出 2 段/);
-  assert.match(guidance, /整体目标长度 700-740 字符/);
-  assert.match(guidance, /每段建议控制在 350-370 字符/);
-  assert.match(guidance, /默认先写 4 句：每段 2 句/);
-  assert.match(guidance, /只挑最重要的 4-6 个事实或收益/);
+  assert.match(guidance, /当前 execution 配置总句数 5，请按 2 个输出槽位均匀分配/);
+  assert.match(guidance, /整体长度控制在 700-740 字符/);
+  assert.match(guidance, /每段必须以完整句和句末标点收尾/);
+  assert.match(guidance, /第1段建议长度 350-370 字符/);
+  assert.match(guidance, /第2段建议长度 350-370 字符/);
   assert.doesNotMatch(guidance, /全文自然覆盖前 \d+ 个关键词/);
   assert.doesNotMatch(guidance, /前 \d+ 个必带关键词/);
   assert.doesNotMatch(guidance, /前 \d+ 个关键词满足后就停止追加更多关键词/);
   assert.doesNotMatch(guidance, /第1段关键词批次/);
   assert.doesNotMatch(guidance, /第2段关键词批次/);
-  assert.doesNotMatch(guidance, /不要把第 2 段关键词提前到第 1 段/);
+  assert.doesNotMatch(guidance, /默认先写 4 句|最重要的 4-6 个事实或收益/);
 });
 
 test("buildSectionExecutionGuidance keeps description paragraph budgets without paragraph keyword batches", () => {
@@ -285,15 +286,15 @@ test("buildSectionRepairGuidance keeps description fixes global when keyword pos
 
   assert.match(guidance, /固定输出 2 段/);
   assert.match(guidance, /当前超出上限 24 字符/);
-  assert.match(guidance, /优先把第2段压缩到建议长度/);
+  assert.match(guidance, /第2段优先收敛到建议长度 350-370 字符/);
   assert.match(guidance, /第1段必须以完整句和句末标点收尾/);
-  assert.match(guidance, /必须补回缺失的关键词：Paper Hanging Decorations/);
+  assert.match(guidance, /必须补回缺失关键词：Paper Hanging Decorations/);
   assert.doesNotMatch(guidance, /前 \d+ 个关键词/);
   assert.doesNotMatch(guidance, /按既定关键词批次重写/);
   assert.doesNotMatch(guidance, /关键词批次/);
 });
 
-test("buildSectionRepairGuidance gives title-specific guidance instead of bullet instructions", () => {
+test("buildSectionRepairGuidance keeps title repair guidance generic and rule-driven", () => {
   const guidance = buildSectionRepairGuidance(
     makeRequirements(),
     makeTitleRule(),
@@ -304,11 +305,11 @@ test("buildSectionRepairGuidance gives title-specific guidance instead of bullet
     ]
   );
 
-  assert.match(guidance, /标题必须保持单行/);
+  assert.match(guidance, /输出单行标题文本/);
   assert.match(guidance, /当前超出上限 6 字符/);
-  assert.match(guidance, /总长度控制在 100-200 字符，绝不超过 220 字符/);
-  assert.match(guidance, /必须补回品牌词 gisgfim/);
-  assert.match(guidance, /必须补回前 3 条核心关键词中缺失的短语/);
+  assert.match(guidance, /整体长度控制在 100-220 字符/);
+  assert.match(guidance, /必须补回缺失品牌词：gisgfim/);
+  assert.match(guidance, /必须补回缺失关键词：Paper Lanterns Decorative/);
   assert.doesNotMatch(guidance, /前序条目/);
   assert.doesNotMatch(guidance, /第1条重写到/);
 });
@@ -323,6 +324,6 @@ test("buildSectionRepairGuidance keeps heavy description rewrites generic when k
   );
 
   assert.match(guidance, /当前超出上限 18 字符/);
-  assert.match(guidance, /优先把第2段压缩到建议长度/);
+  assert.match(guidance, /第2段优先收敛到建议长度 350-370 字符/);
   assert.doesNotMatch(guidance, /本段关键词较长/);
 });

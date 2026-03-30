@@ -173,7 +173,7 @@ test("generateSectionWithAgentTeam falls back to repairer when writer exits with
         ok: false,
         normalizedContent: content,
         errors: ["第1条长度不满足约束: 221（规则区间 [240,250]，容差区间 [240,300]）"],
-        repairGuidance: "修复指导:\n- 第1条重写到 255-265 字符。"
+        repairGuidance: "修复指导:\n- 第1条修复到 255-265 字符。"
       };
     }
   });
@@ -188,9 +188,8 @@ test("generateSectionWithAgentTeam falls back to repairer when writer exits with
   assert.match(prompts[1] ?? "", /当前候选内容/);
   assert.match(prompts[1] ?? "", /draft/);
   assert.match(prompts[1] ?? "", /第1条长度不满足约束/);
-  assert.match(prompts[1] ?? "", /第1条重写到 255-265 字符/);
-  assert.match(prompts[1] ?? "", /这是定量编辑任务，不是整条重写/);
-  assert.match(prompts[1] ?? "", /修复目标：尽量保留现有语义主干/);
+  assert.match(prompts[1] ?? "", /第1条修复到 255-265 字符/);
+  assert.match(prompts[1] ?? "", /这是定量修复任务；优先最小改动，只修被指出的问题/);
   assert.match(prompts[1] ?? "", /当前可见长度 5/);
 });
 
@@ -241,7 +240,7 @@ test("generateSectionWithAgentTeam repair fallback evaluates two candidates and 
         ok: false,
         normalizedContent: content,
         errors: ["第1条长度不满足约束: 221（规则区间 [240,250]，容差区间 [240,300]）"],
-        repairGuidance: "修复指导:\n- 第1条重写到 255-265 字符。"
+        repairGuidance: "修复指导:\n- 第1条修复到 255-265 字符。"
       };
     }
   });
@@ -300,7 +299,7 @@ test("generateSectionWithAgentTeam uses repair fallback after reviewer path retu
         ok: false,
         normalizedContent: content,
         errors: ["第2条长度不满足约束: 231（规则区间 [240,250]，容差区间 [240,300]）"],
-        repairGuidance: "修复指导:\n- 第2条重写到 255-265 字符。"
+        repairGuidance: "修复指导:\n- 第2条修复到 255-265 字符。"
       };
     }
   });
@@ -491,15 +490,15 @@ test("generateSectionWithAgentTeam allows paragraph-level rewrite for severely o
           "- 固定输出 2 段，仅保留 1 个空行分段，不要拆成额外段落。",
           "- 整体长度控制在 700-740 字符，绝不超过 740 字符。",
           "- 当前超出上限 320 字符。",
-          "- 当前整体超长，先压缩再润色，不要只微调几个词。"
+          "- 第2段优先收敛到建议长度 350-370 字符。"
         ].join("\n")
       };
     }
   });
 
   assert.equal(result, "fixed description");
-  assert.match(prompts[1] ?? "", /这是结构化压缩任务，必要时允许重写整段/);
-  assert.match(prompts[1] ?? "", /当前整体超长 320 字符，不能只删几个词/);
+  assert.match(prompts[1] ?? "", /这是结构化修复任务；必要时允许重写局部或整段/);
+  assert.match(prompts[1] ?? "", /当前整体超长 320 字符；目标压回 700-740/);
   assert.match(prompts[1] ?? "", /优先落在 710-730/);
   assert.doesNotMatch(prompts[1] ?? "", /这是定量编辑任务，不是整条重写/);
 });
@@ -615,7 +614,7 @@ test("generateSectionWithAgentTeam can run a second repair fallback round before
           ok: false,
           normalizedContent: content,
           errors: ["长度不满足约束: 768（规则区间 [700,740]，容差区间 [700,740]）"],
-          repairGuidance: "修复指导:\n- 当前超出上限 28 字符。\n- 第2段继续压缩，删掉重复场景串。"
+          repairGuidance: "修复指导:\n- 当前超出上限 28 字符。\n- 第2段继续压缩，删除非必要信息。"
         };
       }
       return {
@@ -683,7 +682,7 @@ test("generateSectionWithAgentTeam can run a third repair fallback round for des
           ok: false,
           normalizedContent: content,
           errors: ["长度不满足约束: 769（规则区间 [700,740]，容差区间 [700,740]）"],
-          repairGuidance: "修复指导:\n- 当前超出上限 29 字符。\n- 优先删掉长场景串、赠礼句和重复铺陈。\n- 第2段继续压缩，删掉长场景串。"
+          repairGuidance: "修复指导:\n- 当前超出上限 29 字符。\n- 优先删除重复信息和冗余铺陈。\n- 第2段继续压缩，删除非必要信息。"
         };
       }
       return {
@@ -697,7 +696,7 @@ test("generateSectionWithAgentTeam can run a third repair fallback round for des
 
   assert.equal(result, "fixed description");
   assert.equal(repairRuns, 6);
-  assert.ok(prompts.some((prompt) => /优先删掉长场景串、赠礼句和重复铺陈/.test(prompt)));
+  assert.ok(prompts.some((prompt) => /优先删除重复信息和冗余铺陈/.test(prompt)));
   assert.ok(prompts.every((prompt) => !/前 \d+ 个关键词/.test(prompt)));
 });
 
