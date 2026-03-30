@@ -311,13 +311,6 @@ export function buildSectionExecutionGuidance(requirements: ListingRequirements,
   const slotCount = resolveSectionSlotCount(rule);
   const tolerance = getNumber(rule.constraints, "tolerance_chars", 0);
   const keywordEmbedding = readKeywordEmbeddingConfig(rule.constraints);
-  const normalizedKeywords = requirements.keywords
-    .map((item) => formatGuidanceKeyword(item, keywordEmbedding.lowercase))
-    .filter(Boolean);
-  const requiredKeywordCount = Math.min(
-    keywordEmbedding.minTotal,
-    normalizedKeywords.length
-  );
   if (rule.section === "bullets") {
     if (plan.length === 0) {
       return "";
@@ -380,21 +373,9 @@ export function buildSectionExecutionGuidance(requirements: ListingRequirements,
       "- 只挑最重要的 4-6 个事实或收益，不要把输入里的全部细节、场景、礼品语和参考素材一次性塞满。",
       "- 字符数按最终文本逐字符计算，空格和标点都计入长度；连续的 2 个星号 ** 不计入字符数。",
       perParagraphMin > 0 && perParagraphMax > 0 ? `- 每段建议控制在 ${perParagraphMin}-${perParagraphMax} 字符，优先均匀分配篇幅。` : "",
-      keywordEmbedding.enabled && requiredKeywordCount > 0
-        ? keywordEmbedding.enforceOrder
-          ? "- 严格按以下段落批次消化关键词，不要把第 2 段关键词提前到第 1 段。"
-          : `- 全文自然覆盖前 ${requiredKeywordCount} 个关键词即可，不限制所在段落；关键词保持原样并使用 Markdown 粗体。`
+      keywordEmbedding.enabled && keywordEmbedding.enforceOrder && plan.length > 0
+        ? "- 严格按以下段落批次消化关键词，不要把第 2 段关键词提前到第 1 段。"
         : "",
-      ...(!keywordEmbedding.enforceOrder && requiredKeywordCount > 0
-        ? [
-            `- 前 ${requiredKeywordCount} 个必带关键词: ${normalizedKeywords
-              .slice(0, requiredKeywordCount)
-              .map((item) => `**${item}**`)
-              .join(" -> ")}`,
-            `- 开写前先确认这 ${requiredKeywordCount} 个关键词都已排进正文，少一个都不要提交。`,
-            `- 前 ${requiredKeywordCount} 个关键词满足后就停止追加更多关键词；每段最多保留 1 个用途或结果句，不要连续枚举长场景串。`
-          ]
-        : []),
       ...(keywordEmbedding.enforceOrder
         ? plan.map((keywords, index) => `- 第${index + 1}段关键词批次: ${keywords.map((item) => `**${item}**`).join(" -> ")}`)
         : []),
@@ -496,10 +477,6 @@ export function buildSectionRepairGuidance(
 
   if (rule.section === "description") {
     const lines = ["修复指导:"];
-    const requiredKeywordCount = Math.min(
-      keywordEmbedding.minTotal,
-      requirements.keywords.map((item) => normalizeLine(item)).filter(Boolean).length
-    );
     if (slotCount > 0) {
       lines.push(`- 固定输出 ${slotCount} 段，仅保留 1 个空行分段，不要拆成额外段落。`);
     }
@@ -544,7 +521,7 @@ export function buildSectionRepairGuidance(
       lines.push(`- 第${paragraphIndex + 1}段必须以完整句和句末标点收尾。`);
     }
     if (!keywordEmbedding.enforceOrder && missingKeywords.length > 0) {
-      lines.push(`- 必须补回缺失的前 ${requiredKeywordCount} 个关键词：${missingKeywords.map((item) => item.keyword).join(" -> ")}。`);
+      lines.push(`- 必须补回缺失的关键词：${missingKeywords.map((item) => item.keyword).join(" -> ")}。`);
     }
     if (keywordEmbedding.enforceOrder && keywordLineIndex !== null) {
       lines.push(`- 从第${keywordLineIndex + 1}段开始按既定关键词批次重写，前面已满足顺序的段落尽量不动。`);

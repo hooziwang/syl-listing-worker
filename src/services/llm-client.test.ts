@@ -683,7 +683,7 @@ test("generateSectionWithAgentTeam can run a third repair fallback round for des
           ok: false,
           normalizedContent: content,
           errors: ["长度不满足约束: 769（规则区间 [700,740]，容差区间 [700,740]）"],
-          repairGuidance: "修复指导:\n- 当前超出上限 29 字符。\n- 前 6 个关键词满足后停止追加更多关键词。\n- 第2段继续压缩，删掉长场景串。"
+          repairGuidance: "修复指导:\n- 当前超出上限 29 字符。\n- 优先删掉长场景串、赠礼句和重复铺陈。\n- 第2段继续压缩，删掉长场景串。"
         };
       }
       return {
@@ -697,7 +697,8 @@ test("generateSectionWithAgentTeam can run a third repair fallback round for des
 
   assert.equal(result, "fixed description");
   assert.equal(repairRuns, 6);
-  assert.ok(prompts.some((prompt) => /前 6 个关键词满足后停止追加更多关键词/.test(prompt)));
+  assert.ok(prompts.some((prompt) => /优先删掉长场景串、赠礼句和重复铺陈/.test(prompt)));
+  assert.ok(prompts.every((prompt) => !/前 \d+ 个关键词/.test(prompt)));
 });
 
 test("generateSectionWithAgentTeam logs normalized bullet lines for failed candidates", async () => {
